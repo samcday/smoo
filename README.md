@@ -1,22 +1,38 @@
 # smoo
 
-A userspace implementation of "reverse USB Mass Storage". That is, the host provides the data to the device.
+**smoo** is an *inverted* mass‑storage USB protocol. The device sees a block device whose data comes from the host.
 
-There's not much to see here yet, besides an extremely hacked together prototype that will probably crash your computer and eat your babies.
+It uses the [ublk][] driver and [FunctionFS][ffs] to implement the device side of the protocol in user-space.  It can
+make use of [FunctionFS DMA-BUF support][ffs-dmabuf] for a (nearly) zero-copy data path.
 
-## Use case?
+The host implementation supports `rusb` (for CLI and desktop apps) and WebUSB (for WASM + web targets).
 
-This is being implemented to make it possible for a host device to serve up a root FS to a live booted mobile device via USB.
+It is implemented in async-first Rust, mostly by robots.
 
-Prior art for this exists with the ["pmOS netboot" feature](https://wiki.postmarketos.org/wiki/Netboot), however with smoo it will be possible to achieve this without NBD (and indeed, without any networking stack at all).
+"UMS" backwards is "SMU". Which sounds like smoo. So there you go.
 
-## The name?
+## Quickstart
 
-USB Mass Storage is frequently referred to as "UMS". UMS backwards is SMU. That sounds like smoo. Yes, I know I suck at naming things.
+```
+# from a computer with a UDC
+cargo run --bin=smoo-gadget-cli
+
+# from another computer connected to the one with a UDC
+dd if=/dev/urandom of=random.img bs=4096 count=512
+cargo run --bin=smoo-host-cli -f random.img
+
+# the UDC computer should now see a /dev/ublk0 that returns data matching random.img
+```
+
+## Status
+
+This is an early prototype. It requires a recent Linux kernel with [FunctionFS][ffs], and [ublk][] support enabled. It
+should work on any device with a UDC, and is tested primarily on SDM670/SDM845 pocket computers.
 
 ## Development
 
-### Project structure
+See **HACKING.md** for architecture and implementation details.
 
- * `apps/smoo-gadget-cli` brings up the ublk device and USB gadget function that backs it
- * `apps/smoo-host-cli` finds a connected smoo gadget and serves I/O requests using a specified file
+[ublk]: https://docs.kernel.org/block/ublk.html
+[ffs]: https://docs.kernel.org/usb/functionfs.html
+[ffs-dmabuf]: https://docs.kernel.org/usb/functionfs.html#dmabuf-interface
