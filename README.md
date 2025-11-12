@@ -13,3 +13,10 @@ Prior art for this exists with the ["pmOS netboot" feature](https://wiki.postmar
 ## The name?
 
 USB Mass Storage is frequently referred to as "UMS". UMS backwards is SMU. That sounds like smoo. Yes, I know I suck at naming things.
+
+## Development
+
+### Project structure
+
+ * `apps/smoo-gadget-cli` brings up the ublk device and USB gadget function that backs it
+ * `apps/smoo-host-cli` finds a connected smoo gadget and serves I/O requests using a specified file

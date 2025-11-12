@@ -1,5 +1,5 @@
 [package]
-name = "smoo_host"
+name = "smoo-host-cli"
 version = "0.1.0"
 edition = "2021"
 

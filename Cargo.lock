@@ -1000,21 +1000,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "smoo_gadget"
+name = "smoo-gadget-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-channel",
  "byteorder",
  "bytes",
- "libc",
  "libublk",
  "tokio",
  "usb-gadget",
 ]
 
 [[package]]
-name = "smoo_host"
+name = "smoo-host-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
