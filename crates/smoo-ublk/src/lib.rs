@@ -3,7 +3,7 @@ use crate::sys::{
     ublk_param_basic, ublk_params, ublksrv_ctrl_cmd, ublksrv_ctrl_dev_info,
 };
 use anyhow::Context;
-use async_channel::Sender;
+use async_channel::{RecvError, Sender};
 use io_uring::IoUring;
 use std::fs::File;
 use std::io;
@@ -44,12 +44,21 @@ impl SmooUblk {
             let _enter = span.enter();
             info!("starting loop");
             loop {
-                let (opcode, cmd, reply) = receiver
-                    .recv_blocking()
-                    .context("recv ublksrv_ctrl_cmd")
-                    .unwrap();
+                let (opcode, cmd, reply) = match receiver.recv_blocking() {
+                    Ok(msg) => msg,
+                    Err(RecvError) => {
+                        info!("smoo-ublk ctrl loop shutting down");
+                        break;
+                    }
+                };
 
                 tracing::span!(Level::INFO, "ctrl cmd", opcode).in_scope(|| {
+                    let send_completion = |res| {
+                        if let Err(e) = reply.send_blocking(res) {
+                            trace!("ctrl reply receiver dropped: {}", e);
+                        }
+                    };
+
                     let cmd_bytes_len = size_of::<sys::ublksrv_ctrl_cmd>();
                     assert!(cmd_bytes_len <= 80, "ublksrv_ctrl_cmd larger than 80 bytes");
                     let mut cmd_buf = [0u8; 80];
@@ -66,22 +75,37 @@ impl SmooUblk {
                         opcode,
                     )
                     .cmd(cmd_buf);
-                    unsafe { ring.submission().push(&sqe.build()) }
-                        .expect("write ublksrv_ctrl_cmd SQE");
+                    if let Err(e) = unsafe { ring.submission().push(&sqe.build()) } {
+                        error!("write ublksrv_ctrl_cmd SQE failed: {}", e);
+                        send_completion(Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("push SQE failed: {e}"),
+                        )));
+                        return;
+                    }
 
                     trace!("submitting sqe");
-                    ring.submit_and_wait(1).unwrap();
+                    if let Err(e) = ring.submit_and_wait(1) {
+                        error!("submit_and_wait failed: {}", e);
+                        send_completion(Err(e));
+                        return;
+                    }
 
-                    let cqe = ring.completion().next().context("fetch cqe").unwrap();
+                    let Some(cqe) = ring.completion().next() else {
+                        error!("missing completion entry from ctrl ring");
+                        send_completion(Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            "missing completion entry",
+                        )));
+                        return;
+                    };
                     let result = cqe.result();
                     trace!(result = result, "got cqe");
-                    reply
-                        .send_blocking(if result == 0 {
-                            Ok(())
-                        } else {
-                            Err(io::Error::from_raw_os_error(-result))
-                        })
-                        .expect("write completion to channel");
+                    send_completion(if result == 0 {
+                        Ok(())
+                    } else {
+                        Err(io::Error::from_raw_os_error(-result))
+                    });
                 });
             }
         });
@@ -111,14 +135,7 @@ impl SmooUblk {
             ..Default::default()
         };
 
-        // the ublksrv_ctrl_cmd descriptor is passed in for all UBLK_CMD_* requests.
-        let mut cmd = ublksrv_ctrl_cmd {
-            dev_id,
-            // queue is -1 for all UBLK_CMD_* requests
-            queue_id: u16::MAX,
-            ..Default::default()
-        };
-
+        // ublk_params is passed in ublksrv_ctrl_dev_info during UBLK_CMD_SET_PARAMS
         let mut params = ublk_params {
             len: size_of::<ublk_params>() as _,
             types: UBLK_PARAM_TYPE_BASIC,
@@ -127,6 +144,14 @@ impl SmooUblk {
                 dev_sectors,
                 ..Default::default()
             },
+            ..Default::default()
+        };
+
+        // the ublksrv_ctrl_cmd descriptor is passed in for all UBLK_CMD_* requests.
+        let mut cmd = ublksrv_ctrl_cmd {
+            dev_id,
+            // queue is -1 for all UBLK_CMD_* requests
+            queue_id: u16::MAX,
             ..Default::default()
         };
 
