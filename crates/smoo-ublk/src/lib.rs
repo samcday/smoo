@@ -1,16 +1,26 @@
 use crate::sys::{
-    UBLK_CMD_ADD_DEV, UBLK_CMD_SET_PARAMS, UBLK_PARAM_TYPE_BASIC, ublk_param_basic, ublk_params,
-    ublksrv_ctrl_cmd, ublksrv_ctrl_dev_info,
+    UBLK_CMD_ADD_DEV, UBLK_CMD_SET_PARAMS, UBLK_CMD_START_DEV, UBLK_IO_OP_DISCARD,
+    UBLK_IO_OP_FLUSH, UBLK_IO_OP_READ, UBLK_IO_OP_WRITE, UBLK_PARAM_TYPE_BASIC,
+    UBLK_U_IO_COMMIT_AND_FETCH_REQ, UBLK_U_IO_FETCH_REQ, ublk_param_basic, ublk_params,
+    ublksrv_ctrl_cmd, ublksrv_ctrl_dev_info, ublksrv_io_cmd, ublksrv_io_desc,
 };
 use anyhow::{Context, ensure};
-use async_channel::{RecvError, Sender};
-use io_uring::IoUring;
+use async_channel::{Receiver, RecvError, Sender};
+use io_uring::{IoUring, cqueue, squeue, types};
+use std::cmp;
 use std::fs::File;
 use std::io;
-use std::mem::size_of;
+use std::mem::{size_of, transmute};
 use std::os::fd::AsRawFd;
+use std::ptr;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 use std::thread::JoinHandle;
-use tracing::{Level, error, info, trace};
+use std::time::Duration;
+use tracing::{Level, error, info, trace, warn};
 
 mod sys {
     #![allow(non_upper_case_globals)]
@@ -24,26 +34,78 @@ mod sys {
 /// Top level interface to ublk. Creates SmooUblkDevices
 pub struct SmooUblk {
     handle: JoinHandle<()>,
-    sender: Sender<(u32, ublksrv_ctrl_cmd, Sender<Result<(), io::Error>>)>,
+    sender: Sender<CtrlCommand>,
 }
 
-pub struct SmooUblkDevice {}
+const CTRL_RING_DEPTH: u32 = 8;
+const START_DEV_TIMEOUT: Duration = Duration::from_secs(5);
+
+type CtrlCommand = (
+    u32,
+    ublksrv_ctrl_cmd,
+    Sender<Result<(), io::Error>>,
+    Option<Duration>,
+);
+
+pub struct SmooUblkDevice {
+    dev_id: u32,
+    queue_count: u16,
+    queue_depth: u16,
+    request_rx: Receiver<UblkIoRequest>,
+    completion_txs: Vec<Sender<QueueCompletion>>,
+    workers: Vec<QueueWorkerHandle>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum UblkOp {
+    Read,
+    Write,
+    Flush,
+    Discard,
+    Unknown(u32),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct UblkIoRequest {
+    pub dev_id: u32,
+    pub queue_id: u16,
+    pub tag: u16,
+    pub op: UblkOp,
+    pub sector: u64,
+    pub num_sectors: u32,
+}
+
+impl UblkIoRequest {
+    pub fn byte_len(&self) -> u64 {
+        (self.num_sectors as u64) << 9
+    }
+}
+
+struct QueueWorkerHandle {
+    stop: Arc<AtomicBool>,
+    thread: JoinHandle<()>,
+}
+
+struct QueueCompletion {
+    tag: u16,
+    result: i32,
+}
 
 impl SmooUblk {
     pub fn new() -> anyhow::Result<Self> {
         let ublk_ctrl = File::options().write(true).open("/dev/ublk-control")?;
-        let (sender, receiver) =
-            async_channel::bounded::<(u32, ublksrv_ctrl_cmd, Sender<Result<(), io::Error>>)>(1);
+        let (sender, receiver) = async_channel::bounded::<CtrlCommand>(1);
         // Setup a simple ring + reactor that round trips one op at a time to /dev/ublk-control
         let mut ring: IoUring<io_uring::squeue::Entry128, _> =
-            IoUring::<io_uring::squeue::Entry128>::builder().build(1)?;
+            IoUring::<io_uring::squeue::Entry128>::builder().build(CTRL_RING_DEPTH)?;
 
         let span = tracing::span!(Level::INFO, "ublk-ctrl");
         let handle = std::thread::spawn(move || {
             let _enter = span.enter();
             info!("starting loop");
+            let mut next_cmd_id: u64 = 1;
             loop {
-                let (opcode, cmd, reply) = match receiver.recv_blocking() {
+                let (opcode, cmd, reply, timeout) = match receiver.recv_blocking() {
                     Ok(msg) => msg,
                     Err(RecvError) => {
                         info!("smoo-ublk ctrl loop shutting down");
@@ -69,42 +131,107 @@ impl SmooUblk {
                     };
                     cmd_buf[..cmd_bytes_len].copy_from_slice(raw_cmd);
 
-                    let sqe = io_uring::opcode::UringCmd80::new(
+                    let cmd_user_data = next_cmd_id << 2;
+                    let timeout_user_data = cmd_user_data | 1;
+                    let cancel_user_data = cmd_user_data | 2;
+                    next_cmd_id = next_cmd_id.wrapping_add(1);
+
+                    let mut cmd_entry = io_uring::opcode::UringCmd80::new(
                         io_uring::types::Fd(ublk_ctrl.as_raw_fd()),
                         opcode,
                     )
-                    .cmd(cmd_buf);
-                    if let Err(e) = unsafe { ring.submission().push(&sqe.build()) } {
-                        error!("write ublksrv_ctrl_cmd SQE failed: {}", e);
-                        send_completion(Err(io::Error::new(
-                            io::ErrorKind::Other,
-                            format!("push SQE failed: {e}"),
-                        )));
-                        return;
+                    .cmd(cmd_buf)
+                    .build()
+                    .user_data(cmd_user_data);
+
+                    if timeout.is_some() {
+                        cmd_entry = cmd_entry.flags(squeue::Flags::IO_LINK);
                     }
 
-                    trace!("submitting sqe");
-                    if let Err(e) = ring.submit_and_wait(1) {
-                        error!("submit_and_wait failed: {}", e);
+                    if let Err(e) = push_ctrl_entry(&mut ring, &cmd_entry) {
+                        error!("write ublksrv_ctrl_cmd SQE failed: {}", e);
                         send_completion(Err(e));
                         return;
                     }
 
-                    let Some(cqe) = ring.completion().next() else {
-                        error!("missing completion entry from ctrl ring");
-                        send_completion(Err(io::Error::new(
-                            io::ErrorKind::Other,
-                            "missing completion entry",
-                        )));
+                    let timeout_spec = timeout.map(types::Timespec::from);
+                    if let Some(ref ts) = timeout_spec {
+                        let timeout_entry = squeue::Entry128::from(
+                            io_uring::opcode::LinkTimeout::new(ts)
+                                .build()
+                                .user_data(timeout_user_data),
+                        );
+                        if let Err(e) = push_ctrl_entry(&mut ring, &timeout_entry) {
+                            error!("link timeout SQE failed: {}", e);
+                            send_completion(Err(e));
+                            return;
+                        }
+                    }
+
+                    if let Err(e) = ring.submitter().submit() {
+                        error!("submit ctrl SQE failed: {}", e);
+                        send_completion(Err(e));
                         return;
-                    };
-                    let result = cqe.result();
-                    trace!(result = result, "got cqe");
-                    send_completion(if result == 0 {
-                        Ok(())
-                    } else {
-                        Err(io::Error::from_raw_os_error(-result))
+                    }
+
+                    trace!("submitting sqe");
+                    let mut completion: Option<Result<i32, io::Error>> = None;
+                    while completion.is_none() {
+                        if let Err(e) = ring.submitter().submit_and_wait(1) {
+                            error!("submit_and_wait failed: {}", e);
+                            completion = Some(Err(e));
+                            break;
+                        }
+                        while let Some(cqe) = ring.completion().next() {
+                            let user_data = cqe.user_data();
+                            if user_data == cmd_user_data {
+                                completion = Some(Ok(cqe.result()));
+                                break;
+                            } else if timeout.is_some() && user_data == timeout_user_data {
+                                trace!(res = cqe.result(), "ctrl timeout completion");
+                                if let Err(err) =
+                                    submit_ctrl_cancel(&mut ring, cmd_user_data, cancel_user_data)
+                                {
+                                    warn!("ctrl cancel submit failed: {}", err);
+                                }
+                                completion =
+                                    Some(Err(io::Error::from_raw_os_error(libc::ETIME)));
+                                break;
+                            } else if timeout.is_some() && user_data == cancel_user_data {
+                                trace!(res = cqe.result(), "ctrl cancel completion");
+                            } else {
+                                trace!(user_data, res = cqe.result(), "ctrl extra completion");
+                            }
+                        }
+                    }
+
+                    while let Some(cqe) = ring.completion().next() {
+                        trace!(
+                            user_data = cqe.user_data(),
+                            res = cqe.result(),
+                            "drain ctrl cqe"
+                        );
+                    }
+
+                    let completion = completion.unwrap_or_else(|| {
+                        Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            "ctrl completion missing result",
+                        ))
                     });
+                    trace!(
+                        result = match completion {
+                            Ok(res) => res,
+                            Err(ref err) => -err.raw_os_error().unwrap_or(libc::EIO),
+                        },
+                        "ctrl completion"
+                    );
+                    let final_result = match completion {
+                        Ok(res) if res == 0 => Ok(()),
+                        Ok(res) => Err(io::Error::from_raw_os_error(-res)),
+                        Err(err) => Err(err),
+                    };
+                    send_completion(final_result);
                 });
             }
         });
@@ -138,6 +265,11 @@ impl SmooUblk {
             "device capacity must be divisible by 512"
         );
         let dev_sectors = (total_bytes / 512) as u64;
+        let queue_depth_bytes = block_size
+            .checked_mul(queue_depth as usize)
+            .unwrap_or(usize::MAX);
+        let desired_buf_bytes = cmp::max(block_size, queue_depth_bytes);
+        let max_io_buf_bytes = cmp::min(desired_buf_bytes, u32::MAX as usize) as u32;
 
         // For now we use -1 as the dev_id, so that a fresh dev is created for us.
         // Once we support resuming this needs to change.
@@ -148,18 +280,21 @@ impl SmooUblk {
             dev_id,
             nr_hw_queues: queue_count,
             queue_depth,
+            max_io_buf_bytes,
+            ublksrv_pid: unsafe { libc::getpid() } as i32,
             ..Default::default()
         };
 
         // ublk_params is passed in ublksrv_ctrl_dev_info during UBLK_CMD_SET_PARAMS
         let mut params = ublk_params {
-            len: size_of::<ublk_params>() as _,
+            len: size_of::<ublk_params>() as u32,
             types: UBLK_PARAM_TYPE_BASIC,
             basic: ublk_param_basic {
                 logical_bs_shift: logical_shift,
                 physical_bs_shift: logical_shift,
                 io_opt_shift: logical_shift,
                 io_min_shift: logical_shift,
+                max_sectors: cmp::max(info.max_io_buf_bytes >> 9, 1),
                 dev_sectors,
                 ..Default::default()
             },
@@ -175,20 +310,9 @@ impl SmooUblk {
         };
 
         // We begin the process by sending ublksrv_ctrl_dev_info along in a UBLK_CMD_ADD_DEV op
-        cmd.len = size_of::<sys::ublksrv_ctrl_dev_info>() as _;
+        cmd.len = ctrl_cmd_len::<sys::ublksrv_ctrl_dev_info>();
         cmd.addr = &raw mut info as _;
-        let (sender, receiver) = async_channel::bounded::<Result<(), io::Error>>(1);
-        // write the submission into the ring
-        self.sender
-            .send((UBLK_CMD_ADD_DEV, cmd, sender))
-            .await
-            .context("send sqe")?;
-        // wait for the completion
-        receiver
-            .recv()
-            .await
-            .context("recv cqe")?
-            .context("add dev")?;
+        submit_ctrl_command(&self.sender, UBLK_CMD_ADD_DEV, cmd, "add device", None).await?;
 
         // Whilst completing our UBLK_CMD_ADD_DEV op, the kernel wrote our true dev_id into the
         // ublksrv_ctrl_dev_info struct.
@@ -198,19 +322,358 @@ impl SmooUblk {
         // Now we pass the ublk_params in a UBLK_CMD_SET_PARAMS to inform ublk of geometry/capacity.
         cmd.len = params.len as _;
         cmd.addr = &raw mut params as _;
-        let (sender, receiver) = async_channel::bounded::<Result<(), io::Error>>(1);
-        // write the submission into the ring
-        self.sender
-            .send((UBLK_CMD_SET_PARAMS, cmd, sender))
-            .await
-            .context("send sqe")?;
-        // wait for the completion
-        receiver
+        submit_ctrl_command(&self.sender, UBLK_CMD_SET_PARAMS, cmd, "set params", None).await?;
+
+        let ioctl_encode = (info.flags & (sys::UBLK_F_CMD_IOCTL_ENCODE as u64)) != 0;
+        let cdev_path = format!("/dev/ublkc{}", dev_id);
+        let (request_tx, request_rx) = async_channel::unbounded::<UblkIoRequest>();
+        let mut completion_txs = Vec::with_capacity(queue_count as usize);
+        let mut workers = Vec::with_capacity(queue_count as usize);
+        let mut ready_rxs = Vec::with_capacity(queue_count as usize);
+
+        for queue_id in 0..queue_count {
+            let (complete_tx, complete_rx) = async_channel::unbounded::<QueueCompletion>();
+            let stop = Arc::new(AtomicBool::new(false));
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let cdev = File::options()
+                .read(true)
+                .write(true)
+                .open(&cdev_path)
+                .with_context(|| format!("open {}", cdev_path))?;
+            let worker_cfg = QueueWorkerConfig {
+                dev_id,
+                queue_id,
+                queue_depth,
+                ioctl_encode,
+                request_tx: request_tx.clone(),
+                completion_rx: complete_rx,
+                stop: stop.clone(),
+                cdev,
+                ready_tx,
+            };
+            let thread = spawn_queue_worker(worker_cfg)?;
+            completion_txs.push(complete_tx);
+            workers.push(QueueWorkerHandle { stop, thread });
+            ready_rxs.push(ready_rx);
+        }
+
+        for ready_rx in ready_rxs {
+            ready_rx.recv().context("queue worker init failed")?;
+        }
+
+        let device = SmooUblkDevice {
+            dev_id,
+            queue_count,
+            queue_depth,
+            request_rx,
+            completion_txs,
+            workers,
+        };
+
+        cmd.len = 0;
+        cmd.addr = 0;
+        cmd.data[0] = unsafe { libc::getpid() } as u64;
+        submit_ctrl_command(
+            &self.sender,
+            UBLK_CMD_START_DEV,
+            cmd,
+            "start device",
+            Some(START_DEV_TIMEOUT),
+        )
+        .await?;
+
+        Ok(device)
+    }
+}
+
+impl SmooUblkDevice {
+    pub async fn next_io(&self) -> anyhow::Result<UblkIoRequest> {
+        self.request_rx
             .recv()
             .await
-            .context("recv cqe")?
-            .context("set ublk params")?;
-
-        Ok(SmooUblkDevice {})
+            .context("smoo-ublk device channel closed")
     }
+
+    pub fn complete_io(&self, request: UblkIoRequest, result: i32) -> anyhow::Result<()> {
+        let sender = self
+            .completion_txs
+            .get(request.queue_id as usize)
+            .context("invalid queue id")?;
+
+        sender
+            .send_blocking(QueueCompletion {
+                tag: request.tag,
+                result,
+            })
+            .context("complete queue command")
+    }
+}
+
+impl Drop for SmooUblkDevice {
+    fn drop(&mut self) {
+        for worker in &self.workers {
+            worker.stop.store(true, Ordering::SeqCst);
+        }
+        for sender in &self.completion_txs {
+            sender.close();
+        }
+        for worker in self.workers.drain(..) {
+            if let Err(e) = worker.thread.join() {
+                error!("queue worker join failed: {:?}", e);
+            }
+        }
+    }
+}
+
+struct QueueWorkerConfig {
+    dev_id: u32,
+    queue_id: u16,
+    queue_depth: u16,
+    ioctl_encode: bool,
+    request_tx: Sender<UblkIoRequest>,
+    completion_rx: Receiver<QueueCompletion>,
+    stop: Arc<AtomicBool>,
+    cdev: File,
+    ready_tx: mpsc::Sender<()>,
+}
+
+struct CmdBuf {
+    ptr: *mut libc::c_void,
+    len: usize,
+}
+
+impl Drop for CmdBuf {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.ptr, self.len);
+        }
+    }
+}
+
+fn spawn_queue_worker(cfg: QueueWorkerConfig) -> anyhow::Result<JoinHandle<()>> {
+    let name = format!("smoo-ublk-q{}", cfg.queue_id);
+    let thread = std::thread::Builder::new().name(name).spawn(move || {
+        if let Err(err) = queue_worker_main(cfg) {
+            error!("queue worker exited: {:?}", err);
+        }
+    })?;
+    Ok(thread)
+}
+
+fn queue_worker_main(cfg: QueueWorkerConfig) -> anyhow::Result<()> {
+    let QueueWorkerConfig {
+        dev_id,
+        queue_id,
+        queue_depth,
+        ioctl_encode,
+        request_tx,
+        completion_rx,
+        stop,
+        cdev,
+        ready_tx,
+    } = cfg;
+
+    let mut ring = IoUring::<io_uring::squeue::Entry, io_uring::cqueue::Entry>::builder()
+        .setup_cqsize(queue_depth as u32)
+        .setup_coop_taskrun()
+        .build(queue_depth as u32)?;
+
+    let cmd_buf_sz = queue_cmd_buf_size(queue_depth as u32);
+    let max_cmd_buf_sz = queue_cmd_buf_size(sys::UBLK_MAX_QUEUE_DEPTH as u32);
+    let offset = sys::UBLKSRV_CMD_BUF_OFFSET as libc::off_t
+        + (queue_id as libc::off_t) * max_cmd_buf_sz as libc::off_t;
+    let raw_cmd_buf = unsafe {
+        libc::mmap(
+            ptr::null_mut(),
+            cmd_buf_sz,
+            libc::PROT_READ,
+            libc::MAP_SHARED | libc::MAP_POPULATE,
+            cdev.as_raw_fd(),
+            offset,
+        )
+    };
+    let raw_cmd_buf = if raw_cmd_buf == libc::MAP_FAILED {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(raw_cmd_buf)
+    }
+    .context("map command buffer")?;
+    let cmd_buf = CmdBuf {
+        ptr: raw_cmd_buf,
+        len: cmd_buf_sz,
+    };
+    let iod_base = cmd_buf.ptr as *mut ublksrv_io_desc;
+    let fd = cdev.as_raw_fd();
+
+    for tag in 0..queue_depth {
+        let desc_ptr = unsafe { iod_base.add(tag as usize) } as *mut ublksrv_io_desc;
+        queue_cmd(
+            &mut ring,
+            fd,
+            queue_id,
+            tag,
+            desc_ptr as u64,
+            UBLK_U_IO_FETCH_REQ,
+            -1,
+            ioctl_encode,
+        )?;
+    }
+    ring.submitter().submit()?;
+    let _ = ready_tx.send(());
+
+    let timeout = types::Timespec::from(Duration::from_millis(5));
+    let submit_args = types::SubmitArgs::new().timespec(&timeout);
+
+    while !stop.load(Ordering::SeqCst) {
+        while let Ok(comp) = completion_rx.try_recv() {
+            let desc_ptr = unsafe { iod_base.add(comp.tag as usize) } as *mut ublksrv_io_desc;
+            queue_cmd(
+                &mut ring,
+                fd,
+                queue_id,
+                comp.tag,
+                desc_ptr as u64,
+                UBLK_U_IO_COMMIT_AND_FETCH_REQ,
+                comp.result,
+                ioctl_encode,
+            )?;
+        }
+
+        match ring.submitter().submit_with_args(1, &submit_args) {
+            Ok(_) => {}
+            Err(err) => {
+                if matches!(err.raw_os_error(), Some(x) if x == libc::ETIME) {
+                    continue;
+                }
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err.into());
+            }
+        }
+
+        while let Some(cqe) = ring.completion().next() {
+            let result = cqe.result();
+            if result < 0 {
+                warn!(
+                    dev = dev_id,
+                    queue = queue_id,
+                    "queue cqe error: {}",
+                    result
+                );
+                return Err(io::Error::from_raw_os_error(-result).into());
+            }
+            let tag = cqe.user_data() as u16;
+            let desc = unsafe { ptr::read(iod_base.add(tag as usize)) };
+            let request = UblkIoRequest {
+                dev_id,
+                queue_id,
+                tag,
+                op: decode_op(desc.op_flags),
+                sector: desc.start_sector,
+                num_sectors: desc.nr_sectors,
+            };
+            if request_tx.send_blocking(request).is_err() {
+                return Ok(());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn queue_cmd(
+    ring: &mut IoUring<io_uring::squeue::Entry, io_uring::cqueue::Entry>,
+    fd: i32,
+    queue_id: u16,
+    tag: u16,
+    desc_addr: u64,
+    opcode: u32,
+    result: i32,
+    ioctl_encode: bool,
+) -> io::Result<()> {
+    let io_cmd = ublksrv_io_cmd {
+        q_id: queue_id,
+        tag,
+        result,
+        addr: desc_addr,
+    };
+    let cmd_bytes: [u8; 16] = unsafe { transmute(io_cmd) };
+    let sqe = io_uring::opcode::UringCmd16::new(types::Fd(fd), encode_cmd_op(opcode, ioctl_encode))
+        .cmd(cmd_bytes)
+        .build()
+        .user_data(tag as u64);
+
+    loop {
+        match unsafe { ring.submission().push(&sqe) } {
+            Ok(_) => break,
+            Err(_) => {
+                ring.submitter().submit()?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn push_ctrl_entry(
+    ring: &mut IoUring<io_uring::squeue::Entry128, cqueue::Entry>,
+    entry: &io_uring::squeue::Entry128,
+) -> io::Result<()> {
+    loop {
+        match unsafe { ring.submission().push(entry) } {
+            Ok(_) => return Ok(()),
+            Err(_) => {
+                let _ = ring.submitter().submit()?;
+            }
+        }
+    }
+}
+
+fn ctrl_cmd_len<T>() -> u16 {
+    u16::try_from(size_of::<T>()).expect("control struct larger than u16")
+}
+
+fn queue_cmd_buf_size(depth: u32) -> usize {
+    let desc_bytes = depth as usize * size_of::<ublksrv_io_desc>();
+    let page_sz = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+    if desc_bytes == 0 {
+        return page_sz;
+    }
+    ((desc_bytes + page_sz - 1) / page_sz) * page_sz
+}
+
+fn encode_cmd_op(cmd: u32, ioctl_encode: bool) -> u32 {
+    if ioctl_encode { cmd } else { cmd & 0xff }
+}
+
+fn decode_op(op_flags: u32) -> UblkOp {
+    match op_flags & 0xff {
+        UBLK_IO_OP_READ => UblkOp::Read,
+        UBLK_IO_OP_WRITE => UblkOp::Write,
+        UBLK_IO_OP_FLUSH => UblkOp::Flush,
+        UBLK_IO_OP_DISCARD => UblkOp::Discard,
+        other => UblkOp::Unknown(other),
+    }
+}
+
+async fn submit_ctrl_command(
+    sender: &Sender<CtrlCommand>,
+    opcode: u32,
+    cmd: ublksrv_ctrl_cmd,
+    label: &'static str,
+    timeout: Option<Duration>,
+) -> anyhow::Result<()> {
+    let (reply_tx, reply_rx) = async_channel::bounded::<Result<(), io::Error>>(1);
+    sender
+        .send((opcode, cmd, reply_tx, timeout))
+        .await
+        .context("send ctrl command")?;
+    reply_rx
+        .recv()
+        .await
+        .context("ctrl loop closed")?
+        .map_err(anyhow::Error::from)
+        .with_context(|| format!("{label} failed"))?;
+    Ok(())
 }
