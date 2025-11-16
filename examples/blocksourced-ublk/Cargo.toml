@@ -9,6 +9,7 @@ clap = { version = "4.5.20", features = ["derive"] }
 libc = "0.2.177"
 smoo-host-core = { path = "../../crates/smoo-host-core" }
 smoo-ublk = { path = "../../crates/smoo-ublk" }
-tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "sync"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+ctrlc = "3.4.5"

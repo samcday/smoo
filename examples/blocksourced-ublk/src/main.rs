@@ -14,10 +14,10 @@
 
 use anyhow::{Context, ensure};
 use clap::{ArgGroup, Parser};
-use libc;
 use smoo_host_core::{BlockSource, DeviceBlockSource, FileBlockSource};
 use smoo_ublk::{SmooUblk, UblkIoRequest, UblkOp};
 use std::{io, path::PathBuf, sync::Arc};
+use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 use tracing_subscriber::prelude::*;
 
@@ -67,6 +67,15 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("determine block count")?;
 
+    let shutdown = Arc::new(Notify::new());
+    {
+        let notify = shutdown.clone();
+        ctrlc::set_handler(move || {
+            notify.notify_waiters();
+        })
+        .context("install ctrl-c handler")?;
+    }
+
     let mut ublk = SmooUblk::new().context("init ublk")?;
     let device = ublk
         .setup_device(block_size, block_count, args.queue_count, args.queue_depth)
@@ -89,131 +98,153 @@ async fn main() -> anyhow::Result<()> {
         "ublk device configured"
     );
 
+    let mut io_error = None;
     loop {
-        let req = device.next_io().await.context("receive ublk io")?;
-        let req_len = match request_byte_len(&req, block_size) {
-            Ok(len) => len,
-            Err(err) => {
-                let errno = errno_from_io(&err);
-                warn!(
+        tokio::select! {
+            _ = shutdown.notified() => {
+                info!("shutdown signal received");
+                break;
+            }
+            req = device.next_io() => {
+                let req = match req {
+                    Ok(req) => req,
+                    Err(err) => {
+                        io_error = Some(err.context("receive ublk io"));
+                        break;
+                    }
+                };
+                let req_len = match request_byte_len(&req, block_size) {
+                    Ok(len) => len,
+                    Err(err) => {
+                        let errno = errno_from_io(&err);
+                        warn!(
+                            queue = req.queue_id,
+                            tag = req.tag,
+                            errno = errno,
+                            ?req.op,
+                            "invalid request length: {err}"
+                        );
+                        device
+                            .complete_io(req, -errno)
+                            .context("complete invalid length")?;
+                        continue;
+                    }
+                };
+                debug!(
                     queue = req.queue_id,
                     tag = req.tag,
-                    errno = errno,
                     ?req.op,
-                    "invalid request length: {err}"
+                    sector = req.sector,
+                    num_sectors = req.num_sectors,
+                    bytes = req_len,
+                    "handling request"
                 );
-                device
-                    .complete_io(req, -errno)
-                    .context("complete invalid length")?;
-                continue;
-            }
-        };
-        debug!(
-            queue = req.queue_id,
-            tag = req.tag,
-            ?req.op,
-            sector = req.sector,
-            num_sectors = req.num_sectors,
-            bytes = req_len,
-            "handling request"
-        );
 
-        let result_bytes = match req.op {
-            UblkOp::Read => {
-                if req_len > buffer_pool.buffer_len() {
-                    warn!(
-                        queue = req.queue_id,
-                        tag = req.tag,
-                        req_bytes = req_len,
-                        buf_cap = buffer_pool.buffer_len(),
-                        "read request exceeds buffer pool capacity"
-                    );
-                    device
-                        .complete_io(req, -libc::EINVAL)
-                        .context("complete oversized request")?;
-                    continue;
-                }
-                let mut buf = buffer_pool
-                    .checkout(req.queue_id, req.tag)
-                    .context("checkout buffer")?;
-                source
-                    .read_blocks(req.sector, &mut buf[..req_len])
-                    .await
-                    .context("read backing source")?;
-                device
-                    .copy_to_kernel(req.queue_id, req.tag, &buf[..req_len])
-                    .context("copy read data to kernel")?;
-                buffer_pool.checkin(req.queue_id, req.tag, buf);
-                req_len
-            }
-            UblkOp::Write => {
-                if req_len > buffer_pool.buffer_len() {
-                    warn!(
-                        queue = req.queue_id,
-                        tag = req.tag,
-                        req_bytes = req_len,
-                        buf_cap = buffer_pool.buffer_len(),
-                        "write request exceeds buffer pool capacity"
-                    );
-                    device
-                        .complete_io(req, -libc::EINVAL)
-                        .context("complete oversized request")?;
-                    continue;
-                }
-                let mut buf = buffer_pool
-                    .checkout(req.queue_id, req.tag)
-                    .context("checkout buffer")?;
-                device
-                    .copy_from_kernel(req.queue_id, req.tag, &mut buf[..req_len])
-                    .context("copy write data from kernel")?;
-                source
-                    .write_blocks(req.sector, &buf[..req_len])
-                    .await
-                    .context("write backing source")?;
-                buffer_pool.checkin(req.queue_id, req.tag, buf);
-                req_len
-            }
-            UblkOp::Flush => {
-                source.flush().await.context("flush backing source")?;
-                0
-            }
-            UblkOp::Discard => {
-                source
-                    .discard(req.sector, req.num_sectors)
-                    .await
-                    .context("discard backing source")?;
-                0
-            }
-            UblkOp::Unknown(code) => {
-                warn!(
-                    queue = req.queue_id,
-                    tag = req.tag,
-                    code = code,
-                    "unsupported operation"
-                );
-                device
-                    .complete_io(req, -libc::EOPNOTSUPP)
-                    .context("complete unsupported op")?;
-                continue;
-            }
-        };
+                let result_bytes = match req.op {
+                    UblkOp::Read => {
+                        if req_len > buffer_pool.buffer_len() {
+                            warn!(
+                                queue = req.queue_id,
+                                tag = req.tag,
+                                req_bytes = req_len,
+                                buf_cap = buffer_pool.buffer_len(),
+                                "read request exceeds buffer pool capacity"
+                            );
+                            device
+                                .complete_io(req, -libc::EINVAL)
+                                .context("complete oversized request")?;
+                            continue;
+                        }
+                        let mut buf = buffer_pool
+                            .checkout(req.queue_id, req.tag)
+                            .context("checkout buffer")?;
+                        source
+                            .read_blocks(req.sector, &mut buf[..req_len])
+                            .await
+                            .context("read backing source")?;
+                        device
+                            .copy_to_kernel(req.queue_id, req.tag, &buf[..req_len])
+                            .context("copy read data to kernel")?;
+                        buffer_pool.checkin(req.queue_id, req.tag, buf);
+                        req_len
+                    }
+                    UblkOp::Write => {
+                        if req_len > buffer_pool.buffer_len() {
+                            warn!(
+                                queue = req.queue_id,
+                                tag = req.tag,
+                                req_bytes = req_len,
+                                buf_cap = buffer_pool.buffer_len(),
+                                "write request exceeds buffer pool capacity"
+                            );
+                            device
+                                .complete_io(req, -libc::EINVAL)
+                                .context("complete oversized request")?;
+                            continue;
+                        }
+                        let mut buf = buffer_pool
+                            .checkout(req.queue_id, req.tag)
+                            .context("checkout buffer")?;
+                        device
+                            .copy_from_kernel(req.queue_id, req.tag, &mut buf[..req_len])
+                            .context("copy write data from kernel")?;
+                        source
+                            .write_blocks(req.sector, &buf[..req_len])
+                            .await
+                            .context("write backing source")?;
+                        buffer_pool.checkin(req.queue_id, req.tag, buf);
+                        req_len
+                    }
+                    UblkOp::Flush => {
+                        source.flush().await.context("flush backing source")?;
+                        0
+                    }
+                    UblkOp::Discard => {
+                        source
+                            .discard(req.sector, req.num_sectors)
+                            .await
+                            .context("discard backing source")?;
+                        0
+                    }
+                    UblkOp::Unknown(code) => {
+                        warn!(
+                            queue = req.queue_id,
+                            tag = req.tag,
+                            code = code,
+                            "unsupported operation"
+                        );
+                        device
+                            .complete_io(req, -libc::EOPNOTSUPP)
+                            .context("complete unsupported op")?;
+                        continue;
+                    }
+                };
 
-        let result_code = match i32::try_from(result_bytes) {
-            Ok(val) => val,
-            Err(_) => {
-                warn!(
-                    queue = req.queue_id,
-                    tag = req.tag,
-                    bytes = result_bytes,
-                    "io result exceeds i32 range"
-                );
-                -libc::EIO
+                let result_code = match i32::try_from(result_bytes) {
+                    Ok(val) => val,
+                    Err(_) => {
+                        warn!(
+                            queue = req.queue_id,
+                            tag = req.tag,
+                            bytes = result_bytes,
+                            "io result exceeds i32 range"
+                        );
+                        -libc::EIO
+                    }
+                };
+                device
+                    .complete_io(req, result_code)
+                    .context("complete io")?;
             }
-        };
-        device
-            .complete_io(req, result_code)
-            .context("complete io")?;
+        }
     }
+
+    info!("stopping ublk device");
+    ublk.stop_dev(device, true).await.context("stop device")?;
+    if let Some(err) = io_error {
+        return Err(err);
+    }
+    Ok(())
 }
 
 async fn open_source(args: &Args) -> anyhow::Result<Arc<dyn BlockSource>> {

@@ -1,6 +1,6 @@
 use crate::sys::{
-    UBLK_CMD_ADD_DEV, UBLK_CMD_SET_PARAMS, UBLK_CMD_START_DEV, UBLK_IO_OP_DISCARD,
-    UBLK_IO_OP_FLUSH, UBLK_IO_OP_READ, UBLK_IO_OP_WRITE, UBLK_PARAM_TYPE_BASIC,
+    UBLK_CMD_ADD_DEV, UBLK_CMD_DEL_DEV, UBLK_CMD_SET_PARAMS, UBLK_CMD_START_DEV, UBLK_CMD_STOP_DEV,
+    UBLK_IO_OP_DISCARD, UBLK_IO_OP_FLUSH, UBLK_IO_OP_READ, UBLK_IO_OP_WRITE, UBLK_PARAM_TYPE_BASIC,
     UBLK_U_IO_COMMIT_AND_FETCH_REQ, UBLK_U_IO_FETCH_REQ, ublk_param_basic, ublk_params,
     ublksrv_ctrl_cmd, ublksrv_ctrl_dev_info, ublksrv_io_cmd, ublksrv_io_desc,
 };
@@ -34,7 +34,7 @@ mod sys {
 
 /// Top level interface to ublk. Creates SmooUblkDevices
 pub struct SmooUblk {
-    handle: JoinHandle<()>,
+    handle: Option<JoinHandle<()>>,
     sender: Sender<CtrlCommand>,
 }
 
@@ -57,6 +57,7 @@ pub struct SmooUblkDevice {
     completion_txs: Vec<Sender<QueueCompletion>>,
     workers: Vec<QueueWorkerHandle>,
     start_handle: Option<JoinHandle<()>>,
+    shutdown: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -235,7 +236,7 @@ impl SmooUblk {
                     };
                     trace!(result = completion_code, "ctrl completion");
                     let final_result = match completion {
-                        Ok(res) if res == 0 => Ok(()),
+                        Ok(0) => Ok(()),
                         Ok(res) => Err(io::Error::from_raw_os_error(-res)),
                         Err(err) => Err(err),
                     };
@@ -244,7 +245,10 @@ impl SmooUblk {
             }
         });
 
-        Ok(Self { handle, sender })
+        Ok(Self {
+            handle: Some(handle),
+            sender,
+        })
     }
 
     pub async fn setup_device(
@@ -408,6 +412,7 @@ impl SmooUblk {
             completion_txs,
             workers,
             start_handle: None,
+            shutdown: false,
         };
 
         cmd.len = 0;
@@ -435,6 +440,59 @@ impl SmooUblk {
         let mut device = device;
         device.start_handle = Some(start_thread);
         Ok(device)
+    }
+
+    /// Gracefully stop a running device and optionally delete the control node.
+    ///
+    /// All queue workers and io_uring resources are torn down before
+    /// sending `UBLK_CMD_STOP_DEV`, matching the kernel contract documented in
+    /// `Documentation/block/ublk.rst`. When `delete_ctrl` is true, a follow-up
+    /// `UBLK_CMD_DEL_DEV` removes the control character device so `/dev/ublkc*`
+    /// disappears as well.
+    pub async fn stop_dev(
+        &mut self,
+        mut device: SmooUblkDevice,
+        delete_ctrl: bool,
+    ) -> anyhow::Result<()> {
+        let dev_id = device.dev_id();
+        device.shutdown();
+        drop(device);
+
+        let cmd = ublksrv_ctrl_cmd {
+            dev_id,
+            queue_id: u16::MAX,
+            ..Default::default()
+        };
+        submit_ctrl_command(&self.sender, UBLK_CMD_STOP_DEV, cmd, "stop device", None).await?;
+
+        if delete_ctrl {
+            let del_cmd = ublksrv_ctrl_cmd {
+                dev_id,
+                queue_id: u16::MAX,
+                ..Default::default()
+            };
+            submit_ctrl_command(
+                &self.sender,
+                UBLK_CMD_DEL_DEV,
+                del_cmd,
+                "delete device",
+                None,
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+}
+
+impl Drop for SmooUblk {
+    fn drop(&mut self) {
+        self.sender.close();
+        if let Some(handle) = self.handle.take() {
+            if let Err(err) = handle.join() {
+                warn!("smoo-ublk ctrl loop panicked: {:?}", err);
+            }
+        }
     }
 }
 
@@ -537,10 +595,12 @@ impl SmooUblkDevice {
             .and_then(|v| v.checked_add(buf_offset as u64))
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "buffer offset overflow"))
     }
-}
 
-impl Drop for SmooUblkDevice {
-    fn drop(&mut self) {
+    fn shutdown(&mut self) {
+        if self.shutdown {
+            return;
+        }
+        self.shutdown = true;
         for worker in &self.workers {
             worker.stop.store(true, Ordering::SeqCst);
         }
@@ -557,6 +617,12 @@ impl Drop for SmooUblkDevice {
                 error!("start_dev thread join failed: {:?}", err);
             }
         }
+    }
+}
+
+impl Drop for SmooUblkDevice {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -622,7 +688,7 @@ fn queue_worker_main(cfg: QueueWorkerConfig) -> anyhow::Result<()> {
         .build(queue_depth as u32)?;
 
     let cmd_buf_sz = queue_cmd_buf_size(queue_depth as u32);
-    let max_cmd_buf_sz = queue_cmd_buf_size(sys::UBLK_MAX_QUEUE_DEPTH as u32);
+    let max_cmd_buf_sz = queue_cmd_buf_size(sys::UBLK_MAX_QUEUE_DEPTH);
     let offset = sys::UBLKSRV_CMD_BUF_OFFSET as libc::off_t
         + (queue_id as libc::off_t) * max_cmd_buf_sz as libc::off_t;
     let raw_cmd_buf = unsafe {
@@ -649,7 +715,7 @@ fn queue_worker_main(cfg: QueueWorkerConfig) -> anyhow::Result<()> {
     let fd = cdev.as_raw_fd();
 
     for tag in 0..queue_depth {
-        let desc_ptr = unsafe { iod_base.add(tag as usize) } as *mut ublksrv_io_desc;
+        let desc_ptr = unsafe { iod_base.add(tag as usize) };
         let cmd_addr = if user_copy { 0 } else { desc_ptr as u64 };
         trace!(
             dev_id = dev_id,
@@ -658,14 +724,16 @@ fn queue_worker_main(cfg: QueueWorkerConfig) -> anyhow::Result<()> {
             "posting initial UBLK_IO_FETCH_REQ"
         );
         queue_cmd(
-            &mut ring,
-            fd,
+            QueueCmdCtx {
+                ring: &mut ring,
+                fd,
+                ioctl_encode,
+            },
             queue_id,
             tag,
             cmd_addr,
             UBLK_U_IO_FETCH_REQ,
             -1,
-            ioctl_encode,
         )?;
     }
     ring.submitter().submit()?;
@@ -686,7 +754,7 @@ fn queue_worker_main(cfg: QueueWorkerConfig) -> anyhow::Result<()> {
 
     while !stop.load(Ordering::SeqCst) {
         while let Ok(comp) = completion_rx.try_recv() {
-            let desc_ptr = unsafe { iod_base.add(comp.tag as usize) } as *mut ublksrv_io_desc;
+            let desc_ptr = unsafe { iod_base.add(comp.tag as usize) };
             let cmd_addr = if user_copy { 0 } else { desc_ptr as u64 };
             trace!(
                 dev_id = dev_id,
@@ -696,14 +764,16 @@ fn queue_worker_main(cfg: QueueWorkerConfig) -> anyhow::Result<()> {
                 "issuing COMMIT_AND_FETCH"
             );
             queue_cmd(
-                &mut ring,
-                fd,
+                QueueCmdCtx {
+                    ring: &mut ring,
+                    fd,
+                    ioctl_encode,
+                },
                 queue_id,
                 comp.tag,
                 cmd_addr,
                 UBLK_U_IO_COMMIT_AND_FETCH_REQ,
                 comp.result,
-                ioctl_encode,
             )?;
         }
 
@@ -764,16 +834,25 @@ fn queue_worker_main(cfg: QueueWorkerConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn queue_cmd(
-    ring: &mut IoUring<io_uring::squeue::Entry, io_uring::cqueue::Entry>,
+struct QueueCmdCtx<'ring> {
+    ring: &'ring mut IoUring<io_uring::squeue::Entry, io_uring::cqueue::Entry>,
     fd: i32,
+    ioctl_encode: bool,
+}
+
+fn queue_cmd(
+    ctx: QueueCmdCtx<'_>,
     queue_id: u16,
     tag: u16,
     desc_addr: u64,
     opcode: u32,
     result: i32,
-    ioctl_encode: bool,
 ) -> io::Result<()> {
+    let QueueCmdCtx {
+        ring,
+        fd,
+        ioctl_encode,
+    } = ctx;
     let io_cmd = ublksrv_io_cmd {
         q_id: queue_id,
         tag,
@@ -845,7 +924,7 @@ fn queue_cmd_buf_size(depth: u32) -> usize {
     if desc_bytes == 0 {
         return page_sz;
     }
-    ((desc_bytes + page_sz - 1) / page_sz) * page_sz
+    desc_bytes.div_ceil(page_sz) * page_sz
 }
 
 fn encode_cmd_op(cmd: u32, ioctl_encode: bool) -> u32 {
