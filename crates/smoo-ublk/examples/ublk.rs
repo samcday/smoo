@@ -1,19 +1,14 @@
-use tracing_subscriber::prelude::*;
 use smoo_ublk::SmooUblk;
+use tracing_subscriber::prelude::*;
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() {
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::from_default_env())
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    tracing::info!("fuck");
-    let mut ublk = SmooUblk::new()?;
+    let mut ublk = SmooUblk::new().expect("init ublk");
 
-    ublk.setup_device(512, 1, 1, 1).await?;
-
-    std::thread::sleep(std::time::Duration::from_secs(5));
-
-    Ok(())
+    ublk.setup_device(512, 1, 1, 1).await.expect("setup device");
 }
