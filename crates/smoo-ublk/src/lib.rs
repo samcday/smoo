@@ -20,7 +20,7 @@ use std::sync::{
 };
 use std::thread::JoinHandle;
 use std::time::Duration;
-use tracing::{Level, error, info, trace, warn};
+use tracing::{Level, debug, error, info, trace, warn};
 
 mod sys {
     #![allow(non_upper_case_globals)]
@@ -38,8 +38,6 @@ pub struct SmooUblk {
 }
 
 const CTRL_RING_DEPTH: u32 = 8;
-const START_DEV_TIMEOUT: Duration = Duration::from_secs(5);
-
 type CtrlCommand = (
     u32,
     ublksrv_ctrl_cmd,
@@ -54,6 +52,7 @@ pub struct SmooUblkDevice {
     request_rx: Receiver<UblkIoRequest>,
     completion_txs: Vec<Sender<QueueCompletion>>,
     workers: Vec<QueueWorkerHandle>,
+    start_handle: Option<JoinHandle<()>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -113,7 +112,7 @@ impl SmooUblk {
                     }
                 };
 
-                tracing::span!(Level::INFO, "ctrl cmd", opcode).in_scope(|| {
+                tracing::span!(Level::DEBUG, "ctrl cmd", opcode).in_scope(|| {
                     let send_completion = |res| {
                         if let Err(e) = reply.send_blocking(res) {
                             trace!("ctrl reply receiver dropped: {}", e);
@@ -182,26 +181,33 @@ impl SmooUblk {
                             completion = Some(Err(e));
                             break;
                         }
+                        let mut timeout_triggered = None;
                         while let Some(cqe) = ring.completion().next() {
                             let user_data = cqe.user_data();
                             if user_data == cmd_user_data {
                                 completion = Some(Ok(cqe.result()));
                                 break;
                             } else if timeout.is_some() && user_data == timeout_user_data {
-                                trace!(res = cqe.result(), "ctrl timeout completion");
-                                if let Err(err) =
-                                    submit_ctrl_cancel(&mut ring, cmd_user_data, cancel_user_data)
-                                {
-                                    warn!("ctrl cancel submit failed: {}", err);
-                                }
-                                completion =
-                                    Some(Err(io::Error::from_raw_os_error(libc::ETIME)));
+                                timeout_triggered = Some(cqe.result());
                                 break;
                             } else if timeout.is_some() && user_data == cancel_user_data {
                                 trace!(res = cqe.result(), "ctrl cancel completion");
                             } else {
-                                trace!(user_data, res = cqe.result(), "ctrl extra completion");
+                                trace!(
+                                    user_data = user_data,
+                                    res = cqe.result(),
+                                    "ctrl extra completion"
+                                );
                             }
+                        }
+                        if let Some(res) = timeout_triggered {
+                            trace!(res = res, "ctrl timeout completion");
+                            if let Err(err) =
+                                submit_ctrl_cancel(&mut ring, cmd_user_data, cancel_user_data)
+                            {
+                                warn!("ctrl cancel submit failed: {}", err);
+                            }
+                            completion = Some(Err(io::Error::from_raw_os_error(libc::ETIME)));
                         }
                     }
 
@@ -219,13 +225,11 @@ impl SmooUblk {
                             "ctrl completion missing result",
                         ))
                     });
-                    trace!(
-                        result = match completion {
-                            Ok(res) => res,
-                            Err(ref err) => -err.raw_os_error().unwrap_or(libc::EIO),
-                        },
-                        "ctrl completion"
-                    );
+                    let completion_code = match &completion {
+                        Ok(res) => *res,
+                        Err(err) => -err.raw_os_error().unwrap_or(libc::EIO),
+                    };
+                    trace!(result = completion_code, "ctrl completion");
                     let final_result = match completion {
                         Ok(res) if res == 0 => Ok(()),
                         Ok(res) => Err(io::Error::from_raw_os_error(-res)),
@@ -246,6 +250,13 @@ impl SmooUblk {
         queue_count: u16,
         queue_depth: u16,
     ) -> anyhow::Result<SmooUblkDevice> {
+        debug!(
+            block_size = block_size,
+            block_count = block_count,
+            queue_count = queue_count,
+            queue_depth = queue_depth,
+            "setup_device requested"
+        );
         ensure!(block_size != 0, "block size must be non-zero");
         ensure!(
             block_size.is_power_of_two(),
@@ -313,6 +324,7 @@ impl SmooUblk {
         cmd.len = ctrl_cmd_len::<sys::ublksrv_ctrl_dev_info>();
         cmd.addr = &raw mut info as _;
         submit_ctrl_command(&self.sender, UBLK_CMD_ADD_DEV, cmd, "add device", None).await?;
+        debug!(dev_id = info.dev_id, "add_dev completed");
 
         // Whilst completing our UBLK_CMD_ADD_DEV op, the kernel wrote our true dev_id into the
         // ublksrv_ctrl_dev_info struct.
@@ -351,14 +363,20 @@ impl SmooUblk {
                 cdev,
                 ready_tx,
             };
+            debug!(queue_id = queue_id, "spawning queue worker");
             let thread = spawn_queue_worker(worker_cfg)?;
             completion_txs.push(complete_tx);
             workers.push(QueueWorkerHandle { stop, thread });
             ready_rxs.push(ready_rx);
         }
 
-        for ready_rx in ready_rxs {
+        for (queue_idx, ready_rx) in ready_rxs.into_iter().enumerate() {
             ready_rx.recv().context("queue worker init failed")?;
+            debug!(
+                queue_ready = true,
+                queue_id = queue_idx,
+                "queue worker ready"
+            );
         }
 
         let device = SmooUblkDevice {
@@ -368,30 +386,54 @@ impl SmooUblk {
             request_rx,
             completion_txs,
             workers,
+            start_handle: None,
         };
 
         cmd.len = 0;
         cmd.addr = 0;
         cmd.data[0] = unsafe { libc::getpid() } as u64;
-        submit_ctrl_command(
-            &self.sender,
-            UBLK_CMD_START_DEV,
-            cmd,
-            "start device",
-            Some(START_DEV_TIMEOUT),
-        )
-        .await?;
+        let ctrl_sender = self.sender.clone();
+        let start_cmd = cmd;
+        let start_thread = std::thread::Builder::new()
+            .name(format!("smoo-ublk-start-{}", dev_id))
+            .spawn(move || {
+                info!(dev_id = dev_id, "start_dev thread begin");
+                let res = submit_ctrl_command_blocking(
+                    &ctrl_sender,
+                    UBLK_CMD_START_DEV,
+                    start_cmd,
+                    "start device",
+                );
+                match res {
+                    Ok(()) => info!(dev_id = dev_id, "start_dev completed"),
+                    Err(err) => error!(dev_id = dev_id, "start_dev failed: {:?}", err),
+                }
+            })
+            .context("spawn start_dev thread")?;
 
+        let mut device = device;
+        device.start_handle = Some(start_thread);
         Ok(device)
     }
 }
 
 impl SmooUblkDevice {
     pub async fn next_io(&self) -> anyhow::Result<UblkIoRequest> {
-        self.request_rx
+        let req = self
+            .request_rx
             .recv()
             .await
-            .context("smoo-ublk device channel closed")
+            .context("smoo-ublk device channel closed")?;
+        trace!(
+            dev_id = req.dev_id,
+            queue_id = req.queue_id,
+            tag = req.tag,
+            op = ?req.op,
+            sector = req.sector,
+            num_sectors = req.num_sectors,
+            "next_io"
+        );
+        Ok(req)
     }
 
     pub fn complete_io(&self, request: UblkIoRequest, result: i32) -> anyhow::Result<()> {
@@ -400,6 +442,13 @@ impl SmooUblkDevice {
             .get(request.queue_id as usize)
             .context("invalid queue id")?;
 
+        trace!(
+            dev_id = request.dev_id,
+            queue_id = request.queue_id,
+            tag = request.tag,
+            result = result,
+            "complete_io enqueue"
+        );
         sender
             .send_blocking(QueueCompletion {
                 tag: request.tag,
@@ -420,6 +469,11 @@ impl Drop for SmooUblkDevice {
         for worker in self.workers.drain(..) {
             if let Err(e) = worker.thread.join() {
                 error!("queue worker join failed: {:?}", e);
+            }
+        }
+        if let Some(handle) = self.start_handle.take() {
+            if let Err(err) = handle.join() {
+                error!("start_dev thread join failed: {:?}", err);
             }
         }
     }
@@ -473,6 +527,12 @@ fn queue_worker_main(cfg: QueueWorkerConfig) -> anyhow::Result<()> {
         ready_tx,
     } = cfg;
 
+    debug!(
+        dev_id = dev_id,
+        queue_id = queue_id,
+        queue_depth = queue_depth,
+        "queue worker starting"
+    );
     let mut ring = IoUring::<io_uring::squeue::Entry, io_uring::cqueue::Entry>::builder()
         .setup_cqsize(queue_depth as u32)
         .setup_coop_taskrun()
@@ -507,6 +567,12 @@ fn queue_worker_main(cfg: QueueWorkerConfig) -> anyhow::Result<()> {
 
     for tag in 0..queue_depth {
         let desc_ptr = unsafe { iod_base.add(tag as usize) } as *mut ublksrv_io_desc;
+        trace!(
+            dev_id = dev_id,
+            queue_id = queue_id,
+            tag = tag,
+            "posting initial UBLK_IO_FETCH_REQ"
+        );
         queue_cmd(
             &mut ring,
             fd,
@@ -519,7 +585,17 @@ fn queue_worker_main(cfg: QueueWorkerConfig) -> anyhow::Result<()> {
         )?;
     }
     ring.submitter().submit()?;
+    debug!(
+        dev_id = dev_id,
+        queue_id = queue_id,
+        "queue worker initial fetch submitted"
+    );
     let _ = ready_tx.send(());
+    debug!(
+        dev_id = dev_id,
+        queue_id = queue_id,
+        "queue worker ready signal sent"
+    );
 
     let timeout = types::Timespec::from(Duration::from_millis(5));
     let submit_args = types::SubmitArgs::new().timespec(&timeout);
@@ -527,6 +603,13 @@ fn queue_worker_main(cfg: QueueWorkerConfig) -> anyhow::Result<()> {
     while !stop.load(Ordering::SeqCst) {
         while let Ok(comp) = completion_rx.try_recv() {
             let desc_ptr = unsafe { iod_base.add(comp.tag as usize) } as *mut ublksrv_io_desc;
+            trace!(
+                dev_id = dev_id,
+                queue_id = queue_id,
+                tag = comp.tag,
+                result = comp.result,
+                "issuing COMMIT_AND_FETCH"
+            );
             queue_cmd(
                 &mut ring,
                 fd,
@@ -573,7 +656,21 @@ fn queue_worker_main(cfg: QueueWorkerConfig) -> anyhow::Result<()> {
                 sector: desc.start_sector,
                 num_sectors: desc.nr_sectors,
             };
+            trace!(
+                dev_id = dev_id,
+                queue_id = queue_id,
+                tag = tag,
+                op = ?request.op,
+                sector = request.sector,
+                num_sectors = request.num_sectors,
+                "queue received io"
+            );
             if request_tx.send_blocking(request).is_err() {
+                debug!(
+                    dev_id = dev_id,
+                    queue_id = queue_id,
+                    "request channel closed, terminating queue worker"
+                );
                 return Ok(());
             }
         }
@@ -598,6 +695,14 @@ fn queue_cmd(
         result,
         addr: desc_addr,
     };
+    trace!(
+        queue_id = queue_id,
+        tag = tag,
+        opcode = opcode,
+        result = result,
+        desc_addr = desc_addr,
+        "submitting uring cmd"
+    );
     let cmd_bytes: [u8; 16] = unsafe { transmute(io_cmd) };
     let sqe = io_uring::opcode::UringCmd16::new(types::Fd(fd), encode_cmd_op(opcode, ioctl_encode))
         .cmd(cmd_bytes)
@@ -628,6 +733,21 @@ fn push_ctrl_entry(
             }
         }
     }
+}
+
+fn submit_ctrl_cancel(
+    ring: &mut IoUring<io_uring::squeue::Entry128, cqueue::Entry>,
+    target_user_data: u64,
+    cancel_user_data: u64,
+) -> io::Result<()> {
+    let cancel_entry = squeue::Entry128::from(
+        io_uring::opcode::AsyncCancel::new(target_user_data)
+            .build()
+            .user_data(cancel_user_data),
+    );
+    push_ctrl_entry(ring, &cancel_entry)?;
+    ring.submitter().submit()?;
+    Ok(())
 }
 
 fn ctrl_cmd_len<T>() -> u16 {
@@ -665,13 +785,45 @@ async fn submit_ctrl_command(
     timeout: Option<Duration>,
 ) -> anyhow::Result<()> {
     let (reply_tx, reply_rx) = async_channel::bounded::<Result<(), io::Error>>(1);
+    debug!(
+        opcode = opcode,
+        dev_id = cmd.dev_id,
+        queue_id = cmd.queue_id,
+        len = cmd.len,
+        addr = cmd.addr,
+        timeout_ms = timeout.map(|t| t.as_millis() as u64),
+        "{label} submitting"
+    );
     sender
         .send((opcode, cmd, reply_tx, timeout))
         .await
         .context("send ctrl command")?;
-    reply_rx
+    let res = reply_rx
         .recv()
         .await
+        .context("ctrl loop closed")?
+        .map_err(anyhow::Error::from)
+        .with_context(|| format!("{label} failed"));
+    match &res {
+        Ok(_) => debug!(opcode = opcode, "{label} succeeded"),
+        Err(err) => debug!(opcode = opcode, error = ?err, "{label} failed"),
+    }
+    res?;
+    Ok(())
+}
+
+fn submit_ctrl_command_blocking(
+    sender: &Sender<CtrlCommand>,
+    opcode: u32,
+    cmd: ublksrv_ctrl_cmd,
+    label: &'static str,
+) -> anyhow::Result<()> {
+    let (reply_tx, reply_rx) = async_channel::bounded::<Result<(), io::Error>>(1);
+    sender
+        .send_blocking((opcode, cmd, reply_tx, None))
+        .context("send ctrl command blocking")?;
+    reply_rx
+        .recv_blocking()
         .context("ctrl loop closed")?
         .map_err(anyhow::Error::from)
         .with_context(|| format!("{label} failed"))?;
