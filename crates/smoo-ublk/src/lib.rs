@@ -1,14 +1,13 @@
 use crate::sys::{
-    UBLK_CMD_ADD_DEV, UBLK_CMD_DEL_DEV, UBLK_CMD_SET_PARAMS, UBLK_PARAM_TYPE_BASIC,
-    ublk_param_basic, ublk_params, ublksrv_ctrl_cmd, ublksrv_ctrl_dev_info,
+    UBLK_CMD_ADD_DEV, UBLK_CMD_SET_PARAMS, UBLK_PARAM_TYPE_BASIC, ublk_param_basic, ublk_params,
+    ublksrv_ctrl_cmd, ublksrv_ctrl_dev_info,
 };
-use anyhow::Context;
+use anyhow::{Context, ensure};
 use async_channel::{RecvError, Sender};
 use io_uring::IoUring;
 use std::fs::File;
 use std::io;
 use std::mem::size_of;
-use std::ops::Div;
 use std::os::fd::AsRawFd;
 use std::thread::JoinHandle;
 use tracing::{Level, error, info, trace};
@@ -120,8 +119,25 @@ impl SmooUblk {
         queue_count: u16,
         queue_depth: u16,
     ) -> anyhow::Result<SmooUblkDevice> {
-        // the kernel only cares about 512 blocks
-        let dev_sectors = block_count.div(512) as u64;
+        ensure!(block_size != 0, "block size must be non-zero");
+        ensure!(
+            block_size.is_power_of_two(),
+            "block size must be a power of two"
+        );
+        let logical_shift = block_size.trailing_zeros() as u8;
+        ensure!(
+            logical_shift >= 9,
+            "logical block size must be at least 512 bytes"
+        );
+
+        let total_bytes = block_count
+            .checked_mul(block_size)
+            .context("device capacity overflow")?;
+        ensure!(
+            total_bytes % 512 == 0,
+            "device capacity must be divisible by 512"
+        );
+        let dev_sectors = (total_bytes / 512) as u64;
 
         // For now we use -1 as the dev_id, so that a fresh dev is created for us.
         // Once we support resuming this needs to change.
@@ -140,7 +156,10 @@ impl SmooUblk {
             len: size_of::<ublk_params>() as _,
             types: UBLK_PARAM_TYPE_BASIC,
             basic: ublk_param_basic {
-                logical_bs_shift: block_count.trailing_zeros() as _,
+                logical_bs_shift: logical_shift,
+                physical_bs_shift: logical_shift,
+                io_opt_shift: logical_shift,
+                io_min_shift: logical_shift,
                 dev_sectors,
                 ..Default::default()
             },
