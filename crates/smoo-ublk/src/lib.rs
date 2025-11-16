@@ -12,6 +12,7 @@ use std::fs::File;
 use std::io;
 use std::mem::{size_of, transmute};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::FileExt;
 use std::ptr;
 use std::sync::{
     Arc,
@@ -49,6 +50,9 @@ pub struct SmooUblkDevice {
     dev_id: u32,
     queue_count: u16,
     queue_depth: u16,
+    block_size: usize,
+    max_io_bytes: usize,
+    data_file: Option<Arc<File>>,
     request_rx: Receiver<UblkIoRequest>,
     completion_txs: Vec<Sender<QueueCompletion>>,
     workers: Vec<QueueWorkerHandle>,
@@ -281,6 +285,7 @@ impl SmooUblk {
             .unwrap_or(usize::MAX);
         let desired_buf_bytes = cmp::max(block_size, queue_depth_bytes);
         let max_io_buf_bytes = cmp::min(desired_buf_bytes, u32::MAX as usize) as u32;
+        let max_io_bytes = max_io_buf_bytes as usize;
 
         // For now we use -1 as the dev_id, so that a fresh dev is created for us.
         // Once we support resuming this needs to change.
@@ -295,6 +300,7 @@ impl SmooUblk {
             ublksrv_pid: unsafe { libc::getpid() } as i32,
             ..Default::default()
         };
+        info.flags |= sys::UBLK_F_USER_COPY as u64;
 
         // ublk_params is passed in ublksrv_ctrl_dev_info during UBLK_CMD_SET_PARAMS
         let mut params = ublk_params {
@@ -337,7 +343,20 @@ impl SmooUblk {
         submit_ctrl_command(&self.sender, UBLK_CMD_SET_PARAMS, cmd, "set params", None).await?;
 
         let ioctl_encode = (info.flags & (sys::UBLK_F_CMD_IOCTL_ENCODE as u64)) != 0;
+        let user_copy = (info.flags & (sys::UBLK_F_USER_COPY as u64)) != 0;
         let cdev_path = format!("/dev/ublkc{}", dev_id);
+        let base_cdev = File::options()
+            .read(true)
+            .write(true)
+            .open(&cdev_path)
+            .with_context(|| format!("open {}", cdev_path))?;
+        let data_file = if user_copy {
+            Some(Arc::new(
+                base_cdev.try_clone().context("clone cdev for data plane")?,
+            ))
+        } else {
+            None
+        };
         let (request_tx, request_rx) = async_channel::unbounded::<UblkIoRequest>();
         let mut completion_txs = Vec::with_capacity(queue_count as usize);
         let mut workers = Vec::with_capacity(queue_count as usize);
@@ -347,16 +366,15 @@ impl SmooUblk {
             let (complete_tx, complete_rx) = async_channel::unbounded::<QueueCompletion>();
             let stop = Arc::new(AtomicBool::new(false));
             let (ready_tx, ready_rx) = mpsc::channel();
-            let cdev = File::options()
-                .read(true)
-                .write(true)
-                .open(&cdev_path)
-                .with_context(|| format!("open {}", cdev_path))?;
+            let cdev = base_cdev
+                .try_clone()
+                .with_context(|| format!("clone {}", cdev_path))?;
             let worker_cfg = QueueWorkerConfig {
                 dev_id,
                 queue_id,
                 queue_depth,
                 ioctl_encode,
+                user_copy,
                 request_tx: request_tx.clone(),
                 completion_rx: complete_rx,
                 stop: stop.clone(),
@@ -383,6 +401,9 @@ impl SmooUblk {
             dev_id,
             queue_count,
             queue_depth,
+            block_size,
+            max_io_bytes,
+            data_file,
             request_rx,
             completion_txs,
             workers,
@@ -418,6 +439,44 @@ impl SmooUblk {
 }
 
 impl SmooUblkDevice {
+    pub fn dev_id(&self) -> u32 {
+        self.dev_id
+    }
+
+    pub fn queue_count(&self) -> u16 {
+        self.queue_count
+    }
+
+    pub fn queue_depth(&self) -> u16 {
+        self.queue_depth
+    }
+
+    pub fn block_size(&self) -> usize {
+        self.block_size
+    }
+
+    pub fn max_io_bytes(&self) -> usize {
+        self.max_io_bytes
+    }
+
+    pub fn copy_from_kernel(&self, queue_id: u16, tag: u16, buf: &mut [u8]) -> io::Result<()> {
+        let file = self
+            .data_file
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "user copy disabled"))?;
+        let offset = self.user_copy_offset(queue_id, tag, 0)?;
+        read_exact_at(file, buf, offset)
+    }
+
+    pub fn copy_to_kernel(&self, queue_id: u16, tag: u16, buf: &[u8]) -> io::Result<()> {
+        let file = self
+            .data_file
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "user copy disabled"))?;
+        let offset = self.user_copy_offset(queue_id, tag, 0)?;
+        write_all_at(file, buf, offset)
+    }
+
     pub async fn next_io(&self) -> anyhow::Result<UblkIoRequest> {
         let req = self
             .request_rx
@@ -456,6 +515,28 @@ impl SmooUblkDevice {
             })
             .context("complete queue command")
     }
+
+    fn user_copy_offset(&self, queue_id: u16, tag: u16, buf_offset: usize) -> io::Result<u64> {
+        if queue_id as u32 >= self.queue_count as u32 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "queue id out of range",
+            ));
+        }
+        if tag as u32 >= self.queue_depth as u32 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "tag out of range",
+            ));
+        }
+        let base = sys::UBLKSRV_IO_BUF_OFFSET as u64;
+        let queue_bits = (queue_id as u64) << sys::UBLK_QID_OFF;
+        let tag_bits = (tag as u64) << sys::UBLK_TAG_OFF;
+        base.checked_add(queue_bits)
+            .and_then(|v| v.checked_add(tag_bits))
+            .and_then(|v| v.checked_add(buf_offset as u64))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "buffer offset overflow"))
+    }
 }
 
 impl Drop for SmooUblkDevice {
@@ -484,6 +565,7 @@ struct QueueWorkerConfig {
     queue_id: u16,
     queue_depth: u16,
     ioctl_encode: bool,
+    user_copy: bool,
     request_tx: Sender<UblkIoRequest>,
     completion_rx: Receiver<QueueCompletion>,
     stop: Arc<AtomicBool>,
@@ -520,6 +602,7 @@ fn queue_worker_main(cfg: QueueWorkerConfig) -> anyhow::Result<()> {
         queue_id,
         queue_depth,
         ioctl_encode,
+        user_copy,
         request_tx,
         completion_rx,
         stop,
@@ -567,6 +650,7 @@ fn queue_worker_main(cfg: QueueWorkerConfig) -> anyhow::Result<()> {
 
     for tag in 0..queue_depth {
         let desc_ptr = unsafe { iod_base.add(tag as usize) } as *mut ublksrv_io_desc;
+        let cmd_addr = if user_copy { 0 } else { desc_ptr as u64 };
         trace!(
             dev_id = dev_id,
             queue_id = queue_id,
@@ -578,7 +662,7 @@ fn queue_worker_main(cfg: QueueWorkerConfig) -> anyhow::Result<()> {
             fd,
             queue_id,
             tag,
-            desc_ptr as u64,
+            cmd_addr,
             UBLK_U_IO_FETCH_REQ,
             -1,
             ioctl_encode,
@@ -603,6 +687,7 @@ fn queue_worker_main(cfg: QueueWorkerConfig) -> anyhow::Result<()> {
     while !stop.load(Ordering::SeqCst) {
         while let Ok(comp) = completion_rx.try_recv() {
             let desc_ptr = unsafe { iod_base.add(comp.tag as usize) } as *mut ublksrv_io_desc;
+            let cmd_addr = if user_copy { 0 } else { desc_ptr as u64 };
             trace!(
                 dev_id = dev_id,
                 queue_id = queue_id,
@@ -615,7 +700,7 @@ fn queue_worker_main(cfg: QueueWorkerConfig) -> anyhow::Result<()> {
                 fd,
                 queue_id,
                 comp.tag,
-                desc_ptr as u64,
+                cmd_addr,
                 UBLK_U_IO_COMMIT_AND_FETCH_REQ,
                 comp.result,
                 ioctl_encode,
@@ -775,6 +860,34 @@ fn decode_op(op_flags: u32) -> UblkOp {
         UBLK_IO_OP_DISCARD => UblkOp::Discard,
         other => UblkOp::Unknown(other),
     }
+}
+
+fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
+    while !buf.is_empty() {
+        let read = file.read_at(buf, offset)?;
+        if read == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short read"));
+        }
+        buf = &mut buf[read..];
+        offset = offset
+            .checked_add(read as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "offset overflow"))?;
+    }
+    Ok(())
+}
+
+fn write_all_at(file: &File, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
+    while !buf.is_empty() {
+        let written = file.write_at(buf, offset)?;
+        if written == 0 {
+            return Err(io::Error::new(io::ErrorKind::WriteZero, "short write"));
+        }
+        buf = &buf[written..];
+        offset = offset
+            .checked_add(written as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "offset overflow"))?;
+    }
+    Ok(())
 }
 
 async fn submit_ctrl_command(
