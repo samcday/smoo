@@ -6,19 +6,26 @@ use smoo_host_core::{BlockSource, BlockSourceResult, HostErrorKind, SmooHost};
 use smoo_host_rusb::{RusbTransport, RusbTransportConfig};
 use std::{path::PathBuf, time::Duration};
 use tokio::signal;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
+
+const SMOO_INTERFACE_CLASS: u8 = 0xFF;
+const SMOO_INTERFACE_SUBCLASS: u8 = 0x53;
+const SMOO_INTERFACE_PROTOCOL: u8 = 0x4D;
 
 #[derive(Debug, Parser)]
 #[command(name = "smoo-host-cli")]
-#[command(about = "Host shim for smoo gadgets", long_about = None)]
+#[command(
+    about = "Host shim for smoo gadgets",
+    long_about = "Host shim for smoo gadgets. By default all visible USB devices are scanned and the first interface matching the vendor triple 0xFF/0x53/0x4D is selected."
+)]
 #[command(group = ArgGroup::new("backing").args(["file", "device"]).required(true))]
 struct Args {
-    /// USB vendor ID of the gadget
-    #[arg(long, default_value_t = 0xDEAD)]
-    vendor_id: u16,
-    /// USB product ID of the gadget
-    #[arg(long, default_value_t = 0xBEEF)]
-    product_id: u16,
+    /// Optional USB vendor ID filter (hex). Defaults to all vendors.
+    #[arg(long, value_name = "HEX", value_parser = parse_hex_u16)]
+    vendor_id: Option<u16>,
+    /// Optional USB product ID filter (hex). Defaults to all products.
+    #[arg(long, value_name = "HEX", value_parser = parse_hex_u16)]
+    product_id: Option<u16>,
     /// Optional disk image backing file
     #[arg(long, value_name = "PATH")]
     file: Option<PathBuf>,
@@ -28,9 +35,6 @@ struct Args {
     /// Logical block size exposed through the gadget (bytes)
     #[arg(long, default_value_t = 512)]
     block_size: u32,
-    /// USB interface number that carries the FunctionFS endpoints
-    #[arg(long, default_value_t = 0)]
-    interface: u8,
     /// Control/interrupt transfer timeout in milliseconds
     #[arg(long, default_value_t = 1000)]
     timeout_ms: u64,
@@ -95,13 +99,12 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-
     let source = open_source(&args).await.context("open block source")?;
-    let handle = open_device(&args).context("open usb device")?;
+    let (handle, interface) = discover_device(&args).context("discover usb device")?;
     let (interrupt_in, interrupt_out) =
-        infer_interrupt_endpoints(&handle, args.interface).context("discover endpoints")?;
+        infer_interrupt_endpoints(&handle, interface).context("discover endpoints")?;
     let transport_config = RusbTransportConfig {
-        interface: args.interface,
+        interface,
         interrupt_in,
         interrupt_out,
         timeout: Duration::from_millis(args.timeout_ms),
@@ -151,21 +154,89 @@ async fn open_source(args: &Args) -> Result<HostSource> {
     }
 }
 
-fn open_device(args: &Args) -> Result<rusb::DeviceHandle<rusb::Context>> {
+fn discover_device(args: &Args) -> Result<(rusb::DeviceHandle<rusb::Context>, u8)> {
     let context = rusb::Context::new().context("init libusb context")?;
-    let handle = context
-        .open_device_with_vid_pid(args.vendor_id, args.product_id)
-        .ok_or_else(|| {
-            anyhow!(
-                "device {:04x}:{:04x} not found",
-                args.vendor_id,
-                args.product_id
-            )
-        })?;
-    handle
-        .set_auto_detach_kernel_driver(true)
-        .context("enable auto-detach")?;
-    Ok(handle)
+    let devices = context.devices().context("enumerate usb devices")?;
+    info!(
+        vendor_filter = args.vendor_id.map(|v| format!("{:#06x}", v)),
+        product_filter = args.product_id.map(|p| format!("{:#06x}", p)),
+        "scanning USB devices for smoo gadget"
+    );
+    for device in devices.iter() {
+        let device_desc = match device.device_descriptor() {
+            Ok(desc) => desc,
+            Err(err) => {
+                warn!(error = %err, "read device descriptor failed");
+                continue;
+            }
+        };
+        if let Some(vendor) = args.vendor_id {
+            if device_desc.vendor_id() != vendor {
+                debug!(
+                    vid = format_args!("{:#06x}", device_desc.vendor_id()),
+                    pid = format_args!("{:#06x}", device_desc.product_id()),
+                    "skipping device due to vendor filter"
+                );
+                continue;
+            }
+        } else {
+            debug!(
+                vid = format_args!("{:#06x}", device_desc.vendor_id()),
+                pid = format_args!("{:#06x}", device_desc.product_id()),
+                "examining usb device"
+            );
+        }
+        if let Some(product) = args.product_id {
+            if device_desc.product_id() != product {
+                debug!("skipping device due to product filter");
+                continue;
+            }
+        }
+        for cfg_idx in 0..device_desc.num_configurations() {
+            let config = match device.config_descriptor(cfg_idx) {
+                Ok(cfg) => cfg,
+                Err(err) => {
+                    warn!(error = %err, config = cfg_idx, "read config descriptor failed");
+                    continue;
+                }
+            };
+            for interface in config.interfaces() {
+                for desc in interface.descriptors() {
+                    let iface_num = desc.interface_number();
+                    if desc.class_code() == SMOO_INTERFACE_CLASS
+                        && desc.sub_class_code() == SMOO_INTERFACE_SUBCLASS
+                        && desc.protocol_code() == SMOO_INTERFACE_PROTOCOL
+                    {
+                        let handle = match device.open() {
+                            Ok(handle) => handle,
+                            Err(err) => {
+                                warn!(error = %err, "failed to open matching usb device");
+                                continue;
+                            }
+                        };
+                        handle
+                            .set_auto_detach_kernel_driver(true)
+                            .context("enable auto-detach")?;
+                        info!(
+                            vid = format_args!("{:#06x}", device_desc.vendor_id()),
+                            pid = format_args!("{:#06x}", device_desc.product_id()),
+                            interface = iface_num,
+                            "selected smoo-compatible interface"
+                        );
+                        return Ok((handle, iface_num));
+                    }
+                }
+            }
+        }
+    }
+    Err(anyhow!(
+        "No smoo-compatible USB devices found{}.",
+        if args.vendor_id.is_some() || args.product_id.is_some() {
+            " (after applying filters)"
+        } else {
+            ""
+        }
+    ))
 }
 
 fn infer_interrupt_endpoints<T: UsbContext>(
@@ -201,4 +272,9 @@ fn infer_interrupt_endpoints<T: UsbContext>(
         "interrupt endpoints not found for interface {}",
         interface
     ))
+}
+
+fn parse_hex_u16(s: &str) -> Result<u16, std::num::ParseIntError> {
+    let trimmed = s.trim_start_matches("0x").trim_start_matches("0X");
+    u16::from_str_radix(trimmed, 16)
 }
