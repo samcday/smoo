@@ -313,6 +313,7 @@ dependencies = [
  "ctrlc",
  "libc",
  "smoo-buffers",
+ "smoo-host-blocksources",
  "smoo-host-core",
  "smoo-ublk",
  "tokio",
@@ -1245,6 +1246,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "smoo-host-blocksources"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "smoo-host-core",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "smoo-host-cli"
 version = "0.1.0"
 dependencies = [
@@ -1257,18 +1269,14 @@ dependencies = [
 name = "smoo-host-core"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "async-trait",
  "smoo-proto",
- "tokio",
- "tracing",
 ]
 
 [[package]]
 name = "smoo-host-rusb"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "async-trait",
  "rusb",
  "smoo-host-core",

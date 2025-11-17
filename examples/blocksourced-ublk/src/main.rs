@@ -15,7 +15,8 @@
 use anyhow::{Context, ensure};
 use clap::{ArgGroup, Parser};
 use smoo_buffers::{BufferPool, VecBufferPool};
-use smoo_host_core::{BlockSource, DeviceBlockSource, FileBlockSource};
+use smoo_host_blocksources::{DeviceBlockSource, FileBlockSource};
+use smoo_host_core::BlockSource;
 use smoo_ublk::{SmooUblk, UblkIoRequest, UblkOp};
 use std::{io, path::PathBuf, sync::Arc};
 use tokio::sync::Notify;

@@ -1,7 +1,6 @@
-use anyhow::{Context, Result, anyhow, ensure};
 use async_trait::async_trait;
 use rusb::{DeviceHandle, Direction, Recipient, RequestType, UsbContext};
-use smoo_host_core::Transport;
+use smoo_host_core::{Transport, TransportError, TransportErrorKind, TransportResult};
 use smoo_proto::{IDENT_LEN, IDENT_REQUEST, Ident, REQUEST_LEN, RESPONSE_LEN, Request, Response};
 use std::{
     sync::{Arc, Mutex},
@@ -42,10 +41,10 @@ pub struct RusbTransport<T: UsbContext + Send + Sync + 'static> {
 }
 
 impl<T: UsbContext + Send + Sync + 'static> RusbTransport<T> {
-    pub fn new(handle: DeviceHandle<T>, config: RusbTransportConfig) -> Result<Self> {
+    pub fn new(handle: DeviceHandle<T>, config: RusbTransportConfig) -> TransportResult<Self> {
         handle
             .claim_interface(config.interface)
-            .context("claim usb interface")?;
+            .map_err(|err| map_rusb_error("claim usb interface", err))?;
         Ok(Self {
             handle: Arc::new(Mutex::new(handle)),
             config,
@@ -60,7 +59,7 @@ impl<T: UsbContext + Send + Sync + 'static> RusbTransport<T> {
 
 #[async_trait]
 impl<T: UsbContext + Send + Sync + 'static> Transport for RusbTransport<T> {
-    async fn setup(&mut self) -> Result<Ident> {
+    async fn setup(&mut self) -> TransportResult<Ident> {
         if let Some(ident) = self.ident {
             return Ok(ident);
         }
@@ -83,13 +82,16 @@ impl<T: UsbContext + Send + Sync + 'static> Transport for RusbTransport<T> {
             Ok::<_, rusb::Error>((read, data))
         })
         .await
-        .context("join ident control transfer")??;
+        .map_err(|err| join_error("ident control transfer", err))?
+        .map_err(|err| map_rusb_error("ident control transfer", err))?;
 
-        ensure!(
-            len == IDENT_LEN,
-            "ident control transfer truncated (expected {IDENT_LEN}, got {len})"
-        );
-        let ident = Ident::decode(buf).map_err(|err| anyhow!("decode ident response: {err}"))?;
+        if len != IDENT_LEN {
+            return Err(protocol_error(format!(
+                "ident control transfer truncated (expected {IDENT_LEN}, got {len})"
+            )));
+        }
+        let ident = Ident::decode(buf)
+            .map_err(|err| protocol_error(format!("decode ident response: {err}")))?;
         debug!(
             major = ident.major,
             minor = ident.minor,
@@ -100,8 +102,10 @@ impl<T: UsbContext + Send + Sync + 'static> Transport for RusbTransport<T> {
         Ok(ident)
     }
 
-    async fn read_request(&mut self) -> Result<Request> {
-        ensure!(self.ident.is_some(), "transport not set up");
+    async fn read_request(&mut self) -> TransportResult<Request> {
+        if self.ident.is_none() {
+            return Err(not_ready());
+        }
         let handle = self.handle.clone();
         let endpoint = self.config.interrupt_in;
         let timeout = self.config.timeout;
@@ -112,17 +116,21 @@ impl<T: UsbContext + Send + Sync + 'static> Transport for RusbTransport<T> {
             Ok::<_, rusb::Error>((read, data))
         })
         .await
-        .context("join interrupt-in read")??;
+        .map_err(|err| join_error("interrupt-in read", err))?
+        .map_err(|err| map_rusb_error("interrupt-in read", err))?;
 
-        ensure!(
-            len == REQUEST_LEN,
-            "request transfer truncated (expected {REQUEST_LEN}, got {len})"
-        );
-        Request::decode(buf).map_err(|err| anyhow!("decode request: {err}"))
+        if len != REQUEST_LEN {
+            return Err(protocol_error(format!(
+                "request transfer truncated (expected {REQUEST_LEN}, got {len})"
+            )));
+        }
+        Request::decode(buf).map_err(|err| protocol_error(format!("decode request: {err}")))
     }
 
-    async fn send_response(&mut self, response: Response) -> Result<()> {
-        ensure!(self.ident.is_some(), "transport not set up");
+    async fn send_response(&mut self, response: Response) -> TransportResult<()> {
+        if self.ident.is_none() {
+            return Err(not_ready());
+        }
         let handle = self.handle.clone();
         let endpoint = self.config.interrupt_out;
         let timeout = self.config.timeout;
@@ -132,12 +140,43 @@ impl<T: UsbContext + Send + Sync + 'static> Transport for RusbTransport<T> {
             handle.write_interrupt(endpoint, &data, timeout)
         })
         .await
-        .context("join interrupt-out write")??;
+        .map_err(|err| join_error("interrupt-out write", err))?
+        .map_err(|err| map_rusb_error("interrupt-out write", err))?;
 
-        ensure!(
-            written == RESPONSE_LEN,
-            "response transfer truncated (expected {RESPONSE_LEN}, wrote {written})"
-        );
+        if written != RESPONSE_LEN {
+            return Err(protocol_error(format!(
+                "response transfer truncated (expected {RESPONSE_LEN}, wrote {written})"
+            )));
+        }
         Ok(())
     }
+}
+
+fn map_rusb_error(op: &str, err: rusb::Error) -> TransportError {
+    let kind = match err {
+        rusb::Error::Timeout => TransportErrorKind::Timeout,
+        rusb::Error::NoDevice => TransportErrorKind::Disconnected,
+        rusb::Error::Pipe | rusb::Error::Overflow => TransportErrorKind::Protocol,
+        rusb::Error::NotFound => TransportErrorKind::Unsupported,
+        _ => TransportErrorKind::Other,
+    };
+    TransportError::with_message(kind, format!("{op}: {err}"))
+}
+
+fn join_error(op: &str, err: task::JoinError) -> TransportError {
+    TransportError::with_message(
+        TransportErrorKind::Other,
+        format!("{op} task join failed: {err}"),
+    )
+}
+
+fn not_ready() -> TransportError {
+    TransportError::with_message(
+        TransportErrorKind::NotReady,
+        "transport not set up".to_string(),
+    )
+}
+
+fn protocol_error(message: impl Into<String>) -> TransportError {
+    TransportError::with_message(TransportErrorKind::Protocol, message.into())
 }
