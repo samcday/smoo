@@ -1234,6 +1234,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "smoo-gadget-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "smoo-buffers",
+ "smoo-proto",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "smoo-host-cli"
 version = "0.1.0"
 dependencies = [
