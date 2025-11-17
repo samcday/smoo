@@ -4,10 +4,13 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-anyhow = "1.0.98"
-usb-gadget = { version = "0.7.5", features = ["tokio"] }
-tokio = { version = "1.44.2", features = ["macros", "rt"] }
-bytes = "1.10.1"
-libublk = "0.3.5"
-byteorder = "1.5.0"
-async-channel = "2.3.1"
+anyhow = "1.0.100"
+clap = { version = "4.5.20", features = ["derive"] }
+smoo-gadget-core = { path = "../../crates/smoo-gadget-core" }
+smoo-gadget-ublk = { path = "../../crates/smoo-gadget-ublk" }
+smoo-proto = { path = "../../crates/smoo-proto" }
+tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "signal"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+usb-gadget = { version = "0.7.6", features = ["tokio"] }
+libc = "0.2.177"
