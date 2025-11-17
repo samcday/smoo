@@ -1,60 +1,204 @@
-use byteorder::{ByteOrder, NetworkEndian, ReadBytesExt};
-use rusb::{Direction, Recipient, RequestType, TransferType};
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
-use std::time::Duration;
+use anyhow::{anyhow, Context, Result};
+use clap::{ArgGroup, Parser};
+use rusb::{Direction, TransferType, UsbContext};
+use smoo_host_blocksources::{DeviceBlockSource, FileBlockSource};
+use smoo_host_core::{BlockSource, BlockSourceResult, HostErrorKind, SmooHost};
+use smoo_host_rusb::{RusbTransport, RusbTransportConfig};
+use std::{path::PathBuf, time::Duration};
+use tokio::signal;
+use tracing::{info, warn};
 
-fn main() -> anyhow::Result<()> {
-    let handle = rusb::open_device_with_vid_pid(0xDEAD, 0xBEEF).unwrap();
+#[derive(Debug, Parser)]
+#[command(name = "smoo-host-cli")]
+#[command(about = "Host shim for smoo gadgets", long_about = None)]
+#[command(group = ArgGroup::new("backing").args(["file", "device"]).required(true))]
+struct Args {
+    /// USB vendor ID of the gadget
+    #[arg(long, default_value_t = 0xDEAD)]
+    vendor_id: u16,
+    /// USB product ID of the gadget
+    #[arg(long, default_value_t = 0xBEEF)]
+    product_id: u16,
+    /// Optional disk image backing file
+    #[arg(long, value_name = "PATH")]
+    file: Option<PathBuf>,
+    /// Optional block device backing file
+    #[arg(long, value_name = "PATH")]
+    device: Option<PathBuf>,
+    /// Logical block size exposed through the gadget (bytes)
+    #[arg(long, default_value_t = 512)]
+    block_size: u32,
+    /// USB interface number that carries the FunctionFS endpoints
+    #[arg(long, default_value_t = 0)]
+    interface: u8,
+    /// Control/interrupt transfer timeout in milliseconds
+    #[arg(long, default_value_t = 1000)]
+    timeout_ms: u64,
+}
 
-    let desc = handle.device().active_config_descriptor()?;
+enum HostSource {
+    File(FileBlockSource),
+    Device(DeviceBlockSource),
+}
 
-    for intf in desc.interfaces() {
-        for ep in intf.descriptors().next().unwrap().endpoint_descriptors() {
-            println!(
-                "ep: {:?} {}",
-                ep,
-                ep.transfer_type() == TransferType::Interrupt
-            );
+#[async_trait::async_trait]
+impl BlockSource for HostSource {
+    fn block_size(&self) -> u32 {
+        match self {
+            HostSource::File(inner) => inner.block_size(),
+            HostSource::Device(inner) => inner.block_size(),
         }
     }
 
-    handle.claim_interface(0)?;
+    async fn total_blocks(&self) -> BlockSourceResult<u64> {
+        match self {
+            HostSource::File(inner) => inner.total_blocks().await,
+            HostSource::Device(inner) => inner.total_blocks().await,
+        }
+    }
 
-    let mut buf: [u8; 512] = [0; 512];
+    async fn read_blocks(&self, lba: u64, buf: &mut [u8]) -> BlockSourceResult<usize> {
+        match self {
+            HostSource::File(inner) => inner.read_blocks(lba, buf).await,
+            HostSource::Device(inner) => inner.read_blocks(lba, buf).await,
+        }
+    }
 
-    let mut f = File::open("/tmp/file")?;
-    f.seek(SeekFrom::End(0))?;
-    NetworkEndian::write_u64(&mut buf, f.stream_position()?);
+    async fn write_blocks(&self, lba: u64, buf: &[u8]) -> BlockSourceResult<usize> {
+        match self {
+            HostSource::File(inner) => inner.write_blocks(lba, buf).await,
+            HostSource::Device(inner) => inner.write_blocks(lba, buf).await,
+        }
+    }
 
-    handle.write_control(
-        rusb::request_type(Direction::Out, RequestType::Vendor, Recipient::Interface),
-        0,
-        0,
-        0,
-        &buf[0..8],
-        Duration::from_secs(1),
-    )?;
+    async fn flush(&self) -> BlockSourceResult<()> {
+        match self {
+            HostSource::File(inner) => inner.flush().await,
+            HostSource::Device(inner) => inner.flush().await,
+        }
+    }
 
-    let mut read_buf = Vec::new();
+    async fn discard(&self, lba: u64, num_blocks: u32) -> BlockSourceResult<()> {
+        match self {
+            HostSource::File(inner) => inner.discard(lba, num_blocks).await,
+            HostSource::Device(inner) => inner.discard(lba, num_blocks).await,
+        }
+    }
+}
+
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .init();
+
+    let args = Args::parse();
+
+    let source = open_source(&args).await.context("open block source")?;
+    let handle = open_device(&args).context("open usb device")?;
+    let (interrupt_in, interrupt_out) =
+        infer_interrupt_endpoints(&handle, args.interface).context("discover endpoints")?;
+    let transport_config = RusbTransportConfig {
+        interface: args.interface,
+        interrupt_in,
+        interrupt_out,
+        timeout: Duration::from_millis(args.timeout_ms),
+    };
+    let transport = RusbTransport::new(handle, transport_config).context("init transport")?;
+    let mut host = SmooHost::new(transport, source);
+    let ident = host.setup().await.context("ident handshake")?;
+    info!(
+        major = ident.major,
+        minor = ident.minor,
+        "connected to smoo gadget"
+    );
+
     loop {
-        let read = handle.read_interrupt(129, &mut buf[0..16], Duration::from_secs(0))?;
-        assert_eq!(read, 16);
-
-        let mut buf_r = &buf[..];
-        let off = buf_r.read_u64::<NetworkEndian>()?;
-        let sz = buf_r.read_u64::<NetworkEndian>()?;
-
-        println!("read {} {}", off, sz);
-
-        read_buf.resize(sz as _, 0);
-
-        let resp = &mut read_buf[0..sz as usize];
-        f.seek(SeekFrom::Start(off))?;
-        f.read_exact(resp);
-
-        handle.write_bulk(2, &resp, Duration::from_secs(1))?;
+        tokio::select! {
+            res = host.run_once() => {
+                match res {
+                    Ok(()) => {}
+                    Err(err) => match err.kind() {
+                        HostErrorKind::Unsupported | HostErrorKind::InvalidRequest => {
+                            warn!(error = %err, "request handling failed");
+                        }
+                        _ => return Err(anyhow!(err.to_string())),
+                    },
+                }
+            }
+            _ = signal::ctrl_c() => {
+                info!("shutdown requested");
+                break;
+            }
+        }
     }
 
     Ok(())
+}
+
+async fn open_source(args: &Args) -> Result<HostSource> {
+    let block_size = args.block_size;
+    match (&args.file, &args.device) {
+        (Some(path), None) => Ok(HostSource::File(
+            FileBlockSource::open(path, block_size).await?,
+        )),
+        (None, Some(path)) => Ok(HostSource::Device(
+            DeviceBlockSource::open(path, block_size).await?,
+        )),
+        _ => unreachable!("clap enforces mutually exclusive arguments"),
+    }
+}
+
+fn open_device(args: &Args) -> Result<rusb::DeviceHandle<rusb::Context>> {
+    let context = rusb::Context::new().context("init libusb context")?;
+    let handle = context
+        .open_device_with_vid_pid(args.vendor_id, args.product_id)
+        .ok_or_else(|| {
+            anyhow!(
+                "device {:04x}:{:04x} not found",
+                args.vendor_id,
+                args.product_id
+            )
+        })?;
+    handle
+        .set_auto_detach_kernel_driver(true)
+        .context("enable auto-detach")?;
+    Ok(handle)
+}
+
+fn infer_interrupt_endpoints<T: UsbContext>(
+    handle: &rusb::DeviceHandle<T>,
+    interface: u8,
+) -> Result<(u8, u8)> {
+    let config = handle
+        .device()
+        .active_config_descriptor()
+        .context("read active config descriptor")?;
+    for intf in config.interfaces() {
+        for desc in intf.descriptors() {
+            if desc.interface_number() != interface {
+                continue;
+            }
+            let mut in_ep = None;
+            let mut out_ep = None;
+            for ep in desc.endpoint_descriptors() {
+                if ep.transfer_type() != TransferType::Interrupt {
+                    continue;
+                }
+                match ep.direction() {
+                    Direction::In => in_ep = Some(ep.address()),
+                    Direction::Out => out_ep = Some(ep.address()),
+                }
+            }
+            if let (Some(in_addr), Some(out_addr)) = (in_ep, out_ep) {
+                return Ok((in_addr, out_addr));
+            }
+        }
+    }
+    Err(anyhow!(
+        "interrupt endpoints not found for interface {}",
+        interface
+    ))
 }

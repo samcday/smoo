@@ -1277,8 +1277,15 @@ name = "smoo-host-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "byteorder",
+ "async-trait",
+ "clap",
  "rusb",
+ "smoo-host-blocksources",
+ "smoo-host-core",
+ "smoo-host-rusb",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1402,6 +1409,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",
