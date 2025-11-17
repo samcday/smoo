@@ -14,6 +14,7 @@
 
 use anyhow::{Context, ensure};
 use clap::{ArgGroup, Parser};
+use smoo_buffers::{BufferPool, VecBufferPool};
 use smoo_host_core::{BlockSource, DeviceBlockSource, FileBlockSource};
 use smoo_ublk::{SmooUblk, UblkIoRequest, UblkOp};
 use std::{io, path::PathBuf, sync::Arc};
@@ -81,7 +82,7 @@ async fn main() -> anyhow::Result<()> {
         .setup_device(block_size, block_count, args.queue_count, args.queue_depth)
         .await
         .context("setup device")?;
-    let mut buffer_pool = BufferPool::new(
+    let mut buffer_pool = VecBufferPool::new(
         device.queue_count(),
         device.queue_depth(),
         device.max_io_bytes(),
@@ -296,60 +297,4 @@ fn request_byte_len(req: &UblkIoRequest, block_size: usize) -> io::Result<usize>
     sectors
         .checked_mul(block_size)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "request byte length overflow"))
-}
-
-struct BufferPool {
-    slots: Vec<Option<Vec<u8>>>,
-    queue_count: usize,
-    queue_depth: usize,
-    buf_len: usize,
-}
-
-impl BufferPool {
-    fn new(queue_count: u16, queue_depth: u16, buf_len: usize) -> anyhow::Result<Self> {
-        ensure!(buf_len > 0, "buffer length must be positive");
-        let queue_count = queue_count as usize;
-        let queue_depth = queue_depth as usize;
-        let total = queue_count
-            .checked_mul(queue_depth)
-            .context("buffer pool size overflow")?;
-        let mut slots = Vec::with_capacity(total);
-        for _ in 0..total {
-            slots.push(Some(vec![0u8; buf_len]));
-        }
-        Ok(Self {
-            slots,
-            queue_count,
-            queue_depth,
-            buf_len,
-        })
-    }
-
-    fn buffer_len(&self) -> usize {
-        self.buf_len
-    }
-
-    fn checkout(&mut self, queue_id: u16, tag: u16) -> anyhow::Result<Vec<u8>> {
-        let idx = self.index(queue_id, tag)?;
-        self.slots[idx].take().context("buffer already checked out")
-    }
-
-    fn checkin(&mut self, queue_id: u16, tag: u16, mut buf: Vec<u8>) {
-        if buf.len() != self.buf_len {
-            buf.resize(self.buf_len, 0);
-        }
-        let idx = self
-            .index(queue_id, tag)
-            .expect("buffer index out of range");
-        let previous = self.slots[idx].replace(buf);
-        debug_assert!(previous.is_none(), "buffer slot occupied during checkin");
-    }
-
-    fn index(&self, queue_id: u16, tag: u16) -> anyhow::Result<usize> {
-        let queue = queue_id as usize;
-        let tag = tag as usize;
-        ensure!(queue < self.queue_count, "queue id out of range");
-        ensure!(tag < self.queue_depth, "tag out of range");
-        Ok(queue * self.queue_depth + tag)
-    }
 }

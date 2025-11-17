@@ -312,6 +312,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "libc",
+ "smoo-buffers",
  "smoo-host-core",
  "smoo-ublk",
  "tokio",
@@ -1210,6 +1211,13 @@ dependencies = [
  "async-process",
  "blocking",
  "futures-lite",
+]
+
+[[package]]
+name = "smoo-buffers"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
 ]
 
 [[package]]
