@@ -148,6 +148,32 @@ impl SmooGadget {
         Response::try_from(buf.as_slice()).map_err(|err| anyhow!("decode response: {err}"))
     }
 
+    /// Read a bulk payload from the host (bulk OUT → gadget).
+    pub async fn read_bulk(&mut self, buf: &mut [u8]) -> Result<()> {
+        ensure!(self.configured, "gadget not configured");
+        if buf.is_empty() {
+            return Ok(());
+        }
+        self.bulk_out
+            .read_exact(buf)
+            .await
+            .context("read payload from bulk OUT")?;
+        Ok(())
+    }
+
+    /// Write a bulk payload to the host (bulk IN → host).
+    pub async fn write_bulk(&mut self, buf: &[u8]) -> Result<()> {
+        ensure!(self.configured, "gadget not configured");
+        if buf.is_empty() {
+            return Ok(());
+        }
+        self.bulk_in
+            .write_all(buf)
+            .await
+            .context("write payload to bulk IN")?;
+        self.bulk_in.flush().await.context("flush bulk IN")
+    }
+
     /// Access the shared Vec-backed buffer pool for bulk transfers.
     pub fn buffer_pool(&mut self) -> &mut VecBufferPool {
         &mut self.buffer_pool

@@ -71,4 +71,10 @@ pub trait Transport: Send {
 
     /// Send a Response back to the gadget (interrupt OUT).
     async fn send_response(&mut self, response: Response) -> TransportResult<()>;
+
+    /// Read a full payload from the gadget over the bulk IN endpoint.
+    async fn read_bulk(&mut self, buf: &mut [u8]) -> TransportResult<()>;
+
+    /// Write a full payload to the gadget over the bulk OUT endpoint.
+    async fn write_bulk(&mut self, buf: &[u8]) -> TransportResult<()>;
 }

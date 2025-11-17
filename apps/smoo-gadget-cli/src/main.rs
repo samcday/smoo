@@ -1,5 +1,6 @@
 use anyhow::{anyhow, ensure, Context, Result};
 use clap::Parser;
+use smoo_gadget_buffers::BufferPool;
 use smoo_gadget_core::{FunctionfsEndpoints, GadgetConfig, SmooGadget};
 use smoo_gadget_ublk::{SmooUblk, SmooUblkDevice, UblkIoRequest, UblkOp};
 use smoo_proto::{Ident, OpCode, Request, Response};
@@ -175,28 +176,121 @@ async fn handle_request(
         }
     };
 
-    let byte_len = u32::try_from(req_len).context("request length exceeds protocol limit")?;
-    let proto_req = Request::new(opcode, req.sector, byte_len, 0);
-    gadget
-        .send_request(proto_req)
-        .await
-        .context("send smoo request")?;
-    let response = gadget.read_response().await.context("read smoo response")?;
+    let mut payload = None;
+    let result = async {
+        if matches!(opcode, OpCode::Read | OpCode::Write) && req_len > 0 {
+            let capacity = {
+                let pool = gadget.buffer_pool();
+                pool.buffer_len()
+            };
+            if req_len > capacity {
+                warn!(
+                    queue = req.queue_id,
+                    tag = req.tag,
+                    req_bytes = req_len,
+                    buf_cap = capacity,
+                    "request exceeds buffer capacity"
+                );
+                device
+                    .complete_io(req, -libc::EINVAL)
+                    .context("complete oversized request")?;
+                return Ok(());
+            }
+            payload = Some(
+                {
+                    let pool = gadget.buffer_pool();
+                    pool.checkout(req.queue_id, req.tag)
+                }
+                .context("checkout bulk buffer")?,
+            );
+        }
 
-    let status = response_status(&response, req_len)?;
-    if status >= 0 && status as usize != req_len {
-        warn!(
-            queue = req.queue_id,
-            tag = req.tag,
-            expected = req_len,
-            reported = status,
-            "response byte count mismatch"
-        );
+        if opcode == OpCode::Write && req_len > 0 {
+            if let Some(buf) = payload.as_mut() {
+                if let Err(err) =
+                    device.copy_from_kernel(req.queue_id, req.tag, &mut buf[..req_len])
+                {
+                    let errno = errno_from_io(&err);
+                    warn!(
+                        queue = req.queue_id,
+                        tag = req.tag,
+                        errno = errno,
+                        "copy write payload from kernel failed: {err}"
+                    );
+                    device
+                        .complete_io(req, -errno)
+                        .context("complete failed kernel copy")?;
+                    if let Some(buf) = payload.take() {
+                        let pool = gadget.buffer_pool();
+                        pool.checkin(req.queue_id, req.tag, buf);
+                    }
+                    return Ok(());
+                }
+            }
+        }
+
+        let byte_len = u32::try_from(req_len).context("request length exceeds protocol limit")?;
+        let proto_req = Request::new(opcode, req.sector, byte_len, 0);
+        gadget
+            .send_request(proto_req)
+            .await
+            .context("send smoo request")?;
+
+        let mut completion_override = None;
+        if opcode == OpCode::Read && req_len > 0 {
+            if let Some(buf) = payload.as_mut() {
+                gadget
+                    .read_bulk(&mut buf[..req_len])
+                    .await
+                    .context("read bulk payload")?;
+                if let Err(err) = device.copy_to_kernel(req.queue_id, req.tag, &buf[..req_len]) {
+                    let errno = errno_from_io(&err);
+                    warn!(
+                        queue = req.queue_id,
+                        tag = req.tag,
+                        errno = errno,
+                        "copy read payload to kernel failed: {err}"
+                    );
+                    completion_override = Some(-errno);
+                }
+            }
+        } else if opcode == OpCode::Write && req_len > 0 {
+            if let Some(buf) = payload.as_ref() {
+                gadget
+                    .write_bulk(&buf[..req_len])
+                    .await
+                    .context("write bulk payload")?;
+            }
+        }
+
+        let response = gadget.read_response().await.context("read smoo response")?;
+
+        let mut status = response_status(&response, req_len)?;
+        if let Some(override_status) = completion_override {
+            status = override_status;
+        }
+        if status >= 0 && status as usize != req_len {
+            warn!(
+                queue = req.queue_id,
+                tag = req.tag,
+                expected = req_len,
+                reported = status,
+                "response byte count mismatch"
+            );
+        }
+        device
+            .complete_io(req, status)
+            .context("complete ublk request")?;
+        Ok(())
     }
-    device
-        .complete_io(req, status)
-        .context("complete ublk request")?;
-    Ok(())
+    .await;
+
+    if let Some(buf) = payload.take() {
+        let pool = gadget.buffer_pool();
+        pool.checkin(req.queue_id, req.tag, buf);
+    }
+
+    result
 }
 
 fn opcode_from_ublk(op: UblkOp) -> Option<OpCode> {

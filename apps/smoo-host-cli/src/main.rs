@@ -101,12 +101,13 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let source = open_source(&args).await.context("open block source")?;
     let (handle, interface) = discover_device(&args).context("discover usb device")?;
-    let (interrupt_in, interrupt_out) =
-        infer_interrupt_endpoints(&handle, interface).context("discover endpoints")?;
+    let endpoints = infer_interface_endpoints(&handle, interface).context("discover endpoints")?;
     let transport_config = RusbTransportConfig {
         interface,
-        interrupt_in,
-        interrupt_out,
+        interrupt_in: endpoints.interrupt_in,
+        interrupt_out: endpoints.interrupt_out,
+        bulk_in: endpoints.bulk_in,
+        bulk_out: endpoints.bulk_out,
         timeout: Duration::from_millis(args.timeout_ms),
     };
     let transport = RusbTransport::new(handle, transport_config).context("init transport")?;
@@ -239,10 +240,62 @@ fn discover_device(args: &Args) -> Result<(rusb::DeviceHandle<rusb::Context>, u8
     ))
 }
 
-fn infer_interrupt_endpoints<T: UsbContext>(
+struct InterfaceEndpoints {
+    interrupt_in: u8,
+    interrupt_out: u8,
+    bulk_in: u8,
+    bulk_out: u8,
+}
+
+#[derive(Default)]
+struct EndpointBuilder {
+    interrupt_in: Option<u8>,
+    interrupt_out: Option<u8>,
+    bulk_in: Option<u8>,
+    bulk_out: Option<u8>,
+}
+
+impl EndpointBuilder {
+    fn record(&mut self, ep: &rusb::EndpointDescriptor) {
+        match (ep.transfer_type(), ep.direction()) {
+            (TransferType::Interrupt, Direction::In) if self.interrupt_in.is_none() => {
+                self.interrupt_in = Some(ep.address());
+            }
+            (TransferType::Interrupt, Direction::Out) if self.interrupt_out.is_none() => {
+                self.interrupt_out = Some(ep.address());
+            }
+            (TransferType::Bulk, Direction::In) if self.bulk_in.is_none() => {
+                self.bulk_in = Some(ep.address());
+            }
+            (TransferType::Bulk, Direction::Out) if self.bulk_out.is_none() => {
+                self.bulk_out = Some(ep.address());
+            }
+            _ => {}
+        }
+    }
+
+    fn finish(self) -> Option<InterfaceEndpoints> {
+        let (Some(interrupt_in), Some(interrupt_out), Some(bulk_in), Some(bulk_out)) = (
+            self.interrupt_in,
+            self.interrupt_out,
+            self.bulk_in,
+            self.bulk_out,
+        ) else {
+            return None;
+        };
+        Some(InterfaceEndpoints {
+            interrupt_in,
+            interrupt_out,
+            bulk_in,
+            bulk_out,
+        })
+    }
+}
+
+fn infer_interface_endpoints<T: UsbContext>(
     handle: &rusb::DeviceHandle<T>,
     interface: u8,
-) -> Result<(u8, u8)> {
+) -> Result<InterfaceEndpoints> {
     let config = handle
         .device()
         .active_config_descriptor()
@@ -252,24 +305,17 @@ fn infer_interrupt_endpoints<T: UsbContext>(
             if desc.interface_number() != interface {
                 continue;
             }
-            let mut in_ep = None;
-            let mut out_ep = None;
+            let mut builder = EndpointBuilder::default();
             for ep in desc.endpoint_descriptors() {
-                if ep.transfer_type() != TransferType::Interrupt {
-                    continue;
-                }
-                match ep.direction() {
-                    Direction::In => in_ep = Some(ep.address()),
-                    Direction::Out => out_ep = Some(ep.address()),
-                }
+                builder.record(&ep);
             }
-            if let (Some(in_addr), Some(out_addr)) = (in_ep, out_ep) {
-                return Ok((in_addr, out_addr));
+            if let Some(endpoints) = builder.finish() {
+                return Ok(endpoints);
             }
         }
     }
     Err(anyhow!(
-        "interrupt endpoints not found for interface {}",
+        "required endpoints not found for interface {}",
         interface
     ))
 }

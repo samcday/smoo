@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.100"
 clap = { version = "4.5.20", features = ["derive"] }
+smoo-gadget-buffers = { path = "../../crates/smoo-gadget-buffers" }
 smoo-gadget-core = { path = "../../crates/smoo-gadget-core" }
 smoo-gadget-ublk = { path = "../../crates/smoo-gadget-ublk" }
 smoo-proto = { path = "../../crates/smoo-proto" }

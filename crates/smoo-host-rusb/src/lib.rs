@@ -18,6 +18,10 @@ pub struct RusbTransportConfig {
     pub interrupt_in: u8,
     /// Interrupt endpoint address used to send Response messages (host → device).
     pub interrupt_out: u8,
+    /// Bulk endpoint address used to read payloads (device → host).
+    pub bulk_in: u8,
+    /// Bulk endpoint address used to write payloads (host → device).
+    pub bulk_out: u8,
     /// Timeout applied to interrupt/control transfers.
     pub timeout: Duration,
 }
@@ -28,6 +32,8 @@ impl Default for RusbTransportConfig {
             interface: 0,
             interrupt_in: 0x81,
             interrupt_out: 0x01,
+            bulk_in: 0x82,
+            bulk_out: 0x02,
             timeout: Duration::from_secs(1),
         }
     }
@@ -146,6 +152,62 @@ impl<T: UsbContext + Send + Sync + 'static> Transport for RusbTransport<T> {
         if written != RESPONSE_LEN {
             return Err(protocol_error(format!(
                 "response transfer truncated (expected {RESPONSE_LEN}, wrote {written})"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn read_bulk(&mut self, buf: &mut [u8]) -> TransportResult<()> {
+        if self.ident.is_none() {
+            return Err(not_ready());
+        }
+        let len = buf.len();
+        if len == 0 {
+            return Ok(());
+        }
+        let handle = self.handle.clone();
+        let endpoint = self.config.bulk_in;
+        let timeout = self.config.timeout;
+        let (read, data) = task::spawn_blocking(move || {
+            let mut tmp = vec![0u8; len];
+            let handle = handle.lock().unwrap();
+            let read = handle.read_bulk(endpoint, &mut tmp, timeout)?;
+            Ok::<_, rusb::Error>((read, tmp))
+        })
+        .await
+        .map_err(|err| join_error("bulk-in read", err))?
+        .map_err(|err| map_rusb_error("bulk-in read", err))?;
+        if read != len {
+            return Err(protocol_error(format!(
+                "bulk read truncated (expected {len}, got {read})"
+            )));
+        }
+        buf.copy_from_slice(&data[..len]);
+        Ok(())
+    }
+
+    async fn write_bulk(&mut self, buf: &[u8]) -> TransportResult<()> {
+        if self.ident.is_none() {
+            return Err(not_ready());
+        }
+        if buf.is_empty() {
+            return Ok(());
+        }
+        let data = buf.to_vec();
+        let len = data.len();
+        let handle = self.handle.clone();
+        let endpoint = self.config.bulk_out;
+        let timeout = self.config.timeout;
+        let written = task::spawn_blocking(move || {
+            let handle = handle.lock().unwrap();
+            handle.write_bulk(endpoint, &data, timeout)
+        })
+        .await
+        .map_err(|err| join_error("bulk-out write", err))?
+        .map_err(|err| map_rusb_error("bulk-out write", err))?;
+        if written != len {
+            return Err(protocol_error(format!(
+                "bulk write truncated (expected {len}, wrote {written})"
             )));
         }
         Ok(())

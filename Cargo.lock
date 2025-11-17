@@ -669,6 +669,7 @@ dependencies = [
  "anyhow",
  "clap",
  "libc",
+ "smoo-gadget-buffers",
  "smoo-gadget-core",
  "smoo-gadget-ublk",
  "smoo-proto",
