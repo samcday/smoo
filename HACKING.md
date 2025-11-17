@@ -65,7 +65,13 @@ Error handling:
 
 ## 4. USB Protocol (control + data)
 
-Control (`Request` / `Response`):
+Protocol handshake (`Ident`):
+* a setup IN message (from gadget -> host)
+* fixed-size, LE
+* fields:
+  * protocol version (major + minor)
+
+Control-plane (`Request` / `Response`):
 
 * fixed-size, LE
 * fields:
