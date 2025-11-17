@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow, ensure};
 use smoo_buffers::VecBufferPool;
-use smoo_proto::{Ident, Request, Response, IDENT_LEN, RESPONSE_LEN};
+use smoo_proto::{IDENT_LEN, IDENT_REQUEST, Ident, RESPONSE_LEN, Request, Response};
 use std::{cmp, fs::File as StdFile, io, os::fd::OwnedFd};
 use tokio::{
     fs::File,
@@ -11,7 +11,6 @@ use tracing::{debug, trace, warn};
 const USB_DIR_IN: u8 = 0x80;
 const USB_TYPE_VENDOR: u8 = 0x40;
 const USB_RECIP_INTERFACE: u8 = 0x01;
-const SMOO_REQ_GET_IDENT: u8 = 0x01;
 const SMOO_REQ_TYPE: u8 = USB_DIR_IN | USB_TYPE_VENDOR | USB_RECIP_INTERFACE;
 
 const SETUP_STAGE_LEN: usize = 8;
@@ -164,7 +163,7 @@ impl SmooGadget {
     }
 
     async fn handle_setup_request(&mut self, setup: UsbControlRequest) -> Result<bool> {
-        if setup.request == SMOO_REQ_GET_IDENT && setup.request_type == SMOO_REQ_TYPE {
+        if setup.request == IDENT_REQUEST && setup.request_type == SMOO_REQ_TYPE {
             ensure!(
                 setup.direction() == ControlDirection::In,
                 "GET_IDENT must be an IN transfer"

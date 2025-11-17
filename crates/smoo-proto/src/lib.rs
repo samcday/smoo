@@ -6,6 +6,8 @@ use core::{convert::TryFrom, fmt};
 pub const IDENT_MAGIC: [u8; 4] = *b"SMOO";
 /// Number of bytes in an encoded [`Ident`] message.
 pub const IDENT_LEN: usize = 8;
+/// Vendor control request opcode used to fetch [`Ident`].
+pub const IDENT_REQUEST: u8 = 0x01;
 /// Number of bytes in an encoded [`Request`] control message.
 pub const REQUEST_LEN: usize = 20;
 /// Number of bytes in an encoded [`Response`] control message.

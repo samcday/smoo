@@ -1259,6 +1259,20 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "smoo-proto",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "smoo-host-rusb"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "rusb",
+ "smoo-host-core",
+ "smoo-proto",
  "tokio",
  "tracing",
 ]

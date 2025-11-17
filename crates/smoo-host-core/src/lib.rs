@@ -13,6 +13,9 @@ use tokio::{
 };
 use tracing::debug;
 
+pub mod transport;
+pub use transport::Transport;
+
 /// Abstraction over a readable/writable block storage source.
 ///
 /// Implementations operate on logical block units (typically 512 bytes) and the caller
