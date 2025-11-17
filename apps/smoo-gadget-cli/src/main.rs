@@ -394,33 +394,31 @@ fn setup_functionfs(args: &Args) -> Result<(FunctionfsEndpoints, GadgetGuard)> {
 
 fn interrupt_in_ep() -> Endpoint {
     let (_, dir) = EndpointDirection::device_to_host();
-    let mut ep = Endpoint::custom(dir, TransferType::Interrupt);
-    ep.max_packet_size_hs = 16;
-    ep.max_packet_size_ss = 16;
-    ep
+    make_ep(dir, TransferType::Interrupt, 16)
 }
 
 fn interrupt_out_ep() -> Endpoint {
     let (_, dir) = EndpointDirection::host_to_device();
-    let mut ep = Endpoint::custom(dir, TransferType::Interrupt);
-    ep.max_packet_size_hs = 16;
-    ep.max_packet_size_ss = 16;
-    ep
+    make_ep(dir, TransferType::Interrupt, 16)
 }
 
 fn bulk_in_ep() -> Endpoint {
     let (_, dir) = EndpointDirection::device_to_host();
-    let mut ep = Endpoint::bulk(dir);
-    ep.max_packet_size_hs = 512;
-    ep.max_packet_size_ss = 512;
-    ep
+    make_ep(dir, TransferType::Bulk, 512)
 }
 
 fn bulk_out_ep() -> Endpoint {
     let (_, dir) = EndpointDirection::host_to_device();
-    let mut ep = Endpoint::bulk(dir);
-    ep.max_packet_size_hs = 512;
-    ep.max_packet_size_ss = 512;
+    make_ep(dir, TransferType::Bulk, 512)
+}
+
+fn make_ep(direction: EndpointDirection, ty: TransferType, packet_size: u16) -> Endpoint {
+    let mut ep = match ty {
+        TransferType::Bulk => Endpoint::bulk(direction),
+        _ => Endpoint::custom(direction, ty),
+    };
+    ep.max_packet_size_hs = packet_size;
+    ep.max_packet_size_ss = packet_size;
     ep
 }
 
