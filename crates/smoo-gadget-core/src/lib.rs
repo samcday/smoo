@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow, ensure};
-use smoo_buffers::VecBufferPool;
+use smoo_gadget_buffers::VecBufferPool;
 use smoo_proto::{IDENT_LEN, IDENT_REQUEST, Ident, RESPONSE_LEN, Request, Response};
 use std::{cmp, fs::File as StdFile, io, os::fd::OwnedFd};
 use tokio::{

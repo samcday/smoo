@@ -112,7 +112,7 @@ impl SmooUblk {
                 let (opcode, cmd, reply, timeout) = match receiver.recv_blocking() {
                     Ok(msg) => msg,
                     Err(RecvError) => {
-                        info!("smoo-ublk ctrl loop shutting down");
+                        info!("smoo-gadget-ublk ctrl loop shutting down");
                         break;
                     }
                 };
@@ -421,7 +421,7 @@ impl SmooUblk {
         let ctrl_sender = self.sender.clone();
         let start_cmd = cmd;
         let start_thread = std::thread::Builder::new()
-            .name(format!("smoo-ublk-start-{}", dev_id))
+            .name(format!("smoo-gadget-ublk-start-{}", dev_id))
             .spawn(move || {
                 info!(dev_id = dev_id, "start_dev thread begin");
                 let res = submit_ctrl_command_blocking(
@@ -490,7 +490,7 @@ impl Drop for SmooUblk {
         self.sender.close();
         if let Some(handle) = self.handle.take() {
             if let Err(err) = handle.join() {
-                warn!("smoo-ublk ctrl loop panicked: {:?}", err);
+                warn!("smoo-gadget-ublk ctrl loop panicked: {:?}", err);
             }
         }
     }
@@ -540,7 +540,7 @@ impl SmooUblkDevice {
             .request_rx
             .recv()
             .await
-            .context("smoo-ublk device channel closed")?;
+            .context("smoo-gadget-ublk device channel closed")?;
         trace!(
             dev_id = req.dev_id,
             queue_id = req.queue_id,
@@ -653,7 +653,7 @@ impl Drop for CmdBuf {
 }
 
 fn spawn_queue_worker(cfg: QueueWorkerConfig) -> anyhow::Result<JoinHandle<()>> {
-    let name = format!("smoo-ublk-q{}", cfg.queue_id);
+    let name = format!("smoo-gadget-ublk-q{}", cfg.queue_id);
     let thread = std::thread::Builder::new().name(name).spawn(move || {
         if let Err(err) = queue_worker_main(cfg) {
             error!("queue worker exited: {:?}", err);

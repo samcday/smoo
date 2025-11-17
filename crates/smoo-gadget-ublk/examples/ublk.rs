@@ -1,5 +1,5 @@
 use anyhow::Context;
-use smoo_ublk::{SmooUblk, UblkOp};
+use smoo_gadget_ublk::{SmooUblk, UblkOp};
 use tracing_subscriber::prelude::*;
 
 #[tokio::main]

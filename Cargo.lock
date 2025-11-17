@@ -312,10 +312,10 @@ dependencies = [
  "clap",
  "ctrlc",
  "libc",
- "smoo-buffers",
+ "smoo-gadget-buffers",
+ "smoo-gadget-ublk",
  "smoo-host-blocksources",
  "smoo-host-core",
- "smoo-ublk",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1215,7 +1215,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "smoo-buffers"
+name = "smoo-gadget-buffers"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1239,10 +1239,26 @@ name = "smoo-gadget-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "smoo-buffers",
+ "smoo-gadget-buffers",
  "smoo-proto",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "smoo-gadget-ublk"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-channel",
+ "bindgen 0.72.1",
+ "io-uring 0.7.11",
+ "libc",
+ "regex",
+ "serde",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1288,22 +1304,6 @@ dependencies = [
 [[package]]
 name = "smoo-proto"
 version = "0.1.0"
-
-[[package]]
-name = "smoo-ublk"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-channel",
- "bindgen 0.72.1",
- "io-uring 0.7.11",
- "libc",
- "regex",
- "serde",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
 
 [[package]]
 name = "socket2"

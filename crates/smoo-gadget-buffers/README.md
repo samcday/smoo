@@ -1,4 +1,4 @@
-# smoo-buffers
+# smoo-gadget-buffers
 
 This crate provides a simple `BufferPool` abstraction, which is used to manage allocation and ownership semantics of
 the buffers that are handed to ublk.

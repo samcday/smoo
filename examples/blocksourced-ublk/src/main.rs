@@ -2,22 +2,22 @@
 //!
 //! ```bash
 //! # Image-backed device
-//! sudo RUST_LOG=info,ublk-ctrl=trace,smoo_ublk=trace \
+//! sudo RUST_LOG=info,ublk-ctrl=trace,smoo_gadget_ublk=trace \
 //!   cargo run -p blocksourced-ublk -- \
 //!     --file ./disk.img --block-size 512 --queue-count 1 --queue-depth 16
 //!
 //! # Real block device
-//! sudo RUST_LOG=info,ublk-ctrl=trace,smoo_ublk=trace \
+//! sudo RUST_LOG=info,ublk-ctrl=trace,smoo_gadget_ublk=trace \
 //!   cargo run -p blocksourced-ublk -- \
 //!     --device /dev/nvme0n1p3 --block-size 512
 //! ```
 
 use anyhow::{Context, ensure};
 use clap::{ArgGroup, Parser};
-use smoo_buffers::{BufferPool, VecBufferPool};
+use smoo_gadget_buffers::{BufferPool, VecBufferPool};
+use smoo_gadget_ublk::{SmooUblk, UblkIoRequest, UblkOp};
 use smoo_host_blocksources::{DeviceBlockSource, FileBlockSource};
 use smoo_host_core::BlockSource;
-use smoo_ublk::{SmooUblk, UblkIoRequest, UblkOp};
 use std::{io, path::PathBuf, sync::Arc};
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};

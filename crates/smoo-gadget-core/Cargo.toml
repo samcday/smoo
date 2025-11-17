@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.100"
-smoo-buffers = { path = "../smoo-buffers" }
+smoo-gadget-buffers = { path = "../smoo-gadget-buffers" }
 smoo-proto = { path = "../smoo-proto" }
 tokio = { version = "1.48.0", features = ["fs", "io-util"] }
 tracing = "0.1.41"
