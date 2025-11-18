@@ -94,7 +94,38 @@ async fn main() -> Result<()> {
     let gadget_config = GadgetConfig::new(ident, args.queue_count, args.queue_depth, max_io_bytes);
     let mut gadget =
         SmooGadget::new(endpoints, gadget_config, buffer_pool).context("init smoo gadget core")?;
-    gadget.setup().await.context("complete FunctionFS setup")?;
+    enum SetupAwait {
+        Configured,
+        Interrupted,
+    }
+    let setup_outcome = {
+        #[allow(unused_mut)]
+        let mut setup_fut = gadget.setup();
+        tokio::pin!(setup_fut);
+        #[allow(unused_mut)]
+        let mut setup_shutdown = signal::ctrl_c();
+        tokio::pin!(setup_shutdown);
+        tokio::select! {
+            res = &mut setup_fut => {
+                res.context("complete FunctionFS setup")?;
+                SetupAwait::Configured
+            }
+            res = &mut setup_shutdown => {
+                if let Err(err) = res {
+                    warn!(error = ?err, "ctrl-c listener failed during FunctionFS setup");
+                }
+                SetupAwait::Interrupted
+            }
+        }
+    };
+
+    if matches!(setup_outcome, SetupAwait::Interrupted) {
+        info!("shutdown requested before host completed ident exchange");
+        ublk.stop_dev(device, true)
+            .await
+            .context("stop ublk device after interrupted setup")?;
+        return Ok(());
+    }
     info!(
         ident_major = ident.major,
         ident_minor = ident.minor,

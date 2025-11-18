@@ -104,19 +104,37 @@ impl SmooGadget {
         if self.configured {
             return Ok(());
         }
+        debug!("waiting for FunctionFS ident handshake");
         loop {
             let event = self.next_event().await.context("read FunctionFS event")?;
             trace!(?event, "ep0 event");
             match event {
-                FunctionfsEvent::Bind
-                | FunctionfsEvent::Unbind
-                | FunctionfsEvent::Enable
-                | FunctionfsEvent::Suspend
-                | FunctionfsEvent::Resume => {}
+                FunctionfsEvent::Bind => {
+                    debug!("FunctionFS bind event received");
+                }
+                FunctionfsEvent::Unbind => {
+                    debug!("FunctionFS unbind event received");
+                }
+                FunctionfsEvent::Enable => {
+                    debug!("FunctionFS interface enabled");
+                }
+                FunctionfsEvent::Suspend => {
+                    debug!("FunctionFS suspend event received");
+                }
+                FunctionfsEvent::Resume => {
+                    debug!("FunctionFS resume event received");
+                }
                 FunctionfsEvent::Disable => {
+                    debug!("FunctionFS disable event received");
                     self.configured = false;
                 }
                 FunctionfsEvent::Setup(setup) => {
+                    debug!(
+                        request = setup.request,
+                        request_type = setup.request_type,
+                        length = setup.length,
+                        "FunctionFS setup request"
+                    );
                     if self.handle_setup_request(setup).await? {
                         self.configured = true;
                         debug!("FunctionFS ident handshake complete");
