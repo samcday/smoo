@@ -311,7 +311,7 @@ impl SmooUblk {
         };
         cmd.len = params.len as u16;
         cmd.addr = &mut params as *mut _ as u64;
-        submit_ctrl_command(&self.sender, UBLK_CMD_GET_PARAMS, cmd, "get params", None).await?;
+        submit_ctrl_command(&self.sender, UBLK_CMD_GET_PARAMS, cmd, "get params", Some(Duration::from_secs(1))).await?;
         Ok(params)
     }
 

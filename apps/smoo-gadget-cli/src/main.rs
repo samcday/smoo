@@ -831,12 +831,16 @@ async fn apply_config(
                 usize::try_from(blocks).context("block count exceeds usize capacity")?;
 
             if let Some(existing) = device_slot.as_mut() {
-                let matches = existing.block_size() == block_size
-                    && existing.block_count() == block_count
-                    && existing.queue_count() == runtime.queue_count
-                    && existing.queue_depth() == runtime.queue_depth;
-                if matches {
-                    info!("CONFIG_EXPORTS matches existing export; resuming recovered device");
+                if existing.recovery_pending() {
+                    let matches = existing.block_size() == block_size
+                        && existing.block_count() == block_count
+                        && existing.queue_count() == runtime.queue_count
+                        && existing.queue_depth() == runtime.queue_depth;
+                    ensure!(
+                        matches,
+                        "recovered export geometry mismatch; clear state file and retry"
+                    );
+                    info!("CONFIG_EXPORTS matches recovered export; finalizing recovery");
                     ublk.finalize_recovery(existing)
                         .await
                         .context("complete ublk recovery")?;

@@ -19,6 +19,7 @@ const DISCOVERY_DELAY_INITIAL: Duration = Duration::from_millis(500);
 const DISCOVERY_DELAY_MAX: Duration = Duration::from_secs(5);
 const STATUS_RETRY_INTERVAL: Duration = Duration::from_millis(200);
 const STATUS_RETRY_ATTEMPTS: usize = 5;
+const RECONNECT_PAUSE: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Parser)]
 #[command(name = "smoo-host-cli")]
@@ -173,6 +174,7 @@ async fn main() -> Result<()> {
             SessionEnd::TransportLost => {
                 info!("gadget disconnected; waiting for reconnection");
                 has_connected = true;
+                time::sleep(RECONNECT_PAUSE).await;
             }
         }
     }
