@@ -12,6 +12,16 @@ pub const IDENT_REQUEST: u8 = 0x01;
 pub const REQUEST_LEN: usize = 20;
 /// Number of bytes in an encoded [`Response`] control message.
 pub const RESPONSE_LEN: usize = 20;
+/// Vendor control bRequest used to fetch [`SmooStatusV0`].
+pub const SMOO_STATUS_REQUEST: u8 = 0x03;
+/// bmRequestType for SMOO status/heartbeat (device → host, vendor, interface).
+pub const SMOO_STATUS_REQ_TYPE: u8 = 0xA1;
+/// Number of bytes returned by [`SmooStatusV0`].
+pub const SMOO_STATUS_LEN: usize = 16;
+/// Supported status payload version.
+pub const SMOO_STATUS_VERSION: u16 = 0;
+/// Status flag indicating an active export.
+pub const SMOO_STATUS_FLAG_EXPORT_ACTIVE: u16 = 1 << 0;
 
 /// Errors surfaced while decoding protocol messages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,6 +32,8 @@ pub enum ProtoError {
     InvalidOpcode(u8),
     /// Ident magic prefix did not match `SMOO`.
     InvalidMagic,
+    /// Payload or struct version mismatch.
+    InvalidVersion { expected: u16, actual: u16 },
 }
 
 impl fmt::Display for ProtoError {
@@ -32,6 +44,10 @@ impl fmt::Display for ProtoError {
             }
             ProtoError::InvalidOpcode(op) => write!(f, "invalid opcode {op}"),
             ProtoError::InvalidMagic => write!(f, "invalid ident magic"),
+            ProtoError::InvalidVersion { expected, actual } => write!(
+                f,
+                "unsupported payload version {actual}, expected {expected}"
+            ),
         }
     }
 }
@@ -224,6 +240,77 @@ fn decode_common(bytes: [u8; REQUEST_LEN]) -> Result<(OpCode, u64, u32, u32)> {
     Ok((op, lba, byte_len, flags))
 }
 
+/// Heartbeat/status payload returned by the gadget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SmooStatusV0 {
+    pub version: u16,
+    pub flags: u16,
+    pub export_count: u32,
+    pub session_id: u64,
+}
+
+impl SmooStatusV0 {
+    /// Create a v0 status payload with the provided flags/count/session.
+    pub const fn new(flags: u16, export_count: u32, session_id: u64) -> Self {
+        Self {
+            version: SMOO_STATUS_VERSION,
+            flags,
+            export_count,
+            session_id,
+        }
+    }
+
+    /// Serialize the status payload to its on-wire representation.
+    pub fn encode(self) -> [u8; SMOO_STATUS_LEN] {
+        let mut buf = [0u8; SMOO_STATUS_LEN];
+        buf[0..2].copy_from_slice(&self.version.to_le_bytes());
+        buf[2..4].copy_from_slice(&self.flags.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.export_count.to_le_bytes());
+        buf[8..16].copy_from_slice(&self.session_id.to_le_bytes());
+        buf
+    }
+
+    /// Decode a status payload from a fixed-size buffer.
+    pub fn decode(bytes: [u8; SMOO_STATUS_LEN]) -> Result<Self> {
+        let version = u16::from_le_bytes([bytes[0], bytes[1]]);
+        if version != SMOO_STATUS_VERSION {
+            return Err(ProtoError::InvalidVersion {
+                expected: SMOO_STATUS_VERSION,
+                actual: version,
+            });
+        }
+        let flags = u16::from_le_bytes([bytes[2], bytes[3]]);
+        let export_count = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        let session_id = u64::from_le_bytes([
+            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+        ]);
+        Ok(Self {
+            version,
+            flags,
+            export_count,
+            session_id,
+        })
+    }
+
+    /// Decode a status payload from a borrowed slice.
+    pub fn try_from_slice(slice: &[u8]) -> Result<Self> {
+        if slice.len() != SMOO_STATUS_LEN {
+            return Err(ProtoError::InvalidLength {
+                expected: SMOO_STATUS_LEN,
+                actual: slice.len(),
+            });
+        }
+        let mut buf = [0u8; SMOO_STATUS_LEN];
+        buf.copy_from_slice(slice);
+        Self::decode(buf)
+    }
+
+    /// Returns true when the export_active flag is set.
+    pub fn export_active(&self) -> bool {
+        (self.flags & SMOO_STATUS_FLAG_EXPORT_ACTIVE) != 0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,6 +346,14 @@ mod tests {
         let bytes = resp.encode();
         assert_eq!(Response::decode(bytes).unwrap(), resp);
         assert_eq!(Response::try_from(bytes.as_slice()).unwrap(), resp);
+    }
+
+    #[test]
+    fn status_round_trip() {
+        let status = SmooStatusV0::new(SMOO_STATUS_FLAG_EXPORT_ACTIVE, 1, 0x0102_0304_0506_0708);
+        let bytes = status.encode();
+        assert_eq!(SmooStatusV0::try_from_slice(&bytes).unwrap(), status);
+        assert!(SmooStatusV0::decode(bytes).unwrap().export_active());
     }
 
     #[test]

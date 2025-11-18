@@ -1,7 +1,10 @@
 use async_trait::async_trait;
 use rusb::{DeviceHandle, UsbContext};
 use smoo_host_core::{Transport, TransportError, TransportErrorKind, TransportResult};
-use smoo_proto::{IDENT_LEN, IDENT_REQUEST, Ident, REQUEST_LEN, RESPONSE_LEN, Request, Response};
+use smoo_proto::{
+    IDENT_LEN, IDENT_REQUEST, Ident, REQUEST_LEN, RESPONSE_LEN, Request, Response, SMOO_STATUS_LEN,
+    SMOO_STATUS_REQ_TYPE, SMOO_STATUS_REQUEST, SmooStatusV0,
+};
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
@@ -142,6 +145,15 @@ impl<T: UsbContext + Send + Sync + 'static> RusbTransport<T> {
         }
         Ok(())
     }
+
+    /// Returns a status client that can issue SMOO_STATUS requests alongside the transport.
+    pub fn status_client(&self) -> StatusClient<T> {
+        StatusClient {
+            handle: self.handle.clone(),
+            interface: self.config.interface,
+            timeout: self.config.timeout,
+        }
+    }
 }
 
 #[async_trait]
@@ -253,6 +265,45 @@ impl<T: UsbContext + Send + Sync + 'static> Transport for RusbTransport<T> {
             )));
         }
         Ok(())
+    }
+}
+
+/// Helper for issuing SMOO_STATUS control transfers.
+#[derive(Clone)]
+pub struct StatusClient<T: UsbContext + Send + Sync + 'static> {
+    handle: Arc<Mutex<DeviceHandle<T>>>,
+    interface: u8,
+    timeout: Duration,
+}
+
+impl<T: UsbContext + Send + Sync + 'static> StatusClient<T> {
+    pub async fn read_status(&self) -> TransportResult<SmooStatusV0> {
+        let handle = self.handle.clone();
+        let interface = self.interface;
+        let timeout = self.timeout;
+        let (len, buf) = task::spawn_blocking(move || {
+            let mut data = [0u8; SMOO_STATUS_LEN];
+            let handle = handle.lock().unwrap();
+            let read = handle.read_control(
+                SMOO_STATUS_REQ_TYPE,
+                SMOO_STATUS_REQUEST,
+                0,
+                interface as u16,
+                &mut data,
+                timeout,
+            )?;
+            Ok::<_, rusb::Error>((read, data))
+        })
+        .await
+        .map_err(|err| join_error("SMOO_STATUS control transfer", err))?
+        .map_err(|err| map_rusb_error("SMOO_STATUS control transfer", err))?;
+        if len != SMOO_STATUS_LEN {
+            return Err(protocol_error(format!(
+                "SMOO_STATUS transfer truncated (expected {SMOO_STATUS_LEN}, got {len})"
+            )));
+        }
+        SmooStatusV0::try_from_slice(&buf[..len])
+            .map_err(|err| protocol_error(format!("decode SMOO_STATUS payload: {err}")))
     }
 }
 

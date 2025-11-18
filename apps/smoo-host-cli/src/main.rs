@@ -1,16 +1,18 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, ensure, Context, Result};
 use clap::{ArgGroup, Parser};
 use rusb::{Direction, TransferType, UsbContext};
 use smoo_host_blocksources::{DeviceBlockSource, FileBlockSource};
 use smoo_host_core::{BlockSource, BlockSourceResult, HostErrorKind, SmooHost};
-use smoo_host_rusb::{ConfigExportsV0Payload, RusbTransport, RusbTransportConfig};
-use std::{path::PathBuf, time::Duration};
-use tokio::signal;
-use tracing::{debug, info, warn};
+use smoo_host_rusb::{ConfigExportsV0Payload, RusbTransport, RusbTransportConfig, StatusClient};
+use smoo_proto::SmooStatusV0;
+use std::{fmt, path::PathBuf, time::Duration};
+use tokio::{signal, sync::mpsc, time};
+use tracing::{debug, error, info, warn};
 
 const SMOO_INTERFACE_CLASS: u8 = 0xFF;
 const SMOO_INTERFACE_SUBCLASS: u8 = 0x53;
 const SMOO_INTERFACE_PROTOCOL: u8 = 0x4D;
+const HEARTBEAT_INTERVAL_SECS: u64 = 1;
 
 #[derive(Debug, Parser)]
 #[command(name = "smoo-host-cli")]
@@ -138,6 +140,36 @@ async fn main() -> Result<()> {
         size_bytes = size_bytes,
         "configured gadget export"
     );
+    let status_client = transport.status_client();
+    let initial_status: SmooStatusV0 = status_client
+        .read_status()
+        .await
+        .context("SMOO_STATUS control transfer")?;
+    ensure!(
+        initial_status.export_active(),
+        "gadget reports no active export after CONFIG_EXPORTS"
+    );
+    ensure!(
+        initial_status.export_count >= 1,
+        "gadget export count invalid ({})",
+        initial_status.export_count
+    );
+    let initial_session_id = initial_status.session_id;
+    debug!(
+        session_id = initial_session_id,
+        export_count = initial_status.export_count,
+        "initial gadget status"
+    );
+    let heartbeat_interval = Duration::from_secs(HEARTBEAT_INTERVAL_SECS);
+    let (heartbeat_tx, mut heartbeat_rx) = mpsc::unbounded_channel();
+    let heartbeat_client = status_client.clone();
+    let heartbeat_task = tokio::spawn(async move {
+        if let Err(err) =
+            run_heartbeat(heartbeat_client, initial_session_id, heartbeat_interval).await
+        {
+            let _ = heartbeat_tx.send(err);
+        }
+    });
     let mut host = SmooHost::new(transport, source);
     let ident = host.setup().await.context("ident handshake")?;
     info!(
@@ -146,6 +178,7 @@ async fn main() -> Result<()> {
         "connected to smoo gadget"
     );
 
+    let mut exit_error: Option<anyhow::Error> = None;
     loop {
         tokio::select! {
             res = host.run_once() => {
@@ -155,7 +188,10 @@ async fn main() -> Result<()> {
                         HostErrorKind::Unsupported | HostErrorKind::InvalidRequest => {
                             warn!(error = %err, "request handling failed");
                         }
-                        _ => return Err(anyhow!(err.to_string())),
+                        _ => {
+                            exit_error = Some(anyhow!(err.to_string()));
+                            break;
+                        }
                     },
                 }
             }
@@ -163,10 +199,26 @@ async fn main() -> Result<()> {
                 info!("shutdown requested");
                 break;
             }
+            event = heartbeat_rx.recv() => {
+                if let Some(event) = event {
+                    error!(reason = %event, "heartbeat failure");
+                    exit_error = Some(anyhow!(event.to_string()));
+                    break;
+                }
+            }
         }
     }
 
-    Ok(())
+    if !heartbeat_task.is_finished() {
+        heartbeat_task.abort();
+    }
+    let _ = heartbeat_task.await;
+
+    if let Some(err) = exit_error {
+        Err(err)
+    } else {
+        Ok(())
+    }
 }
 
 async fn open_source(args: &Args) -> Result<HostSource> {
@@ -345,6 +397,61 @@ fn infer_interface_endpoints<T: UsbContext>(
         "required endpoints not found for interface {}",
         interface
     ))
+}
+
+#[derive(Debug, Clone)]
+enum HeartbeatFailure {
+    SessionChanged { previous: u64, current: u64 },
+    ExportInactive,
+    TransferFailed(String),
+}
+
+impl fmt::Display for HeartbeatFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HeartbeatFailure::SessionChanged { previous, current } => write!(
+                f,
+                "gadget session changed (0x{previous:016x} → 0x{current:016x})"
+            ),
+            HeartbeatFailure::ExportInactive => write!(f, "gadget reports no active export"),
+            HeartbeatFailure::TransferFailed(err) => {
+                write!(f, "heartbeat control transfer failed: {err}")
+            }
+        }
+    }
+}
+
+async fn run_heartbeat(
+    client: StatusClient<rusb::Context>,
+    initial_session_id: u64,
+    interval: Duration,
+) -> Result<(), HeartbeatFailure> {
+    let mut ticker = time::interval(interval);
+    ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        match client.read_status().await {
+            Ok(status) => {
+                debug!(
+                    session_id = status.session_id,
+                    export_count = status.export_count,
+                    "heartbeat successful"
+                );
+                if status.session_id != initial_session_id {
+                    return Err(HeartbeatFailure::SessionChanged {
+                        previous: initial_session_id,
+                        current: status.session_id,
+                    });
+                }
+                if !status.export_active() {
+                    return Err(HeartbeatFailure::ExportInactive);
+                }
+            }
+            Err(err) => {
+                return Err(HeartbeatFailure::TransferFailed(err.to_string()));
+            }
+        }
+    }
 }
 
 fn parse_hex_u16(s: &str) -> Result<u16, std::num::ParseIntError> {
