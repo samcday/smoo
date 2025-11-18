@@ -1,20 +1,85 @@
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
+use dma_heap::{Heap, HeapKind};
+use mmap::{MapError, MapOption, MemoryMap};
+use nix::ioctl_write_ptr;
 use std::alloc::{Layout, alloc_zeroed, dealloc};
-use std::ops::{Deref, DerefMut};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::ptr::NonNull;
+use std::slice;
 
 const BUFFER_ALIGNMENT: usize = 4096;
 
-/// Owns a page-aligned byte buffer whose address stays stable for its lifetime.
-pub struct Buffer {
+const FUNCTIONFS_IOC_MAGIC: u8 = b'g';
+const FUNCTIONFS_DMABUF_ATTACH_NR: u8 = 131;
+const FUNCTIONFS_DMABUF_DETACH_NR: u8 = 132;
+
+ioctl_write_ptr!(
+    ffs_dmabuf_attach,
+    FUNCTIONFS_IOC_MAGIC,
+    FUNCTIONFS_DMABUF_ATTACH_NR,
+    libc::c_int
+);
+
+ioctl_write_ptr!(
+    ffs_dmabuf_detach,
+    FUNCTIONFS_IOC_MAGIC,
+    FUNCTIONFS_DMABUF_DETACH_NR,
+    libc::c_int
+);
+
+/// Type-erased buffer handle used throughout the gadget.
+pub type BufferHandle = Box<dyn Buffer>;
+
+/// Byte buffer backing a ublk queue slot.
+pub trait Buffer: Send {
+    /// Returns the logical capacity of the buffer.
+    fn len(&self) -> usize;
+
+    /// Returns a stable pointer to the buffer contents.
+    fn as_ptr(&self) -> *const u8;
+
+    /// Returns a mutable pointer to the buffer contents.
+    fn as_mut_ptr(&self) -> *mut u8;
+
+    /// Returns an immutable slice covering the logical buffer contents.
+    fn as_slice(&self) -> &[u8];
+
+    /// Returns a mutable slice covering the logical buffer contents.
+    fn as_mut_slice(&mut self) -> &mut [u8];
+
+    /// Returns the dma-buf file descriptor if backed by DMA memory.
+    fn dma_fd(&self) -> Option<RawFd> {
+        None
+    }
+}
+
+/// Provides temporary byte buffers keyed by ublk queue + tag.
+pub trait BufferPool: Send {
+    /// Returns the capacity of each buffer in bytes.
+    fn buffer_len(&self) -> usize;
+
+    /// Returns the raw pointers for every queue/tag slot in queue-major order.
+    ///
+    /// These pointers stay stable for the lifetime of the pool.
+    fn buffer_ptrs(&self) -> Result<Vec<*mut u8>>;
+
+    /// Checks out the buffer assigned to `queue_id`/`tag`.
+    fn checkout(&mut self, queue_id: u16, tag: u16) -> Result<BufferHandle>;
+
+    /// Returns the buffer to the pool.
+    fn checkin(&mut self, queue_id: u16, tag: u16, buf: BufferHandle);
+}
+
+/// Page-aligned byte buffer implemented with regular virtual memory.
+pub struct VecBuffer {
     ptr: NonNull<u8>,
     len: usize,
 }
 
-unsafe impl Send for Buffer {}
-unsafe impl Sync for Buffer {}
+unsafe impl Send for VecBuffer {}
+unsafe impl Sync for VecBuffer {}
 
-impl Buffer {
+impl VecBuffer {
     pub fn new(len: usize) -> Result<Self> {
         ensure!(len > 0, "buffer length must be positive");
         let layout = Layout::from_size_align(len, BUFFER_ALIGNMENT).context("buffer layout")?;
@@ -24,34 +89,34 @@ impl Buffer {
         Ok(Self { ptr, len })
     }
 
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    pub fn as_mut_ptr(&self) -> *mut u8 {
-        self.ptr.as_ptr()
-    }
-
     fn layout(&self) -> Layout {
         Layout::from_size_align(self.len, BUFFER_ALIGNMENT).expect("buffer layout")
     }
 }
 
-impl Deref for Buffer {
-    type Target = [u8];
+impl Buffer for VecBuffer {
+    fn len(&self) -> usize {
+        self.len
+    }
 
-    fn deref(&self) -> &Self::Target {
-        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    fn as_ptr(&self) -> *const u8 {
+        self.ptr.as_ptr()
+    }
+
+    fn as_mut_ptr(&self) -> *mut u8 {
+        self.ptr.as_ptr()
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        unsafe { slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 }
 
-impl DerefMut for Buffer {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
-    }
-}
-
-impl Drop for Buffer {
+impl Drop for VecBuffer {
     fn drop(&mut self) {
         unsafe {
             dealloc(self.ptr.as_ptr(), self.layout());
@@ -59,21 +124,9 @@ impl Drop for Buffer {
     }
 }
 
-/// Provides temporary byte buffers keyed by ublk queue + tag.
-pub trait BufferPool {
-    /// Returns the capacity of each buffer in bytes.
-    fn buffer_len(&self) -> usize;
-
-    /// Checks out the buffer assigned to `queue_id`/`tag`.
-    fn checkout(&mut self, queue_id: u16, tag: u16) -> Result<Buffer>;
-
-    /// Returns the buffer to the pool.
-    fn checkin(&mut self, queue_id: u16, tag: u16, buf: Buffer);
-}
-
-/// BufferPool backed by a Vec of reusable `Vec<u8>` slots.
+/// BufferPool backed by a Vec of reusable buffers.
 pub struct VecBufferPool {
-    slots: Vec<Option<Buffer>>,
+    slots: Vec<Option<BufferHandle>>,
     queue_count: usize,
     queue_depth: usize,
     buf_len: usize,
@@ -89,7 +142,8 @@ impl VecBufferPool {
             .context("buffer pool size overflow")?;
         let mut slots = Vec::with_capacity(total);
         for _ in 0..total {
-            slots.push(Some(Buffer::new(buf_len)?));
+            let buf: BufferHandle = Box::new(VecBuffer::new(buf_len)?);
+            slots.push(Some(buf));
         }
         Ok(Self {
             slots,
@@ -97,21 +151,6 @@ impl VecBufferPool {
             queue_depth,
             buf_len,
         })
-    }
-
-    /// Returns the raw pointers for every queue/tag slot in queue-major order.
-    ///
-    /// These pointers stay stable for the lifetime of the pool because the
-    /// backing `Vec<u8>` allocations never change capacity.
-    pub fn buffer_ptrs(&self) -> Result<Vec<*mut u8>> {
-        self.slots
-            .iter()
-            .map(|slot| {
-                slot.as_ref()
-                    .map(|buf| buf.as_mut_ptr())
-                    .context("buffer slot missing while collecting pointers")
-            })
-            .collect()
     }
 
     fn index(&self, queue_id: u16, tag: u16) -> Result<usize> {
@@ -128,16 +167,241 @@ impl BufferPool for VecBufferPool {
         self.buf_len
     }
 
-    fn checkout(&mut self, queue_id: u16, tag: u16) -> Result<Buffer> {
+    fn buffer_ptrs(&self) -> Result<Vec<*mut u8>> {
+        self.slots
+            .iter()
+            .map(|slot| {
+                slot.as_ref()
+                    .map(|buf| buf.as_mut_ptr())
+                    .context("buffer slot missing while collecting pointers")
+            })
+            .collect()
+    }
+
+    fn checkout(&mut self, queue_id: u16, tag: u16) -> Result<BufferHandle> {
         let idx = self.index(queue_id, tag)?;
         self.slots[idx].take().context("buffer already checked out")
     }
 
-    fn checkin(&mut self, queue_id: u16, tag: u16, buf: Buffer) {
+    fn checkin(&mut self, queue_id: u16, tag: u16, buf: BufferHandle) {
+        debug_assert!(
+            buf.len() == self.buf_len,
+            "buffer length mismatch during checkin"
+        );
         let idx = self
             .index(queue_id, tag)
             .expect("buffer index out of range");
         let previous = self.slots[idx].replace(buf);
         debug_assert!(previous.is_none(), "buffer slot occupied during checkin");
     }
+}
+
+/// Pool of DMA-BUF backed buffers attached to FunctionFS endpoints.
+pub struct DmaBufPool {
+    slots: Vec<Option<BufferHandle>>,
+    queue_count: usize,
+    queue_depth: usize,
+    buf_len: usize,
+    buffer_fds: Vec<RawFd>,
+    bulk_in: EndpointAttachments,
+    bulk_out: EndpointAttachments,
+}
+
+impl DmaBufPool {
+    pub fn new(
+        queue_count: u16,
+        queue_depth: u16,
+        buf_len: usize,
+        bulk_in_fd: RawFd,
+        bulk_out_fd: RawFd,
+    ) -> Result<Self> {
+        ensure!(buf_len > 0, "buffer length must be positive");
+        let queue_count = queue_count as usize;
+        let queue_depth = queue_depth as usize;
+        let total = queue_count
+            .checked_mul(queue_depth)
+            .context("buffer pool size overflow")?;
+
+        let heap = Heap::new(HeapKind::System).context("open system DMA heap")?;
+        let mut slots = Vec::with_capacity(total);
+        let mut buffer_fds = Vec::with_capacity(total);
+        for _ in 0..total {
+            let fd = heap.allocate(buf_len).context("allocate dma-buf")?;
+            let buffer = DmaBuffer::new(fd, buf_len).context("map dma-buf")?;
+            let buffer_fd = buffer.raw_fd();
+            buffer_fds.push(buffer_fd);
+            slots.push(Some(Box::new(buffer) as BufferHandle));
+        }
+
+        let mut bulk_in = EndpointAttachments::new(bulk_in_fd);
+        let mut bulk_out = EndpointAttachments::new(bulk_out_fd);
+        for fd in &buffer_fds {
+            bulk_in
+                .attach(*fd)
+                .with_context(|| format!("attach dma-buf {fd} to bulk IN"))?;
+            bulk_out
+                .attach(*fd)
+                .with_context(|| format!("attach dma-buf {fd} to bulk OUT"))?;
+        }
+
+        Ok(Self {
+            slots,
+            queue_count,
+            queue_depth,
+            buf_len,
+            buffer_fds,
+            bulk_in,
+            bulk_out,
+        })
+    }
+
+    fn index(&self, queue_id: u16, tag: u16) -> Result<usize> {
+        let queue = queue_id as usize;
+        let tag = tag as usize;
+        ensure!(queue < self.queue_count, "queue id out of range");
+        ensure!(tag < self.queue_depth, "tag out of range");
+        Ok(queue * self.queue_depth + tag)
+    }
+
+    /// Returns the dma-buf fd for the queue/tag slot.
+    pub fn dma_buf_fd(&self, queue_id: u16, tag: u16) -> Result<RawFd> {
+        let idx = self.index(queue_id, tag)?;
+        Ok(self.buffer_fds[idx])
+    }
+}
+
+impl BufferPool for DmaBufPool {
+    fn buffer_len(&self) -> usize {
+        self.buf_len
+    }
+
+    fn buffer_ptrs(&self) -> Result<Vec<*mut u8>> {
+        self.slots
+            .iter()
+            .map(|slot| {
+                slot.as_ref()
+                    .map(|buf| buf.as_mut_ptr())
+                    .context("buffer slot missing while collecting pointers")
+            })
+            .collect()
+    }
+
+    fn checkout(&mut self, queue_id: u16, tag: u16) -> Result<BufferHandle> {
+        let idx = self.index(queue_id, tag)?;
+        self.slots[idx].take().context("buffer already checked out")
+    }
+
+    fn checkin(&mut self, queue_id: u16, tag: u16, buf: BufferHandle) {
+        debug_assert!(
+            buf.len() == self.buf_len,
+            "buffer length mismatch during checkin"
+        );
+        let idx = self
+            .index(queue_id, tag)
+            .expect("buffer index out of range");
+        let previous = self.slots[idx].replace(buf);
+        debug_assert!(previous.is_none(), "buffer slot occupied during checkin");
+    }
+}
+
+impl Drop for DmaBufPool {
+    fn drop(&mut self) {
+        self.bulk_in.detach_all();
+        self.bulk_out.detach_all();
+    }
+}
+
+struct DmaBuffer {
+    fd: OwnedFd,
+    map: MemoryMap,
+    len: usize,
+}
+
+unsafe impl Send for DmaBuffer {}
+unsafe impl Sync for DmaBuffer {}
+
+impl DmaBuffer {
+    fn new(fd: OwnedFd, len: usize) -> Result<Self> {
+        ensure!(len > 0, "buffer length must be positive");
+        let raw_fd = fd.as_raw_fd();
+        let map = MemoryMap::new(
+            len,
+            &[
+                MapOption::MapReadable,
+                MapOption::MapWritable,
+                MapOption::MapFd(raw_fd),
+                MapOption::MapNonStandardFlags(libc::MAP_SHARED),
+            ],
+        )
+        .map_err(|err| map_err_to_anyhow(err, "map dma-buf memory"))?;
+        Ok(Self { fd, map, len })
+    }
+
+    fn raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+}
+
+impl Buffer for DmaBuffer {
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn as_ptr(&self) -> *const u8 {
+        self.map.data()
+    }
+
+    fn as_mut_ptr(&self) -> *mut u8 {
+        self.map.data()
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        unsafe { slice::from_raw_parts(self.map.data(), self.len) }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { slice::from_raw_parts_mut(self.map.data(), self.len) }
+    }
+
+    fn dma_fd(&self) -> Option<RawFd> {
+        Some(self.fd.as_raw_fd())
+    }
+}
+
+struct EndpointAttachments {
+    fd: RawFd,
+    attached: Vec<RawFd>,
+}
+
+impl EndpointAttachments {
+    fn new(fd: RawFd) -> Self {
+        Self {
+            fd,
+            attached: Vec::new(),
+        }
+    }
+
+    fn attach(&mut self, buf_fd: RawFd) -> Result<()> {
+        unsafe { ffs_dmabuf_attach(self.fd, &buf_fd) }
+            .map_err(|err| anyhow!(err))
+            .with_context(|| format!("FUNCTIONFS_DMABUF_ATTACH failed for fd {buf_fd}"))?;
+        self.attached.push(buf_fd);
+        Ok(())
+    }
+
+    fn detach_all(&mut self) {
+        for buf_fd in self.attached.drain(..) {
+            let _ = unsafe { ffs_dmabuf_detach(self.fd, &buf_fd) };
+        }
+    }
+}
+
+impl Drop for EndpointAttachments {
+    fn drop(&mut self) {
+        self.detach_all();
+    }
+}
+
+fn map_err_to_anyhow(err: MapError, context: &str) -> anyhow::Error {
+    anyhow!("{context}: {err}")
 }

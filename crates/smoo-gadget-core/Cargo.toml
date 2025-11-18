@@ -5,6 +5,8 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.100"
+libc = "0.2.177"
+nix = { version = "0.30.1", features = ["ioctl", "poll"] }
 smoo-gadget-buffers = { path = "../smoo-gadget-buffers" }
 smoo-proto = { path = "../smoo-proto" }
 tokio = { version = "1.48.0", features = ["fs", "io-util"] }

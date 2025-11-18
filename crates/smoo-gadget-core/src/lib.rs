@@ -1,10 +1,18 @@
 use anyhow::{Context, Result, anyhow, ensure};
-use smoo_gadget_buffers::{BufferPool, VecBufferPool};
+use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+use nix::{ioctl_readwrite, ioctl_write_ptr};
+use smoo_gadget_buffers::{Buffer, BufferPool};
 use smoo_proto::{IDENT_LEN, IDENT_REQUEST, Ident, RESPONSE_LEN, Request, Response};
-use std::{cmp, fs::File as StdFile, io, os::fd::OwnedFd};
+use std::{
+    cmp,
+    fs::File as StdFile,
+    io,
+    os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd},
+};
 use tokio::{
     fs::File,
     io::{AsyncReadExt, AsyncWriteExt},
+    task,
 };
 use tracing::{debug, trace, warn};
 
@@ -15,6 +23,39 @@ const SMOO_REQ_TYPE: u8 = USB_DIR_IN | USB_TYPE_VENDOR | USB_RECIP_INTERFACE;
 
 const SETUP_STAGE_LEN: usize = 8;
 const FUNCTIONFS_EVENT_SIZE: usize = SETUP_STAGE_LEN + 4;
+const FUNCTIONFS_IOC_MAGIC: u8 = b'g';
+const FUNCTIONFS_DMABUF_TRANSFER_NR: u8 = 133;
+
+#[repr(C, packed)]
+struct UsbFfsDmabufTransferReq {
+    fd: libc::c_int,
+    flags: u32,
+    length: u64,
+}
+
+ioctl_write_ptr!(
+    ffs_dmabuf_transfer,
+    FUNCTIONFS_IOC_MAGIC,
+    FUNCTIONFS_DMABUF_TRANSFER_NR,
+    UsbFfsDmabufTransferReq
+);
+
+#[repr(C)]
+struct dma_buf_export_sync_file_req {
+    flags: u32,
+    fd: i32,
+}
+
+const DMA_BUF_SYNC_READ: u32 = 1 << 0;
+const DMA_BUF_SYNC_WRITE: u32 = 1 << 1;
+const DMA_BUF_SYNC_RW: u32 = DMA_BUF_SYNC_READ | DMA_BUF_SYNC_WRITE;
+
+ioctl_readwrite!(
+    dma_buf_export_sync_file,
+    b'b',
+    2,
+    dma_buf_export_sync_file_req
+);
 
 /// File descriptor bundle for a FunctionFS interface.
 pub struct FunctionfsEndpoints {
@@ -74,14 +115,14 @@ pub struct SmooGadget {
     bulk_out: File,
     ident: Ident,
     configured: bool,
-    buffer_pool: VecBufferPool,
+    buffer_pool: Box<dyn BufferPool>,
 }
 
 impl SmooGadget {
     pub fn new(
         endpoints: FunctionfsEndpoints,
         config: GadgetConfig,
-        buffer_pool: VecBufferPool,
+        buffer_pool: Box<dyn BufferPool>,
     ) -> Result<Self> {
         ensure!(
             buffer_pool.buffer_len() == config.max_io_bytes,
@@ -197,9 +238,43 @@ impl SmooGadget {
         self.bulk_in.flush().await.context("flush bulk IN")
     }
 
+    /// Read a bulk payload directly into a pooled buffer, using DMA-BUF when available.
+    pub async fn read_bulk_buffer(&mut self, buf: &mut dyn Buffer, len: usize) -> Result<()> {
+        ensure!(self.configured, "gadget not configured");
+        if len == 0 {
+            return Ok(());
+        }
+        if let Some(fd) = buf.dma_fd() {
+            self.queue_dmabuf_transfer(self.bulk_out.as_raw_fd(), fd, len)
+                .await
+                .context("FUNCTIONFS dmabuf transfer (OUT)")
+        } else {
+            self.read_bulk(&mut buf.as_mut_slice()[..len])
+                .await
+                .context("read bulk payload")
+        }
+    }
+
+    /// Write a bulk payload from a pooled buffer, using DMA-BUF when available.
+    pub async fn write_bulk_buffer(&mut self, buf: &dyn Buffer, len: usize) -> Result<()> {
+        ensure!(self.configured, "gadget not configured");
+        if len == 0 {
+            return Ok(());
+        }
+        if let Some(fd) = buf.dma_fd() {
+            self.queue_dmabuf_transfer(self.bulk_in.as_raw_fd(), fd, len)
+                .await
+                .context("FUNCTIONFS dmabuf transfer (IN)")
+        } else {
+            self.write_bulk(&buf.as_slice()[..len])
+                .await
+                .context("write bulk payload")
+        }
+    }
+
     /// Access the shared Vec-backed buffer pool for bulk transfers.
-    pub fn buffer_pool(&mut self) -> &mut VecBufferPool {
-        &mut self.buffer_pool
+    pub fn buffer_pool(&mut self) -> &mut dyn BufferPool {
+        self.buffer_pool.as_mut()
     }
 
     async fn next_event(&mut self) -> Result<FunctionfsEvent> {
@@ -257,6 +332,17 @@ impl SmooGadget {
         self.ep0.write_all(data).await.context("write ep0 data")?;
         self.ep0.flush().await.context("flush ep0")?;
         Ok(())
+    }
+
+    async fn queue_dmabuf_transfer(
+        &self,
+        endpoint_fd: RawFd,
+        buf_fd: RawFd,
+        len: usize,
+    ) -> Result<()> {
+        task::spawn_blocking(move || dmabuf_transfer_blocking(endpoint_fd, buf_fd, len))
+            .await
+            .map_err(|err| anyhow!("dma-buf transfer task failed: {err}"))?
     }
 }
 
@@ -362,4 +448,51 @@ impl TryFrom<u8> for FunctionfsEventType {
 fn to_tokio_file(fd: OwnedFd) -> io::Result<File> {
     let std_file = StdFile::from(fd);
     Ok(File::from_std(std_file))
+}
+
+fn dmabuf_transfer_blocking(endpoint_fd: RawFd, buf_fd: RawFd, len: usize) -> Result<()> {
+    let length = u64::try_from(len).context("dma-buf transfer length exceeds u64")?;
+    unsafe {
+        ffs_dmabuf_transfer(
+            endpoint_fd,
+            &UsbFfsDmabufTransferReq {
+                fd: buf_fd,
+                flags: 0,
+                length,
+            },
+        )
+    }
+    .map_err(|err| anyhow!("FUNCTIONFS_DMABUF_TRANSFER failed: {err}"))?;
+    wait_for_dmabuf_completion(buf_fd)
+}
+
+fn wait_for_dmabuf_completion(dmabuf_fd: RawFd) -> Result<()> {
+    let sync_fd = unsafe {
+        let mut req = dma_buf_export_sync_file_req {
+            flags: DMA_BUF_SYNC_RW,
+            fd: -1,
+        };
+        dma_buf_export_sync_file(dmabuf_fd, &mut req)
+            .map_err(|err| anyhow!("DMA_BUF_IOCTL_EXPORT_SYNC_FILE failed: {err}"))?;
+        ensure!(req.fd >= 0, "sync file descriptor invalid");
+        OwnedFd::from_raw_fd(req.fd)
+    };
+
+    let mut fds = [PollFd::new(sync_fd.as_fd(), PollFlags::POLLIN)];
+    loop {
+        match poll(&mut fds, PollTimeout::NONE) {
+            Ok(0) => continue,
+            Ok(_) => {
+                let revents = fds[0].revents().unwrap_or(PollFlags::empty());
+                if revents.contains(PollFlags::POLLERR) {
+                    return Err(anyhow!("dma-buf completion poll error"));
+                }
+                if revents.intersects(PollFlags::POLLIN) {
+                    break;
+                }
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(())
 }

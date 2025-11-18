@@ -1,6 +1,6 @@
 use anyhow::{anyhow, ensure, Context, Result};
 use clap::Parser;
-use smoo_gadget_buffers::{BufferPool, VecBufferPool};
+use smoo_gadget_buffers::{BufferHandle, BufferPool, DmaBufPool, VecBufferPool};
 use smoo_gadget_core::{FunctionfsEndpoints, GadgetConfig, SmooGadget};
 use smoo_gadget_ublk::{SmooUblk, SmooUblkDevice, UblkIoRequest, UblkOp};
 use smoo_proto::{Ident, OpCode, Request, Response};
@@ -8,7 +8,7 @@ use std::{
     fs::File,
     io,
     io::Write,
-    os::fd::{FromRawFd, IntoRawFd, OwnedFd},
+    os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
     path::PathBuf,
 };
 use tokio::signal;
@@ -70,8 +70,28 @@ async fn main() -> Result<()> {
     let block_size = args.block_size as usize;
     let max_io_bytes = SmooUblk::max_io_bytes_hint(block_size, args.queue_depth)
         .context("compute max io bytes")?;
-    let buffer_pool = VecBufferPool::new(args.queue_count, args.queue_depth, max_io_bytes)
-        .context("init buffer pool")?;
+    let buffer_pool: Box<dyn BufferPool> = match DmaBufPool::new(
+        args.queue_count,
+        args.queue_depth,
+        max_io_bytes,
+        endpoints.bulk_in.as_raw_fd(),
+        endpoints.bulk_out.as_raw_fd(),
+    ) {
+        Ok(pool) => {
+            info!("using DMA-BUF buffer pool");
+            Box::new(pool)
+        }
+        Err(err) => {
+            warn!(
+                error = ?err,
+                "DMA-BUF pool unavailable, falling back to VecBufferPool"
+            );
+            Box::new(
+                VecBufferPool::new(args.queue_count, args.queue_depth, max_io_bytes)
+                    .context("init vec buffer pool")?,
+            )
+        }
+    };
     let buffer_ptrs = buffer_pool
         .buffer_ptrs()
         .context("collect buffer pointers")?;
@@ -220,7 +240,7 @@ async fn handle_request(
         }
     };
 
-    let mut payload = None;
+    let mut payload: Option<BufferHandle> = None;
     let result = async {
         if matches!(opcode, OpCode::Read | OpCode::Write) && req_len > 0 {
             let capacity = {
@@ -259,14 +279,14 @@ async fn handle_request(
         if opcode == OpCode::Read && req_len > 0 {
             if let Some(buf) = payload.as_mut() {
                 gadget
-                    .read_bulk(&mut buf[..req_len])
+                    .read_bulk_buffer(buf.as_mut(), req_len)
                     .await
                     .context("read bulk payload")?;
             }
         } else if opcode == OpCode::Write && req_len > 0 {
             if let Some(buf) = payload.as_ref() {
                 gadget
-                    .write_bulk(&buf[..req_len])
+                    .write_bulk_buffer(buf.as_ref(), req_len)
                     .await
                     .context("write bulk payload")?;
             }

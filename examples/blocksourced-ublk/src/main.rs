@@ -172,7 +172,7 @@ async fn main() -> anyhow::Result<()> {
                             .checkout(req.queue_id, req.tag)
                             .context("checkout buffer")?;
                         source
-                            .read_blocks(req.sector, &mut buf[..req_len])
+                            .read_blocks(req.sector, &mut buf.as_mut_slice()[..req_len])
                             .await
                             .context("read backing source")?;
                         buffer_pool.checkin(req.queue_id, req.tag, buf);
@@ -196,7 +196,7 @@ async fn main() -> anyhow::Result<()> {
                             .checkout(req.queue_id, req.tag)
                             .context("checkout buffer")?;
                         source
-                            .write_blocks(req.sector, &buf[..req_len])
+                            .write_blocks(req.sector, &buf.as_slice()[..req_len])
                             .await
                             .context("write backing source")?;
                         buffer_pool.checkin(req.queue_id, req.tag, buf);
