@@ -1,6 +1,6 @@
 use anyhow::{anyhow, ensure, Context, Result};
 use clap::Parser;
-use smoo_gadget_buffers::BufferPool;
+use smoo_gadget_buffers::{BufferPool, VecBufferPool};
 use smoo_gadget_core::{FunctionfsEndpoints, GadgetConfig, SmooGadget};
 use smoo_gadget_ublk::{SmooUblk, SmooUblkDevice, UblkIoRequest, UblkOp};
 use smoo_proto::{Ident, OpCode, Request, Response};
@@ -68,19 +68,32 @@ async fn main() -> Result<()> {
 
     let mut ublk = SmooUblk::new().context("init ublk")?;
     let block_size = args.block_size as usize;
+    let max_io_bytes = SmooUblk::max_io_bytes_hint(block_size, args.queue_depth)
+        .context("compute max io bytes")?;
+    let buffer_pool = VecBufferPool::new(args.queue_count, args.queue_depth, max_io_bytes)
+        .context("init buffer pool")?;
+    let buffer_ptrs = buffer_pool
+        .buffer_ptrs()
+        .context("collect buffer pointers")?;
     let device = ublk
-        .setup_device(block_size, block_count, args.queue_count, args.queue_depth)
+        .setup_device(
+            block_size,
+            block_count,
+            args.queue_count,
+            args.queue_depth,
+            &buffer_ptrs,
+        )
         .await
         .context("setup ublk device")?;
+    ensure!(
+        device.max_io_bytes() == max_io_bytes,
+        "device max io bytes changed during setup"
+    );
 
     let ident = Ident::new(0, 1);
-    let gadget_config = GadgetConfig::new(
-        ident,
-        args.queue_count,
-        args.queue_depth,
-        device.max_io_bytes(),
-    );
-    let mut gadget = SmooGadget::new(endpoints, gadget_config).context("init smoo gadget core")?;
+    let gadget_config = GadgetConfig::new(ident, args.queue_count, args.queue_depth, max_io_bytes);
+    let mut gadget =
+        SmooGadget::new(endpoints, gadget_config, buffer_pool).context("init smoo gadget core")?;
     gadget.setup().await.context("complete FunctionFS setup")?;
     info!(
         ident_major = ident.major,
@@ -205,30 +218,6 @@ async fn handle_request(
             );
         }
 
-        if opcode == OpCode::Write && req_len > 0 {
-            if let Some(buf) = payload.as_mut() {
-                if let Err(err) =
-                    device.copy_from_kernel(req.queue_id, req.tag, &mut buf[..req_len])
-                {
-                    let errno = errno_from_io(&err);
-                    warn!(
-                        queue = req.queue_id,
-                        tag = req.tag,
-                        errno = errno,
-                        "copy write payload from kernel failed: {err}"
-                    );
-                    device
-                        .complete_io(req, -errno)
-                        .context("complete failed kernel copy")?;
-                    if let Some(buf) = payload.take() {
-                        let pool = gadget.buffer_pool();
-                        pool.checkin(req.queue_id, req.tag, buf);
-                    }
-                    return Ok(());
-                }
-            }
-        }
-
         let byte_len = u32::try_from(req_len).context("request length exceeds protocol limit")?;
         let proto_req = Request::new(opcode, req.sector, byte_len, 0);
         gadget
@@ -236,23 +225,12 @@ async fn handle_request(
             .await
             .context("send smoo request")?;
 
-        let mut completion_override = None;
         if opcode == OpCode::Read && req_len > 0 {
             if let Some(buf) = payload.as_mut() {
                 gadget
                     .read_bulk(&mut buf[..req_len])
                     .await
                     .context("read bulk payload")?;
-                if let Err(err) = device.copy_to_kernel(req.queue_id, req.tag, &buf[..req_len]) {
-                    let errno = errno_from_io(&err);
-                    warn!(
-                        queue = req.queue_id,
-                        tag = req.tag,
-                        errno = errno,
-                        "copy read payload to kernel failed: {err}"
-                    );
-                    completion_override = Some(-errno);
-                }
             }
         } else if opcode == OpCode::Write && req_len > 0 {
             if let Some(buf) = payload.as_ref() {
@@ -265,10 +243,7 @@ async fn handle_request(
 
         let response = gadget.read_response().await.context("read smoo response")?;
 
-        let mut status = response_status(&response, req_len)?;
-        if let Some(override_status) = completion_override {
-            status = override_status;
-        }
+        let status = response_status(&response, req_len)?;
         if status >= 0 && status as usize != req_len {
             warn!(
                 queue = req.queue_id,

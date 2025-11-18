@@ -79,16 +79,27 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let mut ublk = SmooUblk::new().context("init ublk")?;
+    let max_io_bytes = SmooUblk::max_io_bytes_hint(block_size, args.queue_depth)
+        .context("compute max io bytes")?;
+    let mut buffer_pool = VecBufferPool::new(args.queue_count, args.queue_depth, max_io_bytes)
+        .context("init buffer pool")?;
+    let buffer_ptrs = buffer_pool
+        .buffer_ptrs()
+        .context("collect buffer pointers")?;
     let device = ublk
-        .setup_device(block_size, block_count, args.queue_count, args.queue_depth)
+        .setup_device(
+            block_size,
+            block_count,
+            args.queue_count,
+            args.queue_depth,
+            &buffer_ptrs,
+        )
         .await
         .context("setup device")?;
-    let mut buffer_pool = VecBufferPool::new(
-        device.queue_count(),
-        device.queue_depth(),
-        device.max_io_bytes(),
-    )
-    .context("init buffer pool")?;
+    ensure!(
+        device.max_io_bytes() == max_io_bytes,
+        "device max io bytes changed during setup"
+    );
 
     info!(
         block_size = block_size,
@@ -96,7 +107,7 @@ async fn main() -> anyhow::Result<()> {
         blocks = block_count,
         queues = args.queue_count,
         depth = args.queue_depth,
-        buffer_bytes = device.max_io_bytes(),
+        buffer_bytes = max_io_bytes,
         "ublk device configured"
     );
 
@@ -164,9 +175,6 @@ async fn main() -> anyhow::Result<()> {
                             .read_blocks(req.sector, &mut buf[..req_len])
                             .await
                             .context("read backing source")?;
-                        device
-                            .copy_to_kernel(req.queue_id, req.tag, &buf[..req_len])
-                            .context("copy read data to kernel")?;
                         buffer_pool.checkin(req.queue_id, req.tag, buf);
                         req_len
                     }
@@ -184,12 +192,9 @@ async fn main() -> anyhow::Result<()> {
                                 .context("complete oversized request")?;
                             continue;
                         }
-                        let mut buf = buffer_pool
+                        let buf = buffer_pool
                             .checkout(req.queue_id, req.tag)
                             .context("checkout buffer")?;
-                        device
-                            .copy_from_kernel(req.queue_id, req.tag, &mut buf[..req_len])
-                            .context("copy write data from kernel")?;
                         source
                             .write_blocks(req.sector, &buf[..req_len])
                             .await

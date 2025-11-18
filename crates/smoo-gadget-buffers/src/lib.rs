@@ -40,6 +40,21 @@ impl VecBufferPool {
         })
     }
 
+    /// Returns the raw pointers for every queue/tag slot in queue-major order.
+    ///
+    /// These pointers stay stable for the lifetime of the pool because the
+    /// backing `Vec<u8>` allocations never change capacity.
+    pub fn buffer_ptrs(&self) -> Result<Vec<*mut u8>> {
+        self.slots
+            .iter()
+            .map(|slot| {
+                slot.as_ref()
+                    .map(|buf| buf.as_ptr() as *mut u8)
+                    .context("buffer slot missing while collecting pointers")
+            })
+            .collect()
+    }
+
     fn index(&self, queue_id: u16, tag: u16) -> Result<usize> {
         let queue = queue_id as usize;
         let tag = tag as usize;

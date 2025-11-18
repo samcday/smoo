@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow, ensure};
-use smoo_gadget_buffers::VecBufferPool;
+use smoo_gadget_buffers::{BufferPool, VecBufferPool};
 use smoo_proto::{IDENT_LEN, IDENT_REQUEST, Ident, RESPONSE_LEN, Request, Response};
 use std::{cmp, fs::File as StdFile, io, os::fd::OwnedFd};
 use tokio::{
@@ -78,10 +78,15 @@ pub struct SmooGadget {
 }
 
 impl SmooGadget {
-    pub fn new(endpoints: FunctionfsEndpoints, config: GadgetConfig) -> Result<Self> {
-        let buffer_pool =
-            VecBufferPool::new(config.queue_count, config.queue_depth, config.max_io_bytes)
-                .context("init buffer pool")?;
+    pub fn new(
+        endpoints: FunctionfsEndpoints,
+        config: GadgetConfig,
+        buffer_pool: VecBufferPool,
+    ) -> Result<Self> {
+        ensure!(
+            buffer_pool.buffer_len() == config.max_io_bytes,
+            "buffer pool length mismatch"
+        );
         Ok(Self {
             ep0: to_tokio_file(endpoints.ep0)?,
             interrupt_in: to_tokio_file(endpoints.interrupt_in)?,
