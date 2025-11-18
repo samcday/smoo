@@ -454,6 +454,7 @@ fn to_tokio_file(fd: OwnedFd) -> io::Result<File> {
 
 fn dmabuf_transfer_blocking(endpoint_fd: RawFd, buf_fd: RawFd, len: usize) -> Result<()> {
     let length = u64::try_from(len).context("dma-buf transfer length exceeds u64")?;
+    trace!(endpoint_fd, buf_fd, len, "FUNCTIONFS_DMABUF_TRANSFER begin");
     unsafe {
         ffs_dmabuf_transfer(
             endpoint_fd,
@@ -465,10 +466,15 @@ fn dmabuf_transfer_blocking(endpoint_fd: RawFd, buf_fd: RawFd, len: usize) -> Re
         )
     }
     .map_err(|err| anyhow!("FUNCTIONFS_DMABUF_TRANSFER failed: {err}"))?;
+    trace!(
+        endpoint_fd,
+        buf_fd, len, "FUNCTIONFS_DMABUF_TRANSFER submitted"
+    );
     wait_for_dmabuf_completion(buf_fd)
 }
 
 fn wait_for_dmabuf_completion(dmabuf_fd: RawFd) -> Result<()> {
+    trace!(buf_fd = dmabuf_fd, "DMA_BUF_IOCTL_EXPORT_SYNC_FILE begin");
     let sync_fd = unsafe {
         let mut req = dma_buf_export_sync_file_req {
             flags: DMA_BUF_SYNC_RW,
@@ -479,9 +485,18 @@ fn wait_for_dmabuf_completion(dmabuf_fd: RawFd) -> Result<()> {
         ensure!(req.fd >= 0, "sync file descriptor invalid");
         OwnedFd::from_raw_fd(req.fd)
     };
+    trace!(
+        buf_fd = dmabuf_fd,
+        sync_fd = sync_fd.as_raw_fd(),
+        "DMA_BUF_IOCTL_EXPORT_SYNC_FILE complete"
+    );
 
     let mut fds = [PollFd::new(sync_fd.as_fd(), PollFlags::POLLIN)];
     loop {
+        trace!(
+            sync_fd = sync_fd.as_raw_fd(),
+            "polling for dma-buf completion"
+        );
         match poll(&mut fds, PollTimeout::NONE) {
             Ok(0) => continue,
             Ok(_) => {
@@ -496,5 +511,6 @@ fn wait_for_dmabuf_completion(dmabuf_fd: RawFd) -> Result<()> {
             Err(err) => return Err(err.into()),
         }
     }
+    trace!(buf_fd = dmabuf_fd, "dma-buf completion fence signaled");
     Ok(())
 }

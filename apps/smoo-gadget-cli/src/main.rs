@@ -58,6 +58,7 @@ struct Args {
 enum DmaHeapSelection {
     System,
     Cma,
+    Reserved,
 }
 
 impl From<DmaHeapSelection> for HeapKind {
@@ -65,6 +66,7 @@ impl From<DmaHeapSelection> for HeapKind {
         match value {
             DmaHeapSelection::System => HeapKind::System,
             DmaHeapSelection::Cma => HeapKind::Cma,
+            DmaHeapSelection::Reserved => HeapKind::Custom(PathBuf::from("/dev/dma_heap/reserved")),
         }
     }
 }

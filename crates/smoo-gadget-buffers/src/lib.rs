@@ -6,6 +6,7 @@ use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::ptr::NonNull;
 use std::slice;
+use tracing::{trace, warn};
 
 const BUFFER_ALIGNMENT: usize = 4096;
 
@@ -404,16 +405,40 @@ impl EndpointAttachments {
     }
 
     fn attach(&mut self, buf_fd: RawFd) -> Result<()> {
+        trace!(
+            endpoint_fd = self.fd,
+            buf_fd, "FUNCTIONFS_DMABUF_ATTACH begin"
+        );
         unsafe { ffs_dmabuf_attach(self.fd, &buf_fd) }
             .map_err(|err| anyhow!(err))
             .with_context(|| format!("FUNCTIONFS_DMABUF_ATTACH failed for fd {buf_fd}"))?;
         self.attached.push(buf_fd);
+        trace!(
+            endpoint_fd = self.fd,
+            buf_fd, "FUNCTIONFS_DMABUF_ATTACH complete"
+        );
         Ok(())
     }
 
     fn detach_all(&mut self) {
         for buf_fd in self.attached.drain(..) {
-            let _ = unsafe { ffs_dmabuf_detach(self.fd, &buf_fd) };
+            trace!(
+                endpoint_fd = self.fd,
+                buf_fd, "FUNCTIONFS_DMABUF_DETACH begin"
+            );
+            let res = unsafe { ffs_dmabuf_detach(self.fd, &buf_fd) };
+            match res {
+                Ok(_) => trace!(
+                    endpoint_fd = self.fd,
+                    buf_fd, "FUNCTIONFS_DMABUF_DETACH complete"
+                ),
+                Err(err) => warn!(
+                    endpoint_fd = self.fd,
+                    buf_fd,
+                    error = %err,
+                    "FUNCTIONFS_DMABUF_DETACH failed"
+                ),
+            }
         }
     }
 }
@@ -430,9 +455,18 @@ fn map_err_to_anyhow(err: MapError, context: &str) -> anyhow::Error {
 
 fn dma_buf_sync_call(fd: RawFd, flags: u64) -> Result<()> {
     let req = DmaBufSync { flags };
-    unsafe { dma_buf_sync(fd, &req) }
-        .map(|_| ())
-        .map_err(|err| anyhow!("DMA_BUF_IOCTL_SYNC failed: {err}"))
+    trace!(fd, flags, "DMA_BUF_IOCTL_SYNC begin");
+    let res = unsafe { dma_buf_sync(fd, &req) };
+    match res {
+        Ok(_) => {
+            trace!(fd, flags, "DMA_BUF_IOCTL_SYNC complete");
+            Ok(())
+        }
+        Err(err) => {
+            warn!(fd, flags, error = %err, "DMA_BUF_IOCTL_SYNC failed");
+            Err(anyhow!("DMA_BUF_IOCTL_SYNC failed: {err}"))
+        }
+    }
 }
 
 fn dma_buf_sync_start(fd: RawFd, dir: u64) -> Result<()> {
