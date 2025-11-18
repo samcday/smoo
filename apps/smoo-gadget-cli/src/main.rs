@@ -1,17 +1,24 @@
 use anyhow::{anyhow, ensure, Context, Result};
 use clap::{Parser, ValueEnum};
-use smoo_gadget_core::{DmaHeap, FunctionfsEndpoints, GadgetConfig, SmooGadget};
+use smoo_gadget_core::{
+    ConfigExportsV0, DmaHeap, Ep0Controller, Ep0Event, FunctionfsEndpoints, GadgetConfig,
+    SetupPacket, SmooGadget, CONFIG_EXPORTS_REQUEST, SMOO_CONFIG_REQ_TYPE,
+};
 use smoo_gadget_ublk::{SmooUblk, SmooUblkDevice, UblkBuffer, UblkIoRequest, UblkOp};
-use smoo_proto::{Ident, OpCode, Request, Response};
+use smoo_proto::{Ident, OpCode, Request, Response, IDENT_LEN, IDENT_REQUEST};
 use std::{
+    cmp,
     fs::File,
     io,
     io::Write,
     os::fd::{FromRawFd, IntoRawFd, OwnedFd},
     path::PathBuf,
 };
-use tokio::signal;
-use tracing::{info, warn};
+use tokio::{
+    signal,
+    sync::{mpsc, oneshot},
+};
+use tracing::{debug, info, warn};
 use tracing_subscriber::prelude::*;
 use usb_gadget::{
     function::custom::{Custom, Endpoint, EndpointDirection, Interface, TransferType},
@@ -21,6 +28,7 @@ use usb_gadget::{
 const SMOO_CLASS: u8 = 0xFF;
 const SMOO_SUBCLASS: u8 = 0x53;
 const SMOO_PROTOCOL: u8 = 0x4D;
+const SMOO_IDENT_REQ_TYPE: u8 = 0xC1;
 
 #[derive(Debug, Parser)]
 #[command(name = "smoo-gadget-cli")]
@@ -83,23 +91,15 @@ async fn main() -> Result<()> {
         args.block_size.is_power_of_two(),
         "block size must be a power-of-two"
     );
-    let block_count = usize::try_from(args.blocks).context("block count exceeds usize")?;
+    let default_block_count = usize::try_from(args.blocks).context("block count exceeds usize")?;
 
     usb_gadget::remove_all().context("remove existing USB gadgets")?;
     let (endpoints, _gadget_guard) = setup_functionfs(&args).context("setup FunctionFS")?;
 
     let mut ublk = SmooUblk::new().context("init ublk")?;
-    let block_size = args.block_size as usize;
-    let max_io_bytes = SmooUblk::max_io_bytes_hint(block_size, args.queue_depth)
+    let max_block_size = args.block_size as usize;
+    let max_io_bytes = SmooUblk::max_io_bytes_hint(max_block_size, args.queue_depth)
         .context("compute max io bytes")?;
-    let device = ublk
-        .setup_device(block_size, block_count, args.queue_count, args.queue_depth)
-        .await
-        .context("setup ublk device")?;
-    ensure!(
-        device.max_io_bytes() == max_io_bytes,
-        "device max io bytes changed during setup"
-    );
 
     let ident = Ident::new(0, 1);
     let dma_heap = if args.no_dma_buf {
@@ -142,9 +142,6 @@ async fn main() -> Result<()> {
 
     if matches!(setup_outcome, SetupAwait::Interrupted) {
         info!("shutdown requested before host completed ident exchange");
-        ublk.stop_dev(device, true)
-            .await
-            .context("stop ublk device after interrupted setup")?;
         return Ok(());
     }
     info!(
@@ -155,45 +152,117 @@ async fn main() -> Result<()> {
         "smoo gadget initialized"
     );
 
-    run_event_loop(&mut ublk, device, gadget, args.block_size as usize).await
+    let ep0 = gadget
+        .take_ep0_controller()
+        .context("ep0 controller already taken")?;
+    let (control_tx, control_rx) = mpsc::channel(8);
+    let control_task = tokio::spawn(control_loop(ep0, ident, control_tx));
+    let runtime = RuntimeConfig {
+        queue_count: args.queue_count,
+        queue_depth: args.queue_depth,
+        max_block_size,
+        default_block_count,
+    };
+    let result = run_event_loop(&mut ublk, gadget, runtime, control_rx).await;
+    control_task.abort();
+    let _ = control_task.await;
+    result
+}
+
+struct RuntimeConfig {
+    queue_count: u16,
+    queue_depth: u16,
+    max_block_size: usize,
+    default_block_count: usize,
+}
+
+struct ConfigCommand {
+    payload: ConfigExportsV0,
+    respond_to: oneshot::Sender<Result<()>>,
+}
+
+enum ControlMessage {
+    Config(ConfigCommand),
 }
 
 async fn run_event_loop(
     ublk: &mut SmooUblk,
-    device: SmooUblkDevice,
     mut gadget: SmooGadget,
-    block_size: usize,
+    runtime: RuntimeConfig,
+    mut control_rx: mpsc::Receiver<ControlMessage>,
 ) -> Result<()> {
+    let mut device: Option<SmooUblkDevice> = None;
+    let mut current_block_size: Option<usize> = None;
     let shutdown = signal::ctrl_c();
     tokio::pin!(shutdown);
 
     let mut io_error = None;
     loop {
-        tokio::select! {
-            _ = &mut shutdown => {
-                info!("shutdown signal received");
-                break;
-            }
-            req = device.next_io() => {
-                let req = match req {
-                    Ok(req) => req,
-                    Err(err) => {
-                        io_error = Some(err.context("receive ublk io"));
+        if let Some(active_device) = device.as_ref() {
+            let block_size = current_block_size.expect("block size must be set when device active");
+            tokio::select! {
+                _ = &mut shutdown => {
+                    info!("shutdown signal received");
+                    break;
+                }
+                msg = control_rx.recv() => {
+                    if let Some(msg) = msg {
+                        process_control_message(
+                            msg,
+                            ublk,
+                            &mut device,
+                            &runtime,
+                            &mut current_block_size,
+                        )
+                        .await?;
+                    } else {
                         break;
                     }
-                };
-                if let Err(err) = handle_request(&mut gadget, &device, req, block_size).await {
-                    io_error = Some(err);
+                }
+                req = active_device.next_io() => {
+                    let req = match req {
+                        Ok(req) => req,
+                        Err(err) => {
+                            io_error = Some(err.context("receive ublk io"));
+                            break;
+                        }
+                    };
+                    if let Err(err) = handle_request(&mut gadget, active_device, req, block_size).await {
+                        io_error = Some(err);
+                        break;
+                    }
+                }
+            }
+        } else {
+            tokio::select! {
+                _ = &mut shutdown => {
+                    info!("shutdown signal received");
                     break;
+                }
+                msg = control_rx.recv() => {
+                    if let Some(msg) = msg {
+                        process_control_message(
+                            msg,
+                            ublk,
+                            &mut device,
+                            &runtime,
+                            &mut current_block_size,
+                        )
+                        .await?;
+                    } else {
+                        break;
+                    }
                 }
             }
         }
     }
 
-    info!("stopping ublk device");
-    ublk.stop_dev(device, true)
-        .await
-        .context("stop ublk device")?;
+    if let Some(device) = device.take() {
+        info!("stopping ublk device");
+        ublk.stop_dev(device, true)
+            .await
+            .context("stop ublk device")?;
+    }
     if let Some(err) = io_error {
         Err(err)
     } else {
@@ -310,6 +379,100 @@ async fn handle_request(
     result
 }
 
+async fn control_loop(
+    mut ep0: Ep0Controller,
+    ident: Ident,
+    mut tx: mpsc::Sender<ControlMessage>,
+) -> Result<()> {
+    loop {
+        let event = ep0
+            .next_event()
+            .await
+            .context("read FunctionFS control event")?;
+        match event {
+            Ep0Event::Bind => debug!("FunctionFS bind event (control loop)"),
+            Ep0Event::Unbind => debug!("FunctionFS unbind event (control loop)"),
+            Ep0Event::Enable => debug!("FunctionFS enable event (control loop)"),
+            Ep0Event::Disable => debug!("FunctionFS disable event (control loop)"),
+            Ep0Event::Suspend => debug!("FunctionFS suspend event (control loop)"),
+            Ep0Event::Resume => debug!("FunctionFS resume event (control loop)"),
+            Ep0Event::Setup(setup) => {
+                if setup.request() == IDENT_REQUEST && setup.request_type() == SMOO_IDENT_REQ_TYPE {
+                    if let Err(err) = respond_ident(&mut ep0, ident, setup).await {
+                        warn!(error = ?err, "failed to reply to IDENT");
+                        ep0.stall().await.context("stall IDENT failure")?;
+                    }
+                    continue;
+                }
+                if setup.request() == CONFIG_EXPORTS_REQUEST
+                    && setup.request_type() == SMOO_CONFIG_REQ_TYPE
+                {
+                    if let Err(err) = handle_config_request(&mut ep0, setup, &mut tx).await {
+                        warn!(error = ?err, "CONFIG_EXPORTS failed");
+                        ep0.stall().await.context("stall CONFIG_EXPORTS failure")?;
+                    }
+                    continue;
+                }
+                warn!(
+                    request = setup.request(),
+                    request_type = setup.request_type(),
+                    length = setup.length(),
+                    "unsupported control request"
+                );
+                ep0.stall().await.context("stall unsupported request")?;
+            }
+        }
+    }
+}
+
+async fn respond_ident(ep0: &mut Ep0Controller, ident: Ident, setup: SetupPacket) -> Result<()> {
+    ensure!(
+        setup.request_type() & 0x80 != 0,
+        "IDENT must be an IN transfer"
+    );
+    ensure!(
+        setup.length() as usize >= IDENT_LEN,
+        "IDENT buffer too small"
+    );
+    let encoded = ident.encode();
+    let len = cmp::min(encoded.len(), setup.length() as usize);
+    ep0.write_in(&encoded[..len])
+        .await
+        .context("write IDENT response")
+}
+
+async fn handle_config_request(
+    ep0: &mut Ep0Controller,
+    setup: SetupPacket,
+    tx: &mut mpsc::Sender<ControlMessage>,
+) -> Result<()> {
+    ensure!(
+        setup.length() as usize == ConfigExportsV0::ENCODED_LEN,
+        "CONFIG_EXPORTS payload length mismatch"
+    );
+    let mut buf = [0u8; ConfigExportsV0::ENCODED_LEN];
+    ep0.read_out(&mut buf)
+        .await
+        .context("read CONFIG_EXPORTS")?;
+    let config = ConfigExportsV0::parse(&buf).context("parse CONFIG_EXPORTS payload")?;
+    let (respond_to, response_rx) = oneshot::channel();
+    let cmd = ConfigCommand {
+        payload: config,
+        respond_to,
+    };
+    if tx.send(ControlMessage::Config(cmd)).await.is_err() {
+        anyhow::bail!("control channel closed");
+    }
+    match response_rx.await {
+        Ok(Ok(())) => {
+            ep0.write_in(&[]).await.context("ACK CONFIG_EXPORTS")?;
+            Ok(())
+        }
+        Ok(Err(err)) => Err(err),
+        Err(_) => anyhow::bail!("config responder dropped"),
+    }
+}
+
 fn opcode_from_ublk(op: UblkOp) -> Option<OpCode> {
     match op {
         UblkOp::Read => Some(OpCode::Read),
@@ -348,6 +511,87 @@ fn errno_from_io(err: &io::Error) -> i32 {
         io::ErrorKind::InvalidInput => libc::EINVAL,
         _ => libc::EIO,
     })
+}
+
+async fn process_control_message(
+    msg: ControlMessage,
+    ublk: &mut SmooUblk,
+    device: &mut Option<SmooUblkDevice>,
+    runtime: &RuntimeConfig,
+    current_block_size: &mut Option<usize>,
+) -> Result<()> {
+    match msg {
+        ControlMessage::Config(cmd) => {
+            let result = apply_config(ublk, device, runtime, cmd.payload).await;
+            if let Ok(Some(bs)) = result.as_ref() {
+                *current_block_size = Some(*bs);
+            } else if result.is_ok() {
+                *current_block_size = None;
+            }
+            let reply = result.map(|_| ());
+            let _ = cmd.respond_to.send(reply);
+        }
+    }
+    Ok(())
+}
+
+async fn apply_config(
+    ublk: &mut SmooUblk,
+    device_slot: &mut Option<SmooUblkDevice>,
+    runtime: &RuntimeConfig,
+    config: ConfigExportsV0,
+) -> Result<Option<usize>> {
+    match config.export() {
+        None => {
+            if let Some(device) = device_slot.take() {
+                info!("CONFIG_EXPORTS removing current export");
+                ublk.stop_dev(device, true)
+                    .await
+                    .context("stop ublk device after CONFIG_EXPORTS (count=0)")?;
+            } else {
+                info!("CONFIG_EXPORTS requested zero exports (already idle)");
+            }
+            Ok(None)
+        }
+        Some(export) => {
+            let block_size = export.block_size as usize;
+            ensure!(
+                block_size <= runtime.max_block_size,
+                "requested block size {} exceeds gadget limit {}",
+                block_size,
+                runtime.max_block_size
+            );
+            let block_count = if export.size_bytes == 0 {
+                runtime.default_block_count
+            } else {
+                let blocks = export
+                    .size_bytes
+                    .checked_div(block_size as u64)
+                    .context("size bytes smaller than block size")?;
+                ensure!(blocks > 0, "export size too small");
+                usize::try_from(blocks).context("block count exceeds usize")?
+            };
+            if let Some(device) = device_slot.take() {
+                info!("CONFIG_EXPORTS replacing existing export");
+                ublk.stop_dev(device, true)
+                    .await
+                    .context("stop ublk device before reconfigure")?;
+            } else {
+                info!("CONFIG_EXPORTS creating export");
+            }
+            let new_device = ublk
+                .setup_device(
+                    block_size,
+                    block_count,
+                    runtime.queue_count,
+                    runtime.queue_depth,
+                )
+                .await
+                .context("setup ublk device from CONFIG_EXPORTS")?;
+            *device_slot = Some(new_device);
+            Ok(Some(block_size))
+        }
+    }
 }
 
 struct GadgetGuard {

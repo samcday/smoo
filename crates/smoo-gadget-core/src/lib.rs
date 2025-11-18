@@ -21,6 +21,80 @@ const USB_DIR_IN: u8 = 0x80;
 const USB_TYPE_VENDOR: u8 = 0x40;
 const USB_RECIP_INTERFACE: u8 = 0x01;
 const SMOO_REQ_TYPE: u8 = USB_DIR_IN | USB_TYPE_VENDOR | USB_RECIP_INTERFACE;
+/// bmRequestType for CONFIG_EXPORTS (OUT/vendor/interface).
+pub const SMOO_CONFIG_REQ_TYPE: u8 = USB_TYPE_VENDOR | USB_RECIP_INTERFACE;
+/// Vendor control bRequest for CONFIG_EXPORTS.
+pub const CONFIG_EXPORTS_REQUEST: u8 = 0x02;
+
+/// Parsed representation of the v0 CONFIG_EXPORTS payload (single export max).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfigExportsV0 {
+    export: Option<SingleExport>,
+}
+
+impl ConfigExportsV0 {
+    /// Number of bytes in the encoded payload.
+    pub const ENCODED_LEN: usize = 28;
+
+    pub fn parse(data: &[u8]) -> Result<Self> {
+        ensure!(
+            data.len() == Self::ENCODED_LEN,
+            "CONFIG_EXPORTS payload must be {} bytes",
+            Self::ENCODED_LEN
+        );
+        let version = u16::from_le_bytes([data[0], data[1]]);
+        ensure!(version == 0, "unsupported CONFIG_EXPORTS version {version}");
+        let count = u16::from_le_bytes([data[2], data[3]]);
+        ensure!(count <= 1, "CONFIG_EXPORTS count must be 0 or 1");
+        let flags = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+        ensure!(flags == 0, "CONFIG_EXPORTS header flags must be zero");
+        let block_size = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+        let size_bytes = u64::from_le_bytes([
+            data[12], data[13], data[14], data[15], data[16], data[17], data[18], data[19],
+        ]);
+        let reserved0 = u32::from_le_bytes([data[20], data[21], data[22], data[23]]);
+        let reserved1 = u32::from_le_bytes([data[24], data[25], data[26], data[27]]);
+        ensure!(
+            reserved0 == 0 && reserved1 == 0,
+            "reserved fields must be zero"
+        );
+        let export = if count == 0 {
+            None
+        } else {
+            ensure!(
+                block_size.is_power_of_two(),
+                "block size must be power-of-two"
+            );
+            ensure!(
+                block_size >= 512 && block_size <= 65536,
+                "block size {block_size} out of supported range"
+            );
+            if size_bytes != 0 {
+                ensure!(
+                    size_bytes % block_size as u64 == 0,
+                    "size_bytes must be multiple of block_size"
+                );
+            }
+            Some(SingleExport {
+                block_size,
+                size_bytes,
+            })
+        };
+        Ok(Self { export })
+    }
+
+    /// Returns the desired export, if any.
+    pub fn export(&self) -> Option<SingleExport> {
+        self.export.clone()
+    }
+}
+
+/// Parameters describing a single export entry in v0 CONFIG_EXPORTS payloads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SingleExport {
+    pub block_size: u32,
+    pub size_bytes: u64,
+}
 
 const SETUP_STAGE_LEN: usize = 8;
 const FUNCTIONFS_EVENT_SIZE: usize = SETUP_STAGE_LEN + 4;
@@ -319,7 +393,7 @@ impl DmaHeap {
 
 /// High-level FunctionFS gadget driver.
 pub struct SmooGadget {
-    ep0: Ep0Controller,
+    ep0: Option<Ep0Controller>,
     data_plane: GadgetDataPlane,
     ident: Ident,
 }
@@ -334,7 +408,7 @@ impl SmooGadget {
             bulk_out,
         } = endpoints;
         Ok(Self {
-            ep0: Ep0Controller::new(to_tokio_file(ep0)?),
+            ep0: Some(Ep0Controller::new(to_tokio_file(ep0)?)),
             data_plane: GadgetDataPlane::new(
                 interrupt_in,
                 interrupt_out,
@@ -356,11 +430,13 @@ impl SmooGadget {
         }
         debug!("waiting for FunctionFS ident handshake");
         loop {
-            let event = self
-                .ep0
-                .next_event()
-                .await
-                .context("read FunctionFS event")?;
+            let event = {
+                let ep0 = self
+                    .ep0
+                    .as_mut()
+                    .context("FunctionFS ep0 controller unavailable")?;
+                ep0.next_event().await.context("read FunctionFS event")?
+            };
             trace!(?event, "ep0 event");
             match event {
                 Ep0Event::Bind => {
@@ -389,7 +465,15 @@ impl SmooGadget {
                         length = setup.length(),
                         "FunctionFS setup request"
                     );
-                    if self.handle_setup_request(setup).await? {
+                    if SmooGadget::handle_setup_request(
+                        self.ident,
+                        self.ep0
+                            .as_mut()
+                            .context("FunctionFS ep0 controller unavailable")?,
+                        setup,
+                    )
+                    .await?
+                    {
                         self.data_plane.configured = true;
                         debug!("FunctionFS ident handshake complete");
                         return Ok(());
@@ -429,7 +513,11 @@ impl SmooGadget {
         self.data_plane.write_bulk_buffer(buf).await
     }
 
-    async fn handle_setup_request(&mut self, setup: SetupPacket) -> Result<bool> {
+    async fn handle_setup_request(
+        ident: Ident,
+        ep0: &mut Ep0Controller,
+        setup: SetupPacket,
+    ) -> Result<bool> {
         if setup.request() == IDENT_REQUEST && setup.request_type() == SMOO_REQ_TYPE {
             ensure!(
                 setup.direction() == ControlDirection::In,
@@ -439,10 +527,9 @@ impl SmooGadget {
                 setup.length() as usize >= IDENT_LEN,
                 "GET_IDENT length too small"
             );
-            let ident = self.ident.encode();
+            let ident = ident.encode();
             let len = cmp::min(setup.length() as usize, ident.len());
-            self.ep0
-                .write_in(&ident[..len])
+            ep0.write_in(&ident[..len])
                 .await
                 .context("reply to GET_IDENT")?;
             return Ok(true);
@@ -453,8 +540,7 @@ impl SmooGadget {
                 request = setup.request(),
                 "acknowledging status-only control request"
             );
-            self.ep0
-                .write_in(&[])
+            ep0.write_in(&[])
                 .await
                 .context("ack control status stage")?;
             return Ok(false);
@@ -474,13 +560,23 @@ impl SmooGadget {
     }
 
     /// Access the raw EP0 controller for custom control-plane handling.
-    pub fn ep0_mut(&mut self) -> &mut Ep0Controller {
-        &mut self.ep0
+    pub fn ep0_mut(&mut self) -> Option<&mut Ep0Controller> {
+        self.ep0.as_mut()
+    }
+
+    /// Take ownership of the EP0 controller, preventing further use by [`SmooGadget`].
+    pub fn take_ep0_controller(&mut self) -> Option<Ep0Controller> {
+        self.ep0.take()
     }
 
     /// Access the data-plane controller directly.
     pub fn data_plane_mut(&mut self) -> &mut GadgetDataPlane {
         &mut self.data_plane
+    }
+
+    /// Current IDENT response advertised by the gadget.
+    pub fn ident(&self) -> Ident {
+        self.ident
     }
 }
 
@@ -973,4 +1069,35 @@ fn dma_buf_sync_start(fd: RawFd, dir: u64) -> Result<()> {
 
 fn dma_buf_sync_end(fd: RawFd, dir: u64) -> Result<()> {
     dma_buf_sync_call(fd, DMA_BUF_SYNC_END | dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_exports_none() {
+        let payload = [0u8; ConfigExportsV0::ENCODED_LEN];
+        let parsed = ConfigExportsV0::parse(&payload).expect("parse");
+        assert!(parsed.export().is_none());
+    }
+
+    #[test]
+    fn config_exports_single() {
+        let mut payload = [0u8; ConfigExportsV0::ENCODED_LEN];
+        payload[2] = 1;
+        payload[8..12].copy_from_slice(&4096u32.to_le_bytes());
+        payload[12..20].copy_from_slice(&(4096u64 * 8).to_le_bytes());
+        let parsed = ConfigExportsV0::parse(&payload).expect("parse");
+        let export = parsed.export().expect("export");
+        assert_eq!(export.block_size, 4096);
+        assert_eq!(export.size_bytes, 4096 * 8);
+    }
+
+    #[test]
+    fn config_exports_invalid_flags() {
+        let mut payload = [0u8; ConfigExportsV0::ENCODED_LEN];
+        payload[4] = 1;
+        assert!(ConfigExportsV0::parse(&payload).is_err());
+    }
 }
