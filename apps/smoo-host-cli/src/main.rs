@@ -5,14 +5,16 @@ use smoo_host_blocksources::{DeviceBlockSource, FileBlockSource};
 use smoo_host_core::{BlockSource, BlockSourceResult, HostErrorKind, SmooHost};
 use smoo_host_rusb::{ConfigExportsV0Payload, RusbTransport, RusbTransportConfig, StatusClient};
 use smoo_proto::SmooStatusV0;
-use std::{fmt, path::PathBuf, time::Duration};
+use std::{fmt, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{signal, sync::mpsc, time};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 const SMOO_INTERFACE_CLASS: u8 = 0xFF;
 const SMOO_INTERFACE_SUBCLASS: u8 = 0x53;
 const SMOO_INTERFACE_PROTOCOL: u8 = 0x4D;
 const HEARTBEAT_INTERVAL_SECS: u64 = 1;
+const DISCOVERY_DELAY_INITIAL: Duration = Duration::from_millis(500);
+const DISCOVERY_DELAY_MAX: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Parser)]
 #[command(name = "smoo-host-cli")]
@@ -45,6 +47,19 @@ struct Args {
 enum HostSource {
     File(FileBlockSource),
     Device(DeviceBlockSource),
+}
+
+#[derive(Clone)]
+struct SharedSource {
+    inner: Arc<HostSource>,
+}
+
+impl SharedSource {
+    fn new(inner: HostSource) -> Self {
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -92,6 +107,33 @@ impl BlockSource for HostSource {
     }
 }
 
+#[async_trait::async_trait]
+impl BlockSource for SharedSource {
+    fn block_size(&self) -> u32 {
+        self.inner.block_size()
+    }
+
+    async fn total_blocks(&self) -> BlockSourceResult<u64> {
+        self.inner.total_blocks().await
+    }
+
+    async fn read_blocks(&self, lba: u64, buf: &mut [u8]) -> BlockSourceResult<usize> {
+        self.inner.read_blocks(lba, buf).await
+    }
+
+    async fn write_blocks(&self, lba: u64, buf: &[u8]) -> BlockSourceResult<usize> {
+        self.inner.write_blocks(lba, buf).await
+    }
+
+    async fn flush(&self) -> BlockSourceResult<()> {
+        self.inner.flush().await
+    }
+
+    async fn discard(&self, lba: u64, num_blocks: u32) -> BlockSourceResult<()> {
+        self.inner.discard(lba, num_blocks).await
+    }
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -101,7 +143,7 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let source = open_source(&args).await.context("open block source")?;
+    let source = SharedSource::new(open_source(&args).await.context("open block source")?);
     let block_size = source.block_size();
     let size_bytes = match source.total_blocks().await {
         Ok(blocks) => blocks.checked_mul(block_size as u64).unwrap_or(0),
@@ -110,7 +152,69 @@ async fn main() -> Result<()> {
             0
         }
     };
-    let (handle, interface) = discover_device(&args).context("discover usb device")?;
+    let mut expected_session_id = None;
+    let mut has_connected = false;
+    loop {
+        match run_session(
+            &args,
+            source.clone(),
+            block_size,
+            size_bytes,
+            &mut expected_session_id,
+            has_connected,
+        )
+        .await?
+        {
+            SessionEnd::Shutdown => break,
+            SessionEnd::TransportLost => {
+                info!("gadget disconnected; waiting for reconnection");
+                has_connected = true;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+enum SessionEnd {
+    Shutdown,
+    TransportLost,
+}
+
+async fn run_session(
+    args: &Args,
+    source: SharedSource,
+    block_size: u32,
+    size_bytes: u64,
+    expected_session_id: &mut Option<u64>,
+    has_connected: bool,
+) -> Result<SessionEnd> {
+    let shutdown = signal::ctrl_c();
+    tokio::pin!(shutdown);
+
+    let mut attempts = 0usize;
+    let mut delay = DISCOVERY_DELAY_INITIAL;
+    let (handle, interface) = loop {
+        match discover_device(args, attempts == 0 && !has_connected) {
+            Ok(found) => break found,
+            Err(err) => {
+                if !has_connected && attempts == 0 {
+                    warn!(error = %err, "no smoo gadget found; waiting for connection");
+                } else {
+                    debug!(error = %err, "gadget not present; retrying discovery");
+                }
+                tokio::select! {
+                    _ = &mut shutdown => {
+                        info!("shutdown requested");
+                        return Ok(SessionEnd::Shutdown);
+                    }
+                    _ = time::sleep(delay) => {}
+                }
+                delay = delay.saturating_mul(2).min(DISCOVERY_DELAY_MAX);
+                attempts += 1;
+            }
+        }
+    };
     let endpoints = infer_interface_endpoints(&handle, interface).context("discover endpoints")?;
     let transport_config = RusbTransportConfig {
         interface,
@@ -154,19 +258,30 @@ async fn main() -> Result<()> {
         "gadget export count invalid ({})",
         initial_status.export_count
     );
-    let initial_session_id = initial_status.session_id;
+    match expected_session_id {
+        Some(expected) => {
+            let recorded = *expected;
+            ensure!(
+                recorded == initial_status.session_id,
+                "gadget session changed (expected 0x{recorded:016x}, got 0x{:016x})",
+                initial_status.session_id
+            );
+        }
+        None => {
+            *expected_session_id = Some(initial_status.session_id);
+        }
+    }
     debug!(
-        session_id = initial_session_id,
+        session_id = initial_status.session_id,
         export_count = initial_status.export_count,
         "initial gadget status"
     );
     let heartbeat_interval = Duration::from_secs(HEARTBEAT_INTERVAL_SECS);
     let (heartbeat_tx, mut heartbeat_rx) = mpsc::unbounded_channel();
     let heartbeat_client = status_client.clone();
+    let session_id = initial_status.session_id;
     let heartbeat_task = tokio::spawn(async move {
-        if let Err(err) =
-            run_heartbeat(heartbeat_client, initial_session_id, heartbeat_interval).await
-        {
+        if let Err(err) = run_heartbeat(heartbeat_client, session_id, heartbeat_interval).await {
             let _ = heartbeat_tx.send(err);
         }
     });
@@ -178,8 +293,7 @@ async fn main() -> Result<()> {
         "connected to smoo gadget"
     );
 
-    let mut exit_error: Option<anyhow::Error> = None;
-    loop {
+    let outcome = loop {
         tokio::select! {
             res = host.run_once() => {
                 match res {
@@ -188,37 +302,43 @@ async fn main() -> Result<()> {
                         HostErrorKind::Unsupported | HostErrorKind::InvalidRequest => {
                             warn!(error = %err, "request handling failed");
                         }
+                        HostErrorKind::Transport => {
+                            warn!(error = %err, "transport failure");
+                            break SessionEnd::TransportLost;
+                        }
                         _ => {
-                            exit_error = Some(anyhow!(err.to_string()));
-                            break;
+                            return Err(anyhow!(err.to_string()));
                         }
                     },
                 }
             }
-            _ = signal::ctrl_c() => {
-                info!("shutdown requested");
-                break;
-            }
             event = heartbeat_rx.recv() => {
-                if let Some(event) = event {
-                    error!(reason = %event, "heartbeat failure");
-                    exit_error = Some(anyhow!(event.to_string()));
-                    break;
+                match event {
+                    Some(HeartbeatFailure::TransferFailed(reason)) => {
+                        warn!(reason = %reason, "heartbeat transfer failed");
+                        break SessionEnd::TransportLost;
+                    }
+                    Some(other) => {
+                        return Err(anyhow!(other.to_string()));
+                    }
+                    None => {
+                        break SessionEnd::TransportLost;
+                    }
                 }
             }
+            _ = &mut shutdown => {
+                info!("shutdown requested");
+                break SessionEnd::Shutdown;
+            }
         }
-    }
+    };
 
     if !heartbeat_task.is_finished() {
         heartbeat_task.abort();
     }
     let _ = heartbeat_task.await;
 
-    if let Some(err) = exit_error {
-        Err(err)
-    } else {
-        Ok(())
-    }
+    Ok(outcome)
 }
 
 async fn open_source(args: &Args) -> Result<HostSource> {
@@ -234,14 +354,22 @@ async fn open_source(args: &Args) -> Result<HostSource> {
     }
 }
 
-fn discover_device(args: &Args) -> Result<(rusb::DeviceHandle<rusb::Context>, u8)> {
+fn discover_device(args: &Args, log_scan: bool) -> Result<(rusb::DeviceHandle<rusb::Context>, u8)> {
     let context = rusb::Context::new().context("init libusb context")?;
     let devices = context.devices().context("enumerate usb devices")?;
-    info!(
-        vendor_filter = args.vendor_id.map(|v| format!("{:#06x}", v)),
-        product_filter = args.product_id.map(|p| format!("{:#06x}", p)),
-        "scanning USB devices for smoo gadget"
-    );
+    if log_scan {
+        info!(
+            vendor_filter = args.vendor_id.map(|v| format!("{:#06x}", v)),
+            product_filter = args.product_id.map(|p| format!("{:#06x}", p)),
+            "scanning USB devices for smoo gadget"
+        );
+    } else {
+        debug!(
+            vendor_filter = args.vendor_id.map(|v| format!("{:#06x}", v)),
+            product_filter = args.product_id.map(|p| format!("{:#06x}", p)),
+            "probing USB devices for smoo gadget"
+        );
+    }
     for device in devices.iter() {
         let device_desc = match device.device_descriptor() {
             Ok(desc) => desc,
@@ -259,7 +387,7 @@ fn discover_device(args: &Args) -> Result<(rusb::DeviceHandle<rusb::Context>, u8
                 );
                 continue;
             }
-        } else {
+        } else if log_scan {
             debug!(
                 vid = format_args!("{:#06x}", device_desc.vendor_id()),
                 pid = format_args!("{:#06x}", device_desc.product_id()),
@@ -268,7 +396,9 @@ fn discover_device(args: &Args) -> Result<(rusb::DeviceHandle<rusb::Context>, u8
         }
         if let Some(product) = args.product_id {
             if device_desc.product_id() != product {
-                debug!("skipping device due to product filter");
+                if log_scan {
+                    debug!("skipping device due to product filter");
+                }
                 continue;
             }
         }
