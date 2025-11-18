@@ -51,8 +51,8 @@ Bulk transfers:
 
 * registers a ublk queue with:
 
-    * **logical block size** (must match BlockSource)
-    * **queue depth** (configurable later)
+  * **logical block size** (must match BlockSource)
+  * **queue depth** (configurable later)
 * maps each ublk command → protocol Request
 * completes requests deterministically
 
@@ -76,10 +76,10 @@ Control-plane (`Request` / `Response`):
 * fixed-size, LE
 * fields:
 
-    * op: read/write/flush/discard
-    * LBA
-    * byte length (block-aligned)
-    * flags (future)
+  * op: read/write/flush/discard
+  * LBA
+  * byte length (block-aligned)
+  * flags (future)
 * MUST fit in one interrupt transfer
 * MUST be delivered in-order
 
@@ -151,11 +151,81 @@ Backs actual storage.
 * SHOULD avoid copies
 * MAY wrap:
 
-    * files
-    * raw devices
-    * future WebUSB fetch backends
+  * files
+  * raw devices
+  * future WebUSB fetch backends
 
 ---
+
+
+
+## 7.3 Gadget Lifecycle & Recovery (EP0 + ublk)
+
+### EP0 Control Protocol
+
+Two vendor control requests:
+
+* **IDENT (IN)**: idempotent, side‑effect‑free. Returns protocol version and capability flags.
+* **CONFIG_EXPORTS (OUT)**: authoritative replace of the complete export set. Payload describes all exports for this host session. Invalid payloads MUST STALL the control transfer.
+
+### Export Mapping
+
+Each export entry includes:
+
+* `export_id` (u32)
+* `block_size`
+* `size_bytes`
+* flags (optional)
+
+Gadget maps `export_id` → ublk device. CONFIG_EXPORTS creates/removes ublk devices to match payload. Successful CONFIG_EXPORTS MUST update the state file.
+
+### Gadget State Machine
+
+States:
+
+* **COLD** → process start.
+* **BOUND** → descriptors written; waiting for ENABLE.
+* **USB_ENABLED** → endpoints active.
+* **READY** → IDENT accepted; no exports yet.
+* **RUNNING** → CONFIG_EXPORTS applied; ublk active.
+* **SUSPENDED** → bus suspend; I/O paused.
+* **RECOVERING** → state file found; reattaching to ublk devices.
+
+Transitions:
+
+* ENABLE → USB_ENABLED
+* IDENT → READY
+* CONFIG_EXPORTS → RUNNING
+* SUSPEND/RESUME → pause/resume I/O
+* DISABLE → teardown → BOUND
+
+### Gadget Crash Recovery
+
+On restart:
+
+* If state file exists → RECOVERING: reattach ublk devices. If any fail, delete state file → COLD.
+* If no state file → COLD.
+* Recovery MUST NOT remove/modify ublk devices until complete.
+
+### Host Restart Semantics
+
+Host restart = new session:
+
+* Host re‑issues IDENT + CONFIG_EXPORTS.
+* Gadget MUST discard all existing exports/ublk devices and rebuild from payload.
+* State file rewritten.
+
+### FunctionFS Events
+
+Gadget MUST drain ep0 events continuously:
+
+* **BIND/UNBIND**
+* **ENABLE/DISABLE**
+* **SUSPEND/RESUME**
+* **SETUP** (IDENT/CONFIG_EXPORTS)
+
+Failure to service ep0 promptly leads to EP0 STALL + possible gadget reset.
+
 
 ## 8. Development & Testing
 
@@ -163,11 +233,11 @@ Backs actual storage.
 * Logging: `tracing`
 * Tests: `cargo test --all`
 
-    * uses mock transports
-    * USB loopback via `dummy_hcd`
+  * uses mock transports
+  * USB loopback via `dummy_hcd`
 * CLIs are thin wrappers; logic in libraries
 * Agents MUST uphold:
 
-    * cancellation safety
-    * ordering guarantees
-    * all invariants in this document
+  * cancellation safety
+  * ordering guarantees
+  * all invariants in this document
