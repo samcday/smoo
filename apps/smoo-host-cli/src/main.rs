@@ -3,7 +3,7 @@ use clap::{ArgGroup, Parser};
 use rusb::{Direction, TransferType, UsbContext};
 use smoo_host_blocksources::{DeviceBlockSource, FileBlockSource};
 use smoo_host_core::{BlockSource, BlockSourceResult, HostErrorKind, SmooHost};
-use smoo_host_rusb::{RusbTransport, RusbTransportConfig};
+use smoo_host_rusb::{ConfigExportsV0Payload, RusbTransport, RusbTransportConfig};
 use std::{path::PathBuf, time::Duration};
 use tokio::signal;
 use tracing::{debug, info, warn};
@@ -100,6 +100,14 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     let source = open_source(&args).await.context("open block source")?;
+    let block_size = source.block_size();
+    let size_bytes = match source.total_blocks().await {
+        Ok(blocks) => blocks.checked_mul(block_size as u64).unwrap_or(0),
+        Err(err) => {
+            warn!(error = %err, "determine total blocks failed; advertising dynamic size");
+            0
+        }
+    };
     let (handle, interface) = discover_device(&args).context("discover usb device")?;
     let endpoints = infer_interface_endpoints(&handle, interface).context("discover endpoints")?;
     let transport_config = RusbTransportConfig {
@@ -110,7 +118,26 @@ async fn main() -> Result<()> {
         bulk_out: endpoints.bulk_out,
         timeout: Duration::from_millis(args.timeout_ms),
     };
-    let transport = RusbTransport::new(handle, transport_config).context("init transport")?;
+    let mut transport = RusbTransport::new(handle, transport_config).context("init transport")?;
+    let ident = transport
+        .ensure_ident()
+        .await
+        .context("IDENT control transfer")?;
+    debug!(
+        major = ident.major,
+        minor = ident.minor,
+        "gadget IDENT response"
+    );
+    let config_payload = ConfigExportsV0Payload::single_export(block_size, size_bytes);
+    transport
+        .send_config_exports_v0(&config_payload)
+        .await
+        .context("CONFIG_EXPORTS control transfer")?;
+    info!(
+        block_size = block_size,
+        size_bytes = size_bytes,
+        "configured gadget export"
+    );
     let mut host = SmooHost::new(transport, source);
     let ident = host.setup().await.context("ident handshake")?;
     info!(

@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use rusb::{DeviceHandle, Direction, Recipient, RequestType, UsbContext};
+use rusb::{DeviceHandle, UsbContext};
 use smoo_host_core::{Transport, TransportError, TransportErrorKind, TransportResult};
 use smoo_proto::{IDENT_LEN, IDENT_REQUEST, Ident, REQUEST_LEN, RESPONSE_LEN, Request, Response};
 use std::{
@@ -8,6 +8,10 @@ use std::{
 };
 use tokio::task;
 use tracing::debug;
+
+const IDENT_REQ_TYPE: u8 = 0xC1;
+const CONFIG_REQ_TYPE: u8 = 0x41;
+const CONFIG_EXPORTS_REQUEST: u8 = 0x02;
 
 /// Configuration for [`RusbTransport`].
 #[derive(Clone, Copy, Debug)]
@@ -58,20 +62,16 @@ impl<T: UsbContext + Send + Sync + 'static> RusbTransport<T> {
         })
     }
 
-    fn request_type(&self) -> u8 {
-        rusb::request_type(Direction::In, RequestType::Vendor, Recipient::Interface)
+    fn ident_request_type(&self) -> u8 {
+        IDENT_REQ_TYPE
     }
-}
 
-#[async_trait]
-impl<T: UsbContext + Send + Sync + 'static> Transport for RusbTransport<T> {
-    async fn setup(&mut self) -> TransportResult<Ident> {
+    async fn perform_ident(&mut self) -> TransportResult<Ident> {
         if let Some(ident) = self.ident {
             return Ok(ident);
         }
-
         let handle = self.handle.clone();
-        let request_type = self.request_type();
+        let request_type = self.ident_request_type();
         let interface = self.config.interface;
         let timeout = self.config.timeout;
         let (len, buf) = task::spawn_blocking(move || {
@@ -106,6 +106,48 @@ impl<T: UsbContext + Send + Sync + 'static> Transport for RusbTransport<T> {
         );
         self.ident = Some(ident);
         Ok(ident)
+    }
+
+    pub async fn ensure_ident(&mut self) -> TransportResult<Ident> {
+        self.perform_ident().await
+    }
+
+    pub async fn send_config_exports_v0(
+        &mut self,
+        payload: &ConfigExportsV0Payload,
+    ) -> TransportResult<()> {
+        let handle = self.handle.clone();
+        let interface = self.config.interface;
+        let timeout = self.config.timeout;
+        let data = payload.encode();
+        let written = task::spawn_blocking(move || {
+            let handle = handle.lock().unwrap();
+            handle.write_control(
+                CONFIG_REQ_TYPE,
+                CONFIG_EXPORTS_REQUEST,
+                0,
+                interface as u16,
+                &data,
+                timeout,
+            )
+        })
+        .await
+        .map_err(|err| join_error("CONFIG_EXPORTS control transfer", err))?
+        .map_err(|err| map_rusb_error("CONFIG_EXPORTS control transfer", err))?;
+        if written != ConfigExportsV0Payload::ENCODED_LEN {
+            return Err(protocol_error(format!(
+                "CONFIG_EXPORTS transfer truncated (expected {}, got {written})",
+                ConfigExportsV0Payload::ENCODED_LEN
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl<T: UsbContext + Send + Sync + 'static> Transport for RusbTransport<T> {
+    async fn setup(&mut self) -> TransportResult<Ident> {
+        self.perform_ident().await
     }
 
     async fn read_request(&mut self) -> TransportResult<Request> {
@@ -241,4 +283,57 @@ fn not_ready() -> TransportError {
 
 fn protocol_error(message: impl Into<String>) -> TransportError {
     TransportError::with_message(TransportErrorKind::Protocol, message.into())
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConfigExportsV0Payload {
+    count: u16,
+    block_size: u32,
+    size_bytes: u64,
+}
+
+impl ConfigExportsV0Payload {
+    pub const ENCODED_LEN: usize = 28;
+
+    pub fn zero_exports() -> Self {
+        Self {
+            count: 0,
+            block_size: 0,
+            size_bytes: 0,
+        }
+    }
+
+    pub fn single_export(block_size: u32, size_bytes: u64) -> Self {
+        Self {
+            count: 1,
+            block_size,
+            size_bytes,
+        }
+    }
+
+    pub fn encode(&self) -> [u8; Self::ENCODED_LEN] {
+        let mut buf = [0u8; Self::ENCODED_LEN];
+        buf[0..2].copy_from_slice(&0u16.to_le_bytes());
+        buf[2..4].copy_from_slice(&self.count.to_le_bytes());
+        buf[4..8].copy_from_slice(&0u32.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.block_size.to_le_bytes());
+        buf[12..20].copy_from_slice(&self.size_bytes.to_le_bytes());
+        buf[20..24].copy_from_slice(&0u32.to_le_bytes());
+        buf[24..28].copy_from_slice(&0u32.to_le_bytes());
+        buf
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ConfigExportsV0Payload;
+
+    #[test]
+    fn config_exports_single_encodes_fields() {
+        let payload = ConfigExportsV0Payload::single_export(4096, 8192);
+        let encoded = payload.encode();
+        assert_eq!(encoded.len(), ConfigExportsV0Payload::ENCODED_LEN);
+        assert_eq!(&encoded[2..4], &[1, 0]);
+        assert_eq!(&encoded[8..12], &4096u32.to_le_bytes());
+        assert_eq!(&encoded[12..20], &8192u64.to_le_bytes());
+    }
 }

@@ -128,35 +128,41 @@ where
             OpCode::Write => self.handle_write(request).await,
             OpCode::Flush => match self.source.flush().await {
                 Ok(()) => Ok(Response::new(
-                    request.export_id,
                     OpCode::Flush,
-                    0,
                     request.lba,
-                    request.num_blocks,
+                    request.byte_len,
                     0,
                 )),
                 Err(err) => Ok(response_from_block_error(request, err)),
             },
-            OpCode::Discard => match self.source.discard(request.lba, request.num_blocks).await {
-                Ok(()) => Ok(Response::new(
-                    request.export_id,
-                    OpCode::Discard,
-                    0,
-                    request.lba,
-                    request.num_blocks,
-                    0,
-                )),
-                Err(err) => Ok(response_from_block_error(request, err)),
-            },
+            OpCode::Discard => {
+                let block_size = self.source.block_size();
+                let blocks = match self.byte_len_to_blocks(request.byte_len, block_size) {
+                    Ok(value) => value,
+                    Err(_) => return Ok(invalid_request_response(request)),
+                };
+                match self.source.discard(request.lba, blocks).await {
+                    Ok(()) => Ok(Response::new(
+                        OpCode::Discard,
+                        request.lba,
+                        request.byte_len,
+                        0,
+                    )),
+                    Err(err) => Ok(response_from_block_error(request, err)),
+                }
+            }
         }
     }
 
     async fn handle_read(&mut self, request: Request) -> HostResult<Response> {
-        let block_size = self.source.block_size() as usize;
-        let byte_len = match self.blocks_to_bytes(request.num_blocks, block_size) {
-            Ok(len) => len,
-            Err(_) => return Ok(invalid_request_response(request)),
-        };
+        let block_size = self.source.block_size();
+        if self
+            .byte_len_to_blocks(request.byte_len, block_size)
+            .is_err()
+        {
+            return Ok(invalid_request_response(request));
+        }
+        let byte_len = request.byte_len as usize;
         if byte_len > 0 {
             let mut buf: Vec<u8> = vec![0u8; byte_len];
             let read = match self.source.read_blocks(request.lba, &mut buf).await {
@@ -169,21 +175,22 @@ where
             self.transport.write_bulk(&buf).await?;
         }
         Ok(Response::new(
-            request.export_id,
             OpCode::Read,
-            0,
             request.lba,
-            request.num_blocks,
+            request.byte_len,
             0,
         ))
     }
 
     async fn handle_write(&mut self, request: Request) -> HostResult<Response> {
-        let block_size = self.source.block_size() as usize;
-        let byte_len = match self.blocks_to_bytes(request.num_blocks, block_size) {
-            Ok(len) => len,
-            Err(_) => return Ok(invalid_request_response(request)),
-        };
+        let block_size = self.source.block_size();
+        if self
+            .byte_len_to_blocks(request.byte_len, block_size)
+            .is_err()
+        {
+            return Ok(invalid_request_response(request));
+        }
+        let byte_len = request.byte_len as usize;
         if byte_len > 0 {
             let mut buf: Vec<u8> = vec![0u8; byte_len];
             self.transport.read_bulk(&mut buf).await?;
@@ -196,28 +203,27 @@ where
             }
         }
         Ok(Response::new(
-            request.export_id,
             OpCode::Write,
-            0,
             request.lba,
-            request.num_blocks,
+            request.byte_len,
             0,
         ))
     }
 
-    fn blocks_to_bytes(&self, num_blocks: u32, block_size: usize) -> HostResult<usize> {
+    fn byte_len_to_blocks(&self, byte_len: u32, block_size: u32) -> HostResult<u32> {
         if block_size == 0 {
             return Err(HostError::with_message(
                 HostErrorKind::InvalidRequest,
                 "block size is zero",
             ));
         }
-        usize::try_from(num_blocks)
-            .ok()
-            .and_then(|blocks| blocks.checked_mul(block_size))
-            .ok_or_else(|| {
-                HostError::with_message(HostErrorKind::InvalidRequest, "request length overflow")
-            })
+        if byte_len % block_size != 0 {
+            return Err(HostError::with_message(
+                HostErrorKind::InvalidRequest,
+                "request byte length must align to block size",
+            ));
+        }
+        Ok(byte_len / block_size)
     }
 }
 
@@ -226,25 +232,11 @@ const ERRNO_EIO: u32 = 5;
 const ERRNO_EOPNOTSUPP: u32 = 95;
 
 fn invalid_request_response(request: Request) -> Response {
-    Response::new(
-        request.export_id,
-        request.op,
-        errno_to_status(ERRNO_EINVAL),
-        request.lba,
-        request.num_blocks,
-        0,
-    )
+    Response::new(request.op, request.lba, 0, ERRNO_EINVAL)
 }
 
 fn short_io_response(request: Request) -> Response {
-    Response::new(
-        request.export_id,
-        request.op,
-        errno_to_status(ERRNO_EIO),
-        request.lba,
-        request.num_blocks,
-        0,
-    )
+    Response::new(request.op, request.lba, 0, ERRNO_EIO)
 }
 
 fn response_from_block_error(request: Request, err: BlockSourceError) -> Response {
@@ -253,16 +245,5 @@ fn response_from_block_error(request: Request, err: BlockSourceError) -> Respons
         BlockSourceErrorKind::Unsupported => ERRNO_EOPNOTSUPP,
         BlockSourceErrorKind::Io | BlockSourceErrorKind::Other => ERRNO_EIO,
     };
-    Response::new(
-        request.export_id,
-        request.op,
-        errno_to_status(errno),
-        request.lba,
-        request.num_blocks,
-        0,
-    )
-}
-
-fn errno_to_status(errno: u32) -> u8 {
-    u8::try_from(errno).unwrap_or(u8::MAX)
+    Response::new(request.op, request.lba, 0, errno)
 }
