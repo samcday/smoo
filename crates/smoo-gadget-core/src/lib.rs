@@ -248,8 +248,7 @@ impl SmooGadget {
             self.queue_dmabuf_transfer(self.bulk_out.as_raw_fd(), fd, len)
                 .await
                 .context("FUNCTIONFS dmabuf transfer (OUT)")?;
-            buf.after_device_write(len)?;
-            Ok(())
+            buf.after_device_write(len)
         } else {
             self.read_bulk(&mut buf.as_mut_slice()[..len])
                 .await
@@ -258,7 +257,7 @@ impl SmooGadget {
     }
 
     /// Write a bulk payload from a pooled buffer, using DMA-BUF when available.
-    pub async fn write_bulk_buffer(&mut self, buf: &dyn Buffer, len: usize) -> Result<()> {
+    pub async fn write_bulk_buffer(&mut self, buf: &mut dyn Buffer, len: usize) -> Result<()> {
         ensure!(self.configured, "gadget not configured");
         if len == 0 {
             return Ok(());
@@ -267,8 +266,7 @@ impl SmooGadget {
             buf.before_device_read(len)?;
             self.queue_dmabuf_transfer(self.bulk_in.as_raw_fd(), fd, len)
                 .await
-                .context("FUNCTIONFS dmabuf transfer (IN)")?;
-            Ok(())
+                .context("FUNCTIONFS dmabuf transfer (IN)")
         } else {
             self.write_bulk(&buf.as_slice()[..len])
                 .await

@@ -1,5 +1,6 @@
 use anyhow::{anyhow, ensure, Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+use dma_heap::HeapKind;
 use smoo_gadget_buffers::{BufferHandle, BufferPool, DmaBufPool, VecBufferPool};
 use smoo_gadget_core::{FunctionfsEndpoints, GadgetConfig, SmooGadget};
 use smoo_gadget_ublk::{SmooUblk, SmooUblkDevice, UblkIoRequest, UblkOp};
@@ -48,6 +49,24 @@ struct Args {
     /// Disable the DMA-BUF fast path even if the kernel advertises support.
     #[arg(long)]
     no_dma_buf: bool,
+    /// DMA-HEAP to allocate from when DMA-BUF mode is enabled.
+    #[arg(long, value_enum, default_value_t = DmaHeapSelection::System)]
+    dma_heap: DmaHeapSelection,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum DmaHeapSelection {
+    System,
+    Cma,
+}
+
+impl From<DmaHeapSelection> for HeapKind {
+    fn from(value: DmaHeapSelection) -> Self {
+        match value {
+            DmaHeapSelection::System => HeapKind::System,
+            DmaHeapSelection::Cma => HeapKind::Cma,
+        }
+    }
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -84,6 +103,7 @@ async fn main() -> Result<()> {
             args.queue_count,
             args.queue_depth,
             max_io_bytes,
+            args.dma_heap.into(),
             endpoints.bulk_in.as_raw_fd(),
             endpoints.bulk_out.as_raw_fd(),
         ) {
@@ -295,9 +315,9 @@ async fn handle_request(
                     .context("read bulk payload")?;
             }
         } else if opcode == OpCode::Write && req_len > 0 {
-            if let Some(buf) = payload.as_ref() {
+            if let Some(buf) = payload.as_mut() {
                 gadget
-                    .write_bulk_buffer(buf.as_ref(), req_len)
+                    .write_bulk_buffer(buf.as_mut(), req_len)
                     .await
                     .context("write bulk payload")?;
             }

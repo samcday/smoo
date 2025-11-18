@@ -54,12 +54,12 @@ pub trait Buffer: Send {
     }
 
     /// Called before the buffer is used as the source of a DMA transfer.
-    fn before_device_read(&self, _len: usize) -> Result<()> {
+    fn before_device_read(&mut self, _len: usize) -> Result<()> {
         Ok(())
     }
 
     /// Called after the buffer has been written by a DMA transfer.
-    fn after_device_write(&self, _len: usize) -> Result<()> {
+    fn after_device_write(&mut self, _len: usize) -> Result<()> {
         Ok(())
     }
 }
@@ -223,6 +223,7 @@ impl DmaBufPool {
         queue_count: u16,
         queue_depth: u16,
         buf_len: usize,
+        heap_kind: HeapKind,
         bulk_in_fd: RawFd,
         bulk_out_fd: RawFd,
     ) -> Result<Self> {
@@ -233,7 +234,7 @@ impl DmaBufPool {
             .checked_mul(queue_depth)
             .context("buffer pool size overflow")?;
 
-        let heap = Heap::new(HeapKind::System).context("open system DMA heap")?;
+        let heap = Heap::new(heap_kind).context("open DMA heap")?;
         let mut slots = Vec::with_capacity(total);
         let mut buffer_fds = Vec::with_capacity(total);
         for _ in 0..total {
@@ -378,12 +379,12 @@ impl Buffer for DmaBuffer {
         Some(self.fd.as_raw_fd())
     }
 
-    fn before_device_read(&self, _len: usize) -> Result<()> {
+    fn before_device_read(&mut self, _len: usize) -> Result<()> {
         dma_buf_sync_start(self.fd.as_raw_fd(), DMA_BUF_SYNC_WRITE_FLAG)?;
         dma_buf_sync_end(self.fd.as_raw_fd(), DMA_BUF_SYNC_WRITE_FLAG)
     }
 
-    fn after_device_write(&self, _len: usize) -> Result<()> {
+    fn after_device_write(&mut self, _len: usize) -> Result<()> {
         dma_buf_sync_start(self.fd.as_raw_fd(), DMA_BUF_SYNC_READ_FLAG)?;
         dma_buf_sync_end(self.fd.as_raw_fd(), DMA_BUF_SYNC_READ_FLAG)
     }

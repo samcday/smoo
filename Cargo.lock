@@ -779,6 +779,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "dma-heap",
  "libc 0.2.177",
  "smoo-gadget-buffers",
  "smoo-gadget-core",
