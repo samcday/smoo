@@ -12,6 +12,7 @@ const BUFFER_ALIGNMENT: usize = 4096;
 const FUNCTIONFS_IOC_MAGIC: u8 = b'g';
 const FUNCTIONFS_DMABUF_ATTACH_NR: u8 = 131;
 const FUNCTIONFS_DMABUF_DETACH_NR: u8 = 132;
+const DMA_BUF_SYNC_NR: u8 = 0;
 
 ioctl_write_ptr!(
     ffs_dmabuf_attach,
@@ -50,6 +51,16 @@ pub trait Buffer: Send {
     /// Returns the dma-buf file descriptor if backed by DMA memory.
     fn dma_fd(&self) -> Option<RawFd> {
         None
+    }
+
+    /// Called before the buffer is used as the source of a DMA transfer.
+    fn before_device_read(&self, _len: usize) -> Result<()> {
+        Ok(())
+    }
+
+    /// Called after the buffer has been written by a DMA transfer.
+    fn after_device_write(&self, _len: usize) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -366,6 +377,16 @@ impl Buffer for DmaBuffer {
     fn dma_fd(&self) -> Option<RawFd> {
         Some(self.fd.as_raw_fd())
     }
+
+    fn before_device_read(&self, _len: usize) -> Result<()> {
+        dma_buf_sync_start(self.fd.as_raw_fd(), DMA_BUF_SYNC_WRITE_FLAG)?;
+        dma_buf_sync_end(self.fd.as_raw_fd(), DMA_BUF_SYNC_WRITE_FLAG)
+    }
+
+    fn after_device_write(&self, _len: usize) -> Result<()> {
+        dma_buf_sync_start(self.fd.as_raw_fd(), DMA_BUF_SYNC_READ_FLAG)?;
+        dma_buf_sync_end(self.fd.as_raw_fd(), DMA_BUF_SYNC_READ_FLAG)
+    }
 }
 
 struct EndpointAttachments {
@@ -405,3 +426,29 @@ impl Drop for EndpointAttachments {
 fn map_err_to_anyhow(err: MapError, context: &str) -> anyhow::Error {
     anyhow!("{context}: {err}")
 }
+
+fn dma_buf_sync_call(fd: RawFd, flags: u64) -> Result<()> {
+    let req = DmaBufSync { flags };
+    unsafe { dma_buf_sync(fd, &req) }
+        .map(|_| ())
+        .map_err(|err| anyhow!("DMA_BUF_IOCTL_SYNC failed: {err}"))
+}
+
+fn dma_buf_sync_start(fd: RawFd, dir: u64) -> Result<()> {
+    dma_buf_sync_call(fd, DMA_BUF_SYNC_START | dir)
+}
+
+fn dma_buf_sync_end(fd: RawFd, dir: u64) -> Result<()> {
+    dma_buf_sync_call(fd, DMA_BUF_SYNC_END | dir)
+}
+#[repr(C)]
+struct DmaBufSync {
+    flags: u64,
+}
+
+const DMA_BUF_SYNC_START: u64 = 0 << 2;
+const DMA_BUF_SYNC_END: u64 = 1 << 2;
+const DMA_BUF_SYNC_READ_FLAG: u64 = 1 << 0;
+const DMA_BUF_SYNC_WRITE_FLAG: u64 = 1 << 1;
+
+ioctl_write_ptr!(dma_buf_sync, b'b', DMA_BUF_SYNC_NR, DmaBufSync);

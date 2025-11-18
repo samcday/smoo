@@ -247,7 +247,9 @@ impl SmooGadget {
         if let Some(fd) = buf.dma_fd() {
             self.queue_dmabuf_transfer(self.bulk_out.as_raw_fd(), fd, len)
                 .await
-                .context("FUNCTIONFS dmabuf transfer (OUT)")
+                .context("FUNCTIONFS dmabuf transfer (OUT)")?;
+            buf.after_device_write(len)?;
+            Ok(())
         } else {
             self.read_bulk(&mut buf.as_mut_slice()[..len])
                 .await
@@ -262,9 +264,11 @@ impl SmooGadget {
             return Ok(());
         }
         if let Some(fd) = buf.dma_fd() {
+            buf.before_device_read(len)?;
             self.queue_dmabuf_transfer(self.bulk_in.as_raw_fd(), fd, len)
                 .await
-                .context("FUNCTIONFS dmabuf transfer (IN)")
+                .context("FUNCTIONFS dmabuf transfer (IN)")?;
+            Ok(())
         } else {
             self.write_bulk(&buf.as_slice()[..len])
                 .await
