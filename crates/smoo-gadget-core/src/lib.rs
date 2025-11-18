@@ -101,6 +101,175 @@ impl FunctionfsEndpoints {
     }
 }
 
+/// Async wrapper around the FunctionFS control endpoint (ep0).
+///
+/// This controller exposes raw FunctionFS events so higher-level code can react to
+/// lifecycle changes (BIND/ENABLE/DISABLE/etc.) and vendor-specific SETUP packets.
+/// Future configuration handlers (e.g. CONFIG_EXPORTS) can listen for [`Ep0Event::Setup`]
+/// and interact with the host using the [`write_in`], [`read_out`], and [`stall`]
+/// helpers.
+pub struct Ep0Controller {
+    ep0: File,
+}
+
+impl Ep0Controller {
+    fn new(ep0: File) -> Self {
+        Self { ep0 }
+    }
+
+    /// Read the next FunctionFS event from ep0.
+    pub async fn next_event(&mut self) -> Result<Ep0Event> {
+        let mut buf = [0u8; FUNCTIONFS_EVENT_SIZE];
+        self.ep0
+            .read_exact(&mut buf)
+            .await
+            .context("read ep0 event")?;
+        Ep0Event::from_bytes(buf)
+    }
+
+    /// Send an IN data stage (device → host) for the current control transfer.
+    pub async fn write_in(&mut self, data: &[u8]) -> Result<()> {
+        self.ep0.write_all(data).await.context("write ep0 data")?;
+        self.ep0.flush().await.context("flush ep0")?;
+        Ok(())
+    }
+
+    /// Read an OUT data stage (host → device) for the current control transfer.
+    pub async fn read_out(&mut self, buf: &mut [u8]) -> Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        self.ep0.read_exact(buf).await.context("read ep0 payload")?;
+        Ok(())
+    }
+
+    /// Stall the current control transfer.
+    pub async fn stall(&mut self) -> Result<()> {
+        // Writing a single zero byte signals a halt condition to FunctionFS.
+        self.ep0
+            .write_all(&[0u8])
+            .await
+            .context("stall ep0 control")?;
+        self.ep0.flush().await.context("flush ep0 after stall")?;
+        Ok(())
+    }
+}
+
+/// FunctionFS control-plane events surfaced by [`Ep0Controller`].
+#[derive(Clone, Copy, Debug)]
+pub enum Ep0Event {
+    Bind,
+    Unbind,
+    Enable,
+    Disable,
+    Suspend,
+    Resume,
+    Setup(SetupPacket),
+}
+
+impl Ep0Event {
+    fn from_bytes(bytes: [u8; FUNCTIONFS_EVENT_SIZE]) -> Result<Self> {
+        let event_type = Ep0EventType::try_from(bytes[SETUP_STAGE_LEN])?;
+        Ok(match event_type {
+            Ep0EventType::Bind => Ep0Event::Bind,
+            Ep0EventType::Unbind => Ep0Event::Unbind,
+            Ep0EventType::Enable => Ep0Event::Enable,
+            Ep0EventType::Disable => Ep0Event::Disable,
+            Ep0EventType::Suspend => Ep0Event::Suspend,
+            Ep0EventType::Resume => Ep0Event::Resume,
+            Ep0EventType::Setup => {
+                let mut setup_bytes = [0u8; SETUP_STAGE_LEN];
+                setup_bytes.copy_from_slice(&bytes[..SETUP_STAGE_LEN]);
+                Ep0Event::Setup(SetupPacket::from_bytes(setup_bytes))
+            }
+        })
+    }
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug)]
+enum Ep0EventType {
+    Bind = 0,
+    Unbind = 1,
+    Enable = 2,
+    Disable = 3,
+    Setup = 4,
+    Suspend = 5,
+    Resume = 6,
+}
+
+impl TryFrom<u8> for Ep0EventType {
+    type Error = anyhow::Error;
+
+    fn try_from(value: u8) -> Result<Self> {
+        match value {
+            0 => Ok(Ep0EventType::Bind),
+            1 => Ok(Ep0EventType::Unbind),
+            2 => Ok(Ep0EventType::Enable),
+            3 => Ok(Ep0EventType::Disable),
+            4 => Ok(Ep0EventType::Setup),
+            5 => Ok(Ep0EventType::Suspend),
+            6 => Ok(Ep0EventType::Resume),
+            other => Err(anyhow!("unknown FunctionFS event type {other}")),
+        }
+    }
+}
+
+/// Decoded USB control request observed on ep0.
+#[derive(Clone, Copy, Debug)]
+pub struct SetupPacket {
+    request_type: u8,
+    request: u8,
+    value: u16,
+    index: u16,
+    length: u16,
+}
+
+impl SetupPacket {
+    fn from_bytes(bytes: [u8; SETUP_STAGE_LEN]) -> Self {
+        Self {
+            request_type: bytes[0],
+            request: bytes[1],
+            value: u16::from_le_bytes([bytes[2], bytes[3]]),
+            index: u16::from_le_bytes([bytes[4], bytes[5]]),
+            length: u16::from_le_bytes([bytes[6], bytes[7]]),
+        }
+    }
+
+    /// bmRequestType
+    pub fn request_type(&self) -> u8 {
+        self.request_type
+    }
+
+    /// bRequest
+    pub fn request(&self) -> u8 {
+        self.request
+    }
+
+    /// wValue
+    pub fn value(&self) -> u16 {
+        self.value
+    }
+
+    /// wIndex
+    pub fn index(&self) -> u16 {
+        self.index
+    }
+
+    /// wLength
+    pub fn length(&self) -> u16 {
+        self.length
+    }
+
+    fn direction(&self) -> ControlDirection {
+        if self.request_type & USB_DIR_IN != 0 {
+            ControlDirection::In
+        } else {
+            ControlDirection::Out
+        }
+    }
+}
+
 /// Gadget configuration parameters that stay constant while the device is active.
 #[derive(Clone, Copy)]
 pub struct GadgetConfig {
@@ -150,85 +319,78 @@ impl DmaHeap {
 
 /// High-level FunctionFS gadget driver.
 pub struct SmooGadget {
-    ep0: File,
-    interrupt_in: File,
-    interrupt_out: File,
-    #[allow(dead_code)]
-    bulk_in: File,
-    #[allow(dead_code)]
-    bulk_out: File,
+    ep0: Ep0Controller,
+    data_plane: GadgetDataPlane,
     ident: Ident,
-    configured: bool,
-    dma_scratch: Option<FunctionfsDmaScratch>,
 }
 
 impl SmooGadget {
     pub fn new(endpoints: FunctionfsEndpoints, config: GadgetConfig) -> Result<Self> {
-        let dma_scratch = if let Some(heap) = config.dma_heap {
-            let slots = config.queue_count as usize * config.queue_depth as usize;
-            Some(
-                FunctionfsDmaScratch::new(
-                    endpoints.bulk_in.as_raw_fd(),
-                    endpoints.bulk_out.as_raw_fd(),
-                    slots,
-                    config.max_io_bytes,
-                    heap.to_heap_kind(),
-                )
-                .context("init DMA scratch buffers")?,
-            )
-        } else {
-            None
-        };
+        let FunctionfsEndpoints {
+            ep0,
+            interrupt_in,
+            interrupt_out,
+            bulk_in,
+            bulk_out,
+        } = endpoints;
         Ok(Self {
-            ep0: to_tokio_file(endpoints.ep0)?,
-            interrupt_in: to_tokio_file(endpoints.interrupt_in)?,
-            interrupt_out: to_tokio_file(endpoints.interrupt_out)?,
-            bulk_in: to_tokio_file(endpoints.bulk_in)?,
-            bulk_out: to_tokio_file(endpoints.bulk_out)?,
+            ep0: Ep0Controller::new(to_tokio_file(ep0)?),
+            data_plane: GadgetDataPlane::new(
+                interrupt_in,
+                interrupt_out,
+                bulk_in,
+                bulk_out,
+                config.queue_count,
+                config.queue_depth,
+                config.max_io_bytes,
+                config.dma_heap,
+            )?,
             ident: config.ident,
-            configured: false,
-            dma_scratch,
         })
     }
 
     /// Run the FunctionFS control handshake and reply to the GET_IDENT request.
     pub async fn setup(&mut self) -> Result<()> {
-        if self.configured {
+        if self.data_plane.configured {
             return Ok(());
         }
         debug!("waiting for FunctionFS ident handshake");
         loop {
-            let event = self.next_event().await.context("read FunctionFS event")?;
+            let event = self
+                .ep0
+                .next_event()
+                .await
+                .context("read FunctionFS event")?;
             trace!(?event, "ep0 event");
             match event {
-                FunctionfsEvent::Bind => {
+                Ep0Event::Bind => {
                     debug!("FunctionFS bind event received");
                 }
-                FunctionfsEvent::Unbind => {
+                Ep0Event::Unbind => {
                     debug!("FunctionFS unbind event received");
                 }
-                FunctionfsEvent::Enable => {
+                Ep0Event::Enable => {
                     debug!("FunctionFS interface enabled");
                 }
-                FunctionfsEvent::Suspend => {
+                Ep0Event::Suspend => {
                     debug!("FunctionFS suspend event received");
                 }
-                FunctionfsEvent::Resume => {
+                Ep0Event::Resume => {
                     debug!("FunctionFS resume event received");
                 }
-                FunctionfsEvent::Disable => {
+                Ep0Event::Disable => {
                     debug!("FunctionFS disable event received");
-                    self.configured = false;
+                    self.data_plane.configured = false;
                 }
-                FunctionfsEvent::Setup(setup) => {
+                Ep0Event::Setup(setup) => {
                     debug!(
-                        request = setup.request,
-                        request_type = setup.request_type,
-                        length = setup.length,
+                        request = setup.request(),
+                        request_type = setup.request_type(),
+                        length = setup.length(),
                         "FunctionFS setup request"
                     );
                     if self.handle_setup_request(setup).await? {
-                        self.configured = true;
+                        self.data_plane.configured = true;
                         debug!("FunctionFS ident handshake complete");
                         return Ok(());
                     }
@@ -238,6 +400,140 @@ impl SmooGadget {
     }
 
     /// Send a Request message to the host over the interrupt IN endpoint.
+    pub async fn send_request(&mut self, request: Request) -> Result<()> {
+        self.data_plane.send_request(request).await
+    }
+
+    /// Receive a Response message from the host over the interrupt OUT endpoint.
+    pub async fn read_response(&mut self) -> Result<Response> {
+        self.data_plane.read_response().await
+    }
+
+    /// Read a bulk payload from the host (bulk OUT → gadget).
+    pub async fn read_bulk(&mut self, buf: &mut [u8]) -> Result<()> {
+        self.data_plane.read_bulk(buf).await
+    }
+
+    /// Write a bulk payload to the host (bulk IN → host).
+    pub async fn write_bulk(&mut self, buf: &[u8]) -> Result<()> {
+        self.data_plane.write_bulk(buf).await
+    }
+
+    /// Read a bulk payload directly into a buffer, using DMA-BUF when available.
+    pub async fn read_bulk_buffer(&mut self, buf: &mut [u8]) -> Result<()> {
+        self.data_plane.read_bulk_buffer(buf).await
+    }
+
+    /// Write a bulk payload from a buffer, using DMA-BUF when available.
+    pub async fn write_bulk_buffer(&mut self, buf: &mut [u8]) -> Result<()> {
+        self.data_plane.write_bulk_buffer(buf).await
+    }
+
+    async fn handle_setup_request(&mut self, setup: SetupPacket) -> Result<bool> {
+        if setup.request() == IDENT_REQUEST && setup.request_type() == SMOO_REQ_TYPE {
+            ensure!(
+                setup.direction() == ControlDirection::In,
+                "GET_IDENT must be an IN transfer"
+            );
+            ensure!(
+                setup.length() as usize >= IDENT_LEN,
+                "GET_IDENT length too small"
+            );
+            let ident = self.ident.encode();
+            let len = cmp::min(setup.length() as usize, ident.len());
+            self.ep0
+                .write_in(&ident[..len])
+                .await
+                .context("reply to GET_IDENT")?;
+            return Ok(true);
+        }
+
+        if setup.request_type() & USB_DIR_IN == 0 && setup.length() == 0 {
+            trace!(
+                request = setup.request(),
+                "acknowledging status-only control request"
+            );
+            self.ep0
+                .write_in(&[])
+                .await
+                .context("ack control status stage")?;
+            return Ok(false);
+        }
+
+        warn!(
+            request = setup.request(),
+            request_type = setup.request_type(),
+            length = setup.length(),
+            "unsupported setup request"
+        );
+        Err(anyhow!(
+            "unsupported setup request {:#x} type {:#x}",
+            setup.request(),
+            setup.request_type()
+        ))
+    }
+
+    /// Access the raw EP0 controller for custom control-plane handling.
+    pub fn ep0_mut(&mut self) -> &mut Ep0Controller {
+        &mut self.ep0
+    }
+
+    /// Access the data-plane controller directly.
+    pub fn data_plane_mut(&mut self) -> &mut GadgetDataPlane {
+        &mut self.data_plane
+    }
+}
+
+/// Data-plane controller that owns the FunctionFS interrupt and bulk endpoints.
+///
+/// Today it still drives a single export, but the separation from [`Ep0Controller`]
+/// allows future work to multiplex multiple exports or schedule heavy work without
+/// blocking EP0.
+pub struct GadgetDataPlane {
+    interrupt_in: File,
+    interrupt_out: File,
+    bulk_in: File,
+    bulk_out: File,
+    configured: bool,
+    dma_scratch: Option<FunctionfsDmaScratch>,
+}
+
+impl GadgetDataPlane {
+    pub(crate) fn new(
+        interrupt_in: OwnedFd,
+        interrupt_out: OwnedFd,
+        bulk_in: OwnedFd,
+        bulk_out: OwnedFd,
+        queue_count: u16,
+        queue_depth: u16,
+        max_io_bytes: usize,
+        dma_heap: Option<DmaHeap>,
+    ) -> Result<Self> {
+        let dma_scratch = if let Some(heap) = dma_heap {
+            let slots = queue_count as usize * queue_depth as usize;
+            Some(
+                FunctionfsDmaScratch::new(
+                    bulk_in.as_raw_fd(),
+                    bulk_out.as_raw_fd(),
+                    slots,
+                    max_io_bytes,
+                    heap.to_heap_kind(),
+                )
+                .context("init DMA scratch buffers")?,
+            )
+        } else {
+            None
+        };
+        Ok(Self {
+            interrupt_in: to_tokio_file(interrupt_in)?,
+            interrupt_out: to_tokio_file(interrupt_out)?,
+            bulk_in: to_tokio_file(bulk_in)?,
+            bulk_out: to_tokio_file(bulk_out)?,
+            configured: false,
+            dma_scratch,
+        })
+    }
+
     pub async fn send_request(&mut self, request: Request) -> Result<()> {
         ensure!(self.configured, "gadget not configured");
         let encoded = request.encode();
@@ -252,7 +548,6 @@ impl SmooGadget {
         Ok(())
     }
 
-    /// Receive a Response message from the host over the interrupt OUT endpoint.
     pub async fn read_response(&mut self) -> Result<Response> {
         ensure!(self.configured, "gadget not configured");
         let mut buf = [0u8; RESPONSE_LEN];
@@ -263,7 +558,6 @@ impl SmooGadget {
         Response::try_from(buf.as_slice()).map_err(|err| anyhow!("decode response: {err}"))
     }
 
-    /// Read a bulk payload from the host (bulk OUT → gadget).
     pub async fn read_bulk(&mut self, buf: &mut [u8]) -> Result<()> {
         ensure!(self.configured, "gadget not configured");
         if buf.is_empty() {
@@ -276,7 +570,6 @@ impl SmooGadget {
         Ok(())
     }
 
-    /// Write a bulk payload to the host (bulk IN → host).
     pub async fn write_bulk(&mut self, buf: &[u8]) -> Result<()> {
         ensure!(self.configured, "gadget not configured");
         if buf.is_empty() {
@@ -289,7 +582,6 @@ impl SmooGadget {
         self.bulk_in.flush().await.context("flush bulk IN")
     }
 
-    /// Read a bulk payload directly into a buffer, using DMA-BUF when available.
     pub async fn read_bulk_buffer(&mut self, buf: &mut [u8]) -> Result<()> {
         ensure!(self.configured, "gadget not configured");
         if buf.is_empty() {
@@ -320,7 +612,6 @@ impl SmooGadget {
         }
     }
 
-    /// Write a bulk payload from a buffer, using DMA-BUF when available.
     pub async fn write_bulk_buffer(&mut self, buf: &mut [u8]) -> Result<()> {
         ensure!(self.configured, "gadget not configured");
         if buf.is_empty() {
@@ -350,63 +641,6 @@ impl SmooGadget {
         }
     }
 
-    async fn next_event(&mut self) -> Result<FunctionfsEvent> {
-        let mut buf = [0u8; FUNCTIONFS_EVENT_SIZE];
-        self.ep0
-            .read_exact(&mut buf)
-            .await
-            .context("read ep0 event")?;
-        FunctionfsEvent::from_bytes(buf)
-    }
-
-    async fn handle_setup_request(&mut self, setup: UsbControlRequest) -> Result<bool> {
-        if setup.request == IDENT_REQUEST && setup.request_type == SMOO_REQ_TYPE {
-            ensure!(
-                setup.direction() == ControlDirection::In,
-                "GET_IDENT must be an IN transfer"
-            );
-            ensure!(
-                setup.length as usize >= IDENT_LEN,
-                "GET_IDENT length too small"
-            );
-            let ident = self.ident.encode();
-            let len = cmp::min(setup.length as usize, ident.len());
-            self.write_ep0(&ident[..len])
-                .await
-                .context("reply to GET_IDENT")?;
-            return Ok(true);
-        }
-
-        if setup.request_type & USB_DIR_IN == 0 && setup.length == 0 {
-            trace!(
-                request = setup.request,
-                "acknowledging status-only control request"
-            );
-            self.write_ep0(&[])
-                .await
-                .context("ack control status stage")?;
-            return Ok(false);
-        }
-
-        warn!(
-            request = setup.request,
-            request_type = setup.request_type,
-            length = setup.length,
-            "unsupported setup request"
-        );
-        Err(anyhow!(
-            "unsupported setup request {:#x} type {:#x}",
-            setup.request,
-            setup.request_type
-        ))
-    }
-
-    async fn write_ep0(&mut self, data: &[u8]) -> Result<()> {
-        self.ep0.write_all(data).await.context("write ep0 data")?;
-        self.ep0.flush().await.context("flush ep0")?;
-        Ok(())
-    }
-
     async fn queue_dmabuf_transfer(
         &self,
         endpoint_fd: RawFd,
@@ -423,99 +657,6 @@ impl SmooGadget {
 enum ControlDirection {
     In,
     Out,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct UsbControlRequest {
-    request_type: u8,
-    request: u8,
-    #[allow(dead_code)]
-    value: u16,
-    #[allow(dead_code)]
-    index: u16,
-    length: u16,
-}
-
-impl UsbControlRequest {
-    fn from_bytes(bytes: [u8; SETUP_STAGE_LEN]) -> Self {
-        let value = u16::from_le_bytes([bytes[2], bytes[3]]);
-        let index = u16::from_le_bytes([bytes[4], bytes[5]]);
-        let length = u16::from_le_bytes([bytes[6], bytes[7]]);
-        Self {
-            request_type: bytes[0],
-            request: bytes[1],
-            value,
-            index,
-            length,
-        }
-    }
-
-    fn direction(&self) -> ControlDirection {
-        if self.request_type & USB_DIR_IN != 0 {
-            ControlDirection::In
-        } else {
-            ControlDirection::Out
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-enum FunctionfsEvent {
-    Bind,
-    Unbind,
-    Enable,
-    Disable,
-    Setup(UsbControlRequest),
-    Suspend,
-    Resume,
-}
-
-impl FunctionfsEvent {
-    fn from_bytes(bytes: [u8; FUNCTIONFS_EVENT_SIZE]) -> Result<Self> {
-        let event_type = FunctionfsEventType::try_from(bytes[SETUP_STAGE_LEN])?;
-        Ok(match event_type {
-            FunctionfsEventType::Bind => FunctionfsEvent::Bind,
-            FunctionfsEventType::Unbind => FunctionfsEvent::Unbind,
-            FunctionfsEventType::Enable => FunctionfsEvent::Enable,
-            FunctionfsEventType::Disable => FunctionfsEvent::Disable,
-            FunctionfsEventType::Suspend => FunctionfsEvent::Suspend,
-            FunctionfsEventType::Resume => FunctionfsEvent::Resume,
-            FunctionfsEventType::Setup => {
-                let mut setup_bytes = [0u8; SETUP_STAGE_LEN];
-                setup_bytes.copy_from_slice(&bytes[..SETUP_STAGE_LEN]);
-                FunctionfsEvent::Setup(UsbControlRequest::from_bytes(setup_bytes))
-            }
-        })
-    }
-}
-
-#[repr(u8)]
-#[derive(Clone, Copy, Debug)]
-enum FunctionfsEventType {
-    Bind = 0,
-    Unbind = 1,
-    Enable = 2,
-    Disable = 3,
-    Setup = 4,
-    Suspend = 5,
-    Resume = 6,
-}
-
-impl TryFrom<u8> for FunctionfsEventType {
-    type Error = anyhow::Error;
-
-    fn try_from(value: u8) -> Result<Self> {
-        match value {
-            0 => Ok(FunctionfsEventType::Bind),
-            1 => Ok(FunctionfsEventType::Unbind),
-            2 => Ok(FunctionfsEventType::Enable),
-            3 => Ok(FunctionfsEventType::Disable),
-            4 => Ok(FunctionfsEventType::Setup),
-            5 => Ok(FunctionfsEventType::Suspend),
-            6 => Ok(FunctionfsEventType::Resume),
-            other => Err(anyhow!("unknown FunctionFS event type {other}")),
-        }
-    }
 }
 
 fn to_tokio_file(fd: OwnedFd) -> io::Result<File> {
