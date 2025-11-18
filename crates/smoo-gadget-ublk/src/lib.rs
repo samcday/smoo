@@ -21,7 +21,6 @@ use std::sync::{
 use std::thread::JoinHandle;
 use std::time::Duration;
 use tracing::{Level, debug, error, info, trace, warn};
-
 mod sys {
     #![allow(non_upper_case_globals)]
     #![allow(non_camel_case_types)]
@@ -30,7 +29,6 @@ mod sys {
     #![allow(unsafe_op_in_unsafe_fn)]
     include!(concat!(env!("OUT_DIR"), "/ublk_cmd.rs"));
 }
-
 /// Top level interface to ublk. Creates SmooUblkDevices
 pub struct SmooUblk {
     handle: Option<JoinHandle<()>>,

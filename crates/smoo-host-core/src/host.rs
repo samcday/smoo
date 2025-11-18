@@ -1,4 +1,7 @@
-use crate::{BlockSource, BlockSourceError, BlockSourceErrorKind, Transport, TransportError};
+use crate::{
+    BlockSource, BlockSourceError, BlockSourceErrorKind, Transport, TransportError,
+    TransportErrorKind,
+};
 use alloc::{
     string::{String, ToString},
     vec::Vec,
@@ -107,7 +110,13 @@ where
         if self.ident.is_none() {
             self.setup().await?;
         }
-        let request = self.transport.read_request().await?;
+        let request = match self.transport.read_request().await {
+            Ok(req) => req,
+            Err(err) if err.kind() == TransportErrorKind::Timeout => {
+                return Ok(());
+            }
+            Err(err) => return Err(err.into()),
+        };
         let response = self.handle_request(request).await?;
         self.transport.send_response(response).await?;
         Ok(())
