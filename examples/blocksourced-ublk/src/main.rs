@@ -14,7 +14,6 @@
 
 use anyhow::{Context, ensure};
 use clap::{ArgGroup, Parser};
-use smoo_gadget_buffers::{BufferPool, VecBufferPool};
 use smoo_gadget_ublk::{SmooUblk, UblkIoRequest, UblkOp};
 use smoo_host_blocksources::{DeviceBlockSource, FileBlockSource};
 use smoo_host_core::BlockSource;
@@ -81,19 +80,8 @@ async fn main() -> anyhow::Result<()> {
     let mut ublk = SmooUblk::new().context("init ublk")?;
     let max_io_bytes = SmooUblk::max_io_bytes_hint(block_size, args.queue_depth)
         .context("compute max io bytes")?;
-    let mut buffer_pool = VecBufferPool::new(args.queue_count, args.queue_depth, max_io_bytes)
-        .context("init buffer pool")?;
-    let buffer_ptrs = buffer_pool
-        .buffer_ptrs()
-        .context("collect buffer pointers")?;
     let device = ublk
-        .setup_device(
-            block_size,
-            block_count,
-            args.queue_count,
-            args.queue_depth,
-            &buffer_ptrs,
-        )
+        .setup_device(block_size, block_count, args.queue_count, args.queue_depth)
         .await
         .context("setup device")?;
     ensure!(
@@ -155,36 +143,35 @@ async fn main() -> anyhow::Result<()> {
 
                 let result_bytes = match req.op {
                     UblkOp::Read => {
-                        if req_len > buffer_pool.buffer_len() {
+                        if req_len > device.buffer_len() {
                             warn!(
                                 queue = req.queue_id,
                                 tag = req.tag,
                                 req_bytes = req_len,
-                                buf_cap = buffer_pool.buffer_len(),
-                                "read request exceeds buffer pool capacity"
+                                buf_cap = device.buffer_len(),
+                                "read request exceeds buffer capacity"
                             );
                             device
                                 .complete_io(req, -libc::EINVAL)
                                 .context("complete oversized request")?;
                             continue;
                         }
-                        let mut buf = buffer_pool
-                            .checkout(req.queue_id, req.tag)
+                        let mut buf = device
+                            .checkout_buffer(req.queue_id, req.tag)
                             .context("checkout buffer")?;
                         source
                             .read_blocks(req.sector, &mut buf.as_mut_slice()[..req_len])
                             .await
                             .context("read backing source")?;
-                        buffer_pool.checkin(req.queue_id, req.tag, buf);
                         req_len
                     }
                     UblkOp::Write => {
-                        if req_len > buffer_pool.buffer_len() {
+                        if req_len > device.buffer_len() {
                             warn!(
                                 queue = req.queue_id,
                                 tag = req.tag,
                                 req_bytes = req_len,
-                                buf_cap = buffer_pool.buffer_len(),
+                                buf_cap = device.buffer_len(),
                                 "write request exceeds buffer pool capacity"
                             );
                             device
@@ -192,14 +179,13 @@ async fn main() -> anyhow::Result<()> {
                                 .context("complete oversized request")?;
                             continue;
                         }
-                        let buf = buffer_pool
-                            .checkout(req.queue_id, req.tag)
+                        let buf = device
+                            .checkout_buffer(req.queue_id, req.tag)
                             .context("checkout buffer")?;
                         source
                             .write_blocks(req.sector, &buf.as_slice()[..req_len])
                             .await
                             .context("write backing source")?;
-                        buffer_pool.checkin(req.queue_id, req.tag, buf);
                         req_len
                     }
                     UblkOp::Flush => {

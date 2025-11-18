@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, anyhow, ensure};
+use dma_heap::HeapKind;
+use mmap::MemoryMap;
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::{ioctl_readwrite, ioctl_write_ptr};
-use smoo_gadget_buffers::{Buffer, BufferPool, DmaEndpointPool, DmaEndpointSlot};
 use smoo_proto::{IDENT_LEN, IDENT_REQUEST, Ident, RESPONSE_LEN, Request, Response};
 use std::{
     cmp,
@@ -24,6 +25,8 @@ const SMOO_REQ_TYPE: u8 = USB_DIR_IN | USB_TYPE_VENDOR | USB_RECIP_INTERFACE;
 const SETUP_STAGE_LEN: usize = 8;
 const FUNCTIONFS_EVENT_SIZE: usize = SETUP_STAGE_LEN + 4;
 const FUNCTIONFS_IOC_MAGIC: u8 = b'g';
+const FUNCTIONFS_DMABUF_ATTACH_NR: u8 = 131;
+const FUNCTIONFS_DMABUF_DETACH_NR: u8 = 132;
 const FUNCTIONFS_DMABUF_TRANSFER_NR: u8 = 133;
 
 #[repr(C, packed)]
@@ -32,6 +35,20 @@ struct UsbFfsDmabufTransferReq {
     flags: u32,
     length: u64,
 }
+
+ioctl_write_ptr!(
+    ffs_dmabuf_attach,
+    FUNCTIONFS_IOC_MAGIC,
+    FUNCTIONFS_DMABUF_ATTACH_NR,
+    libc::c_int
+);
+
+ioctl_write_ptr!(
+    ffs_dmabuf_detach,
+    FUNCTIONFS_IOC_MAGIC,
+    FUNCTIONFS_DMABUF_DETACH_NR,
+    libc::c_int
+);
 
 ioctl_write_ptr!(
     ffs_dmabuf_transfer,
@@ -91,15 +108,42 @@ pub struct GadgetConfig {
     pub queue_count: u16,
     pub queue_depth: u16,
     pub max_io_bytes: usize,
+    pub dma_heap: Option<DmaHeap>,
 }
 
 impl GadgetConfig {
-    pub fn new(ident: Ident, queue_count: u16, queue_depth: u16, max_io_bytes: usize) -> Self {
+    pub fn new(
+        ident: Ident,
+        queue_count: u16,
+        queue_depth: u16,
+        max_io_bytes: usize,
+        dma_heap: Option<DmaHeap>,
+    ) -> Self {
         Self {
             ident,
             queue_count,
             queue_depth,
             max_io_bytes,
+            dma_heap,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum DmaHeap {
+    System,
+    Cma,
+    Reserved,
+}
+
+impl DmaHeap {
+    fn to_heap_kind(self) -> HeapKind {
+        match self {
+            DmaHeap::System => HeapKind::System,
+            DmaHeap::Cma => HeapKind::Cma,
+            DmaHeap::Reserved => {
+                HeapKind::Custom(std::path::PathBuf::from("/dev/dma_heap/reserved"))
+            }
         }
     }
 }
@@ -115,21 +159,26 @@ pub struct SmooGadget {
     bulk_out: File,
     ident: Ident,
     configured: bool,
-    buffer_pool: Box<dyn BufferPool>,
     dma_scratch: Option<FunctionfsDmaScratch>,
 }
 
 impl SmooGadget {
-    pub fn new(
-        endpoints: FunctionfsEndpoints,
-        config: GadgetConfig,
-        buffer_pool: Box<dyn BufferPool>,
-        dma_scratch: Option<FunctionfsDmaScratch>,
-    ) -> Result<Self> {
-        ensure!(
-            buffer_pool.buffer_len() == config.max_io_bytes,
-            "buffer pool length mismatch"
-        );
+    pub fn new(endpoints: FunctionfsEndpoints, config: GadgetConfig) -> Result<Self> {
+        let dma_scratch = if let Some(heap) = config.dma_heap {
+            let slots = config.queue_count as usize * config.queue_depth as usize;
+            Some(
+                FunctionfsDmaScratch::new(
+                    endpoints.bulk_in.as_raw_fd(),
+                    endpoints.bulk_out.as_raw_fd(),
+                    slots,
+                    config.max_io_bytes,
+                    heap.to_heap_kind(),
+                )
+                .context("init DMA scratch buffers")?,
+            )
+        } else {
+            None
+        };
         Ok(Self {
             ep0: to_tokio_file(endpoints.ep0)?,
             interrupt_in: to_tokio_file(endpoints.interrupt_in)?,
@@ -138,7 +187,6 @@ impl SmooGadget {
             bulk_out: to_tokio_file(endpoints.bulk_out)?,
             ident: config.ident,
             configured: false,
-            buffer_pool,
             dma_scratch,
         })
     }
@@ -241,12 +289,13 @@ impl SmooGadget {
         self.bulk_in.flush().await.context("flush bulk IN")
     }
 
-    /// Read a bulk payload directly into a pooled buffer, using DMA-BUF when available.
-    pub async fn read_bulk_buffer(&mut self, buf: &mut dyn Buffer, len: usize) -> Result<()> {
+    /// Read a bulk payload directly into a buffer, using DMA-BUF when available.
+    pub async fn read_bulk_buffer(&mut self, buf: &mut [u8]) -> Result<()> {
         ensure!(self.configured, "gadget not configured");
-        if len == 0 {
+        if buf.is_empty() {
             return Ok(());
         }
+        let len = buf.len();
         if self.dma_scratch.is_some() {
             let mut slot = {
                 let scratch = self.dma_scratch.as_mut().unwrap();
@@ -261,25 +310,23 @@ impl SmooGadget {
                 if result.is_ok() {
                     slot.finish_device_write()
                         .context("invalidate DMA buffer after device write")?;
-                    let data = slot.as_slice();
-                    buf.as_mut_slice()[..len].copy_from_slice(&data[..len]);
+                    buf.copy_from_slice(&slot.as_slice()[..len]);
                 }
                 scratch.checkin_out(slot);
             }
             result
         } else {
-            self.read_bulk(&mut buf.as_mut_slice()[..len])
-                .await
-                .context("read bulk payload")
+            self.read_bulk(buf).await.context("read bulk payload")
         }
     }
 
-    /// Write a bulk payload from a pooled buffer, using DMA-BUF when available.
-    pub async fn write_bulk_buffer(&mut self, buf: &mut dyn Buffer, len: usize) -> Result<()> {
+    /// Write a bulk payload from a buffer, using DMA-BUF when available.
+    pub async fn write_bulk_buffer(&mut self, buf: &mut [u8]) -> Result<()> {
         ensure!(self.configured, "gadget not configured");
-        if len == 0 {
+        if buf.is_empty() {
             return Ok(());
         }
+        let len = buf.len();
         if self.dma_scratch.is_some() {
             let mut slot = {
                 let scratch = self.dma_scratch.as_mut().unwrap();
@@ -287,7 +334,7 @@ impl SmooGadget {
                     .checkout_in()
                     .context("checkout bulk IN DMA buffer")?
             };
-            slot.as_mut_slice()[..len].copy_from_slice(&buf.as_slice()[..len]);
+            slot.as_mut_slice()[..len].copy_from_slice(&buf[..len]);
             slot.prepare_device_read()
                 .context("flush DMA buffer before device read")?;
             let result = self
@@ -299,15 +346,8 @@ impl SmooGadget {
             }
             result
         } else {
-            self.write_bulk(&buf.as_slice()[..len])
-                .await
-                .context("write bulk payload")
+            self.write_bulk(buf).await.context("write bulk payload")
         }
-    }
-
-    /// Access the shared Vec-backed buffer pool for bulk transfers.
-    pub fn buffer_pool(&mut self) -> &mut dyn BufferPool {
-        self.buffer_pool.as_mut()
     }
 
     async fn next_event(&mut self) -> Result<FunctionfsEvent> {
@@ -551,8 +591,18 @@ pub struct FunctionfsDmaScratch {
 }
 
 impl FunctionfsDmaScratch {
-    pub fn new(bulk_in: DmaEndpointPool, bulk_out: DmaEndpointPool) -> Self {
-        Self { bulk_in, bulk_out }
+    fn new(
+        bulk_in_fd: RawFd,
+        bulk_out_fd: RawFd,
+        slot_count: usize,
+        buf_len: usize,
+        heap_kind: HeapKind,
+    ) -> Result<Self> {
+        let bulk_in = DmaEndpointPool::new(slot_count, buf_len, heap_kind.clone(), bulk_in_fd)
+            .context("init bulk IN DMA scratch")?;
+        let bulk_out = DmaEndpointPool::new(slot_count, buf_len, heap_kind, bulk_out_fd)
+            .context("init bulk OUT DMA scratch")?;
+        Ok(Self { bulk_in, bulk_out })
     }
 
     fn checkout_in(&mut self) -> Result<DmaEndpointSlot> {
@@ -574,4 +624,212 @@ impl FunctionfsDmaScratch {
     fn checkin_out(&mut self, slot: DmaEndpointSlot) {
         self.bulk_out.checkin(slot);
     }
+}
+
+struct DmaEndpointPool {
+    slots: Vec<Option<DmaBuffer>>,
+    _attachments: EndpointAttachments,
+}
+
+impl DmaEndpointPool {
+    fn new(
+        slot_count: usize,
+        buf_len: usize,
+        heap_kind: HeapKind,
+        endpoint_fd: RawFd,
+    ) -> Result<Self> {
+        ensure!(slot_count > 0, "DMA scratch slot count must be positive");
+        ensure!(buf_len > 0, "DMA scratch buffer length must be positive");
+        let heap = dma_heap::Heap::new(heap_kind).context("open DMA heap")?;
+        let mut slots = Vec::with_capacity(slot_count);
+        for _ in 0..slot_count {
+            let fd = heap.allocate(buf_len).context("allocate DMA buffer")?;
+            slots.push(Some(DmaBuffer::new(fd, buf_len).context("map DMA buffer")?));
+        }
+        let mut attachments = EndpointAttachments::new(endpoint_fd);
+        for buf in slots.iter().flatten() {
+            attachments
+                .attach(buf.raw_fd())
+                .with_context(|| format!("attach dma-buf {} to endpoint", buf.raw_fd()))?;
+        }
+        Ok(Self {
+            slots,
+            _attachments: attachments,
+        })
+    }
+
+    fn checkout(&mut self) -> Result<DmaEndpointSlot> {
+        let (idx, buf) = self
+            .slots
+            .iter_mut()
+            .enumerate()
+            .find_map(|(idx, slot)| slot.take().map(|buf| (idx, buf)))
+            .context("no DMA scratch buffers available")?;
+        Ok(DmaEndpointSlot { idx, buf })
+    }
+
+    fn checkin(&mut self, slot: DmaEndpointSlot) {
+        let previous = self.slots[slot.idx].replace(slot.buf);
+        debug_assert!(previous.is_none(), "DMA scratch slot double freed");
+    }
+}
+
+struct DmaEndpointSlot {
+    idx: usize,
+    buf: DmaBuffer,
+}
+
+impl DmaEndpointSlot {
+    fn fd(&self) -> RawFd {
+        self.buf.raw_fd()
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        self.buf.as_slice()
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        self.buf.as_mut_slice()
+    }
+
+    fn prepare_device_read(&mut self) -> Result<()> {
+        dma_buf_sync_start(self.fd(), DMA_BUF_SYNC_WRITE_FLAG)?;
+        dma_buf_sync_end(self.fd(), DMA_BUF_SYNC_WRITE_FLAG)
+    }
+
+    fn finish_device_write(&mut self) -> Result<()> {
+        dma_buf_sync_start(self.fd(), DMA_BUF_SYNC_READ_FLAG)?;
+        dma_buf_sync_end(self.fd(), DMA_BUF_SYNC_READ_FLAG)
+    }
+}
+
+struct DmaBuffer {
+    fd: OwnedFd,
+    map: MemoryMap,
+    len: usize,
+}
+
+impl DmaBuffer {
+    fn new(fd: OwnedFd, len: usize) -> Result<Self> {
+        let raw_fd = fd.as_raw_fd();
+        let map = MemoryMap::new(
+            len,
+            &[
+                mmap::MapOption::MapReadable,
+                mmap::MapOption::MapWritable,
+                mmap::MapOption::MapFd(raw_fd),
+                mmap::MapOption::MapNonStandardFlags(libc::MAP_SHARED),
+            ],
+        )
+        .map_err(|err| anyhow!("map DMA buffer: {err}"))?;
+        Ok(Self { fd, map, len })
+    }
+
+    fn raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.map.data(), self.len) }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.map.data(), self.len) }
+    }
+}
+
+struct EndpointAttachments {
+    fd: RawFd,
+    attached: Vec<RawFd>,
+}
+
+impl EndpointAttachments {
+    fn new(fd: RawFd) -> Self {
+        Self {
+            fd,
+            attached: Vec::new(),
+        }
+    }
+
+    fn attach(&mut self, buf_fd: RawFd) -> Result<()> {
+        trace!(
+            endpoint_fd = self.fd,
+            buf_fd, "FUNCTIONFS_DMABUF_ATTACH begin"
+        );
+        unsafe { ffs_dmabuf_attach(self.fd, &buf_fd) }
+            .map_err(|err| anyhow!(err))
+            .with_context(|| format!("FUNCTIONFS_DMABUF_ATTACH failed for fd {buf_fd}"))?;
+        trace!(
+            endpoint_fd = self.fd,
+            buf_fd, "FUNCTIONFS_DMABUF_ATTACH complete"
+        );
+        self.attached.push(buf_fd);
+        Ok(())
+    }
+
+    fn detach_all(&mut self) {
+        for buf_fd in self.attached.drain(..) {
+            trace!(
+                endpoint_fd = self.fd,
+                buf_fd, "FUNCTIONFS_DMABUF_DETACH begin"
+            );
+            let res = unsafe { ffs_dmabuf_detach(self.fd, &buf_fd) };
+            match res {
+                Ok(_) => trace!(
+                    endpoint_fd = self.fd,
+                    buf_fd, "FUNCTIONFS_DMABUF_DETACH complete"
+                ),
+                Err(err) => warn!(
+                    endpoint_fd = self.fd,
+                    buf_fd,
+                    error = %err,
+                    "FUNCTIONFS_DMABUF_DETACH failed"
+                ),
+            }
+        }
+    }
+}
+
+impl Drop for EndpointAttachments {
+    fn drop(&mut self) {
+        self.detach_all();
+    }
+}
+
+#[repr(C)]
+struct DmaBufSync {
+    flags: u64,
+}
+
+const DMA_BUF_SYNC_NR: u8 = 0;
+const DMA_BUF_SYNC_START: u64 = 0 << 2;
+const DMA_BUF_SYNC_END: u64 = 1 << 2;
+const DMA_BUF_SYNC_READ_FLAG: u64 = 1 << 0;
+const DMA_BUF_SYNC_WRITE_FLAG: u64 = 1 << 1;
+
+ioctl_write_ptr!(dma_buf_sync, b'b', DMA_BUF_SYNC_NR, DmaBufSync);
+
+fn dma_buf_sync_call(fd: RawFd, flags: u64) -> Result<()> {
+    let req = DmaBufSync { flags };
+    trace!(fd, flags, "DMA_BUF_IOCTL_SYNC begin");
+    let res = unsafe { dma_buf_sync(fd, &req) };
+    match res {
+        Ok(0) => {
+            trace!(fd, flags, "DMA_BUF_IOCTL_SYNC complete");
+            Ok(())
+        }
+        Ok(code) => Err(anyhow!("DMA_BUF_IOCTL_SYNC unexpected code {code}")),
+        Err(err) => {
+            warn!(fd, flags, error = %err, "DMA_BUF_IOCTL_SYNC failed");
+            Err(anyhow!("DMA_BUF_IOCTL_SYNC failed: {err}"))
+        }
+    }
+}
+
+fn dma_buf_sync_start(fd: RawFd, dir: u64) -> Result<()> {
+    dma_buf_sync_call(fd, DMA_BUF_SYNC_START | dir)
+}
+
+fn dma_buf_sync_end(fd: RawFd, dir: u64) -> Result<()> {
+    dma_buf_sync_call(fd, DMA_BUF_SYNC_END | dir)
 }

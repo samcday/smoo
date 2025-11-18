@@ -133,7 +133,6 @@ dependencies = [
  "clap",
  "ctrlc",
  "libc 0.2.177",
- "smoo-gadget-buffers",
  "smoo-gadget-ublk",
  "smoo-host-blocksources",
  "smoo-host-core",
@@ -763,26 +762,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
-name = "smoo-gadget-buffers"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "dma-heap",
- "libc 0.2.177",
- "mmap",
- "nix",
- "tracing",
-]
-
-[[package]]
 name = "smoo-gadget-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "dma-heap",
  "libc 0.2.177",
- "smoo-gadget-buffers",
  "smoo-gadget-core",
  "smoo-gadget-ublk",
  "smoo-proto",
@@ -797,9 +782,10 @@ name = "smoo-gadget-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dma-heap",
  "libc 0.2.177",
+ "mmap",
  "nix",
- "smoo-gadget-buffers",
  "smoo-proto",
  "tokio",
  "tracing",

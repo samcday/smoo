@@ -1,3 +1,6 @@
+mod buffers;
+
+use crate::buffers::{BufferGuard, QueueBuffers};
 use crate::sys::{
     UBLK_CMD_ADD_DEV, UBLK_CMD_DEL_DEV, UBLK_CMD_SET_PARAMS, UBLK_CMD_START_DEV, UBLK_CMD_STOP_DEV,
     UBLK_IO_OP_DISCARD, UBLK_IO_OP_FLUSH, UBLK_IO_OP_READ, UBLK_IO_OP_WRITE, UBLK_PARAM_TYPE_BASIC,
@@ -49,6 +52,7 @@ pub struct SmooUblkDevice {
     queue_depth: u16,
     block_size: usize,
     max_io_bytes: usize,
+    buffers: QueueBuffers,
     request_rx: Receiver<UblkIoRequest>,
     completion_txs: Vec<Sender<QueueCompletion>>,
     workers: Vec<QueueWorkerHandle>,
@@ -90,6 +94,8 @@ struct QueueCompletion {
     tag: u16,
     result: i32,
 }
+
+pub type UblkBuffer<'a> = BufferGuard<'a>;
 
 impl SmooUblk {
     pub fn max_io_bytes_hint(block_size: usize, queue_depth: u16) -> anyhow::Result<usize> {
@@ -257,7 +263,6 @@ impl SmooUblk {
         block_count: usize,
         queue_count: u16,
         queue_depth: u16,
-        queue_buf_ptrs: &[*mut u8],
     ) -> anyhow::Result<SmooUblkDevice> {
         debug!(
             block_size = block_size,
@@ -287,10 +292,9 @@ impl SmooUblk {
         let dev_sectors = (total_bytes / 512) as u64;
         let max_io_bytes = compute_max_io_bytes(block_size, queue_depth)?;
         let max_io_buf_bytes = max_io_bytes as u32;
-        ensure!(
-            queue_buf_ptrs.len() == queue_count as usize * queue_depth as usize,
-            "queue buffer pointer count mismatch"
-        );
+        let buffers = QueueBuffers::new(queue_count, queue_depth, max_io_bytes)
+            .context("allocate ublk buffers")?;
+        let queue_buf_ptrs = buffers.raw_ptrs();
 
         // For now we use -1 as the dev_id, so that a fresh dev is created for us.
         // Once we support resuming this needs to change.
@@ -367,11 +371,7 @@ impl SmooUblk {
                 .with_context(|| format!("clone {}", cdev_path))?;
             let start = queue_id as usize * queue_depth as usize;
             let end = start + queue_depth as usize;
-            let mut buf_ptrs = Vec::with_capacity(queue_depth as usize);
-            for ptr in &queue_buf_ptrs[start..end] {
-                ensure!(!ptr.is_null(), "queue buffer pointer null");
-                buf_ptrs.push(*ptr as u64);
-            }
+            let buf_ptrs = queue_buf_ptrs[start..end].to_vec();
             let worker_cfg = QueueWorkerConfig {
                 dev_id,
                 queue_id,
@@ -406,6 +406,7 @@ impl SmooUblk {
             queue_depth,
             block_size,
             max_io_bytes,
+            buffers,
             request_rx,
             completion_txs,
             workers,
@@ -513,6 +514,16 @@ impl SmooUblkDevice {
 
     pub fn max_io_bytes(&self) -> usize {
         self.max_io_bytes
+    }
+
+    pub fn buffer_len(&self) -> usize {
+        self.buffers.buffer_len()
+    }
+
+    pub fn checkout_buffer(&self, queue_id: u16, tag: u16) -> anyhow::Result<UblkBuffer<'_>> {
+        self.buffers
+            .checkout(queue_id, tag)
+            .context("checkout ublk buffer")
     }
 
     pub async fn next_io(&self) -> anyhow::Result<UblkIoRequest> {

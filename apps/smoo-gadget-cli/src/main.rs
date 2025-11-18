@@ -1,15 +1,13 @@
 use anyhow::{anyhow, ensure, Context, Result};
 use clap::{Parser, ValueEnum};
-use dma_heap::HeapKind;
-use smoo_gadget_buffers::{BufferHandle, BufferPool, DmaEndpointPool, VecBufferPool};
-use smoo_gadget_core::{FunctionfsDmaScratch, FunctionfsEndpoints, GadgetConfig, SmooGadget};
-use smoo_gadget_ublk::{SmooUblk, SmooUblkDevice, UblkIoRequest, UblkOp};
+use smoo_gadget_core::{DmaHeap, FunctionfsEndpoints, GadgetConfig, SmooGadget};
+use smoo_gadget_ublk::{SmooUblk, SmooUblkDevice, UblkBuffer, UblkIoRequest, UblkOp};
 use smoo_proto::{Ident, OpCode, Request, Response};
 use std::{
     fs::File,
     io,
     io::Write,
-    os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
+    os::fd::{FromRawFd, IntoRawFd, OwnedFd},
     path::PathBuf,
 };
 use tokio::signal;
@@ -61,12 +59,12 @@ enum DmaHeapSelection {
     Reserved,
 }
 
-impl From<DmaHeapSelection> for HeapKind {
+impl From<DmaHeapSelection> for DmaHeap {
     fn from(value: DmaHeapSelection) -> Self {
         match value {
-            DmaHeapSelection::System => HeapKind::System,
-            DmaHeapSelection::Cma => HeapKind::Cma,
-            DmaHeapSelection::Reserved => HeapKind::Custom(PathBuf::from("/dev/dma_heap/reserved")),
+            DmaHeapSelection::System => DmaHeap::System,
+            DmaHeapSelection::Cma => DmaHeap::Cma,
+            DmaHeapSelection::Reserved => DmaHeap::Reserved,
         }
     }
 }
@@ -94,57 +92,8 @@ async fn main() -> Result<()> {
     let block_size = args.block_size as usize;
     let max_io_bytes = SmooUblk::max_io_bytes_hint(block_size, args.queue_depth)
         .context("compute max io bytes")?;
-    let buffer_pool: Box<dyn BufferPool> = Box::new(
-        VecBufferPool::new(args.queue_count, args.queue_depth, max_io_bytes)
-            .context("init vec buffer pool")?,
-    );
-
-    let dma_scratch = if args.no_dma_buf {
-        info!("DMA-BUF disabled via --no-dma-buf; using memcpy path");
-        None
-    } else {
-        let slot_count = (args.queue_count as usize)
-            .checked_mul(args.queue_depth as usize)
-            .context("scratch slot count overflow")?;
-        let heap_kind: HeapKind = args.dma_heap.into();
-        match (
-            DmaEndpointPool::new(
-                slot_count,
-                max_io_bytes,
-                heap_kind.clone(),
-                endpoints.bulk_in.as_raw_fd(),
-            ),
-            DmaEndpointPool::new(
-                slot_count,
-                max_io_bytes,
-                heap_kind,
-                endpoints.bulk_out.as_raw_fd(),
-            ),
-        ) {
-            (Ok(bulk_in), Ok(bulk_out)) => {
-                info!("DMA-BUF scratch pool enabled");
-                Some(FunctionfsDmaScratch::new(bulk_in, bulk_out))
-            }
-            (Err(err), _) | (_, Err(err)) => {
-                warn!(
-                    error = ?err,
-                    "DMA-BUF scratch init failed, falling back to memcpy path"
-                );
-                None
-            }
-        }
-    };
-    let buffer_ptrs = buffer_pool
-        .buffer_ptrs()
-        .context("collect buffer pointers")?;
     let device = ublk
-        .setup_device(
-            block_size,
-            block_count,
-            args.queue_count,
-            args.queue_depth,
-            &buffer_ptrs,
-        )
+        .setup_device(block_size, block_count, args.queue_count, args.queue_depth)
         .await
         .context("setup ublk device")?;
     ensure!(
@@ -153,9 +102,19 @@ async fn main() -> Result<()> {
     );
 
     let ident = Ident::new(0, 1);
-    let gadget_config = GadgetConfig::new(ident, args.queue_count, args.queue_depth, max_io_bytes);
-    let mut gadget = SmooGadget::new(endpoints, gadget_config, buffer_pool, dma_scratch)
-        .context("init smoo gadget core")?;
+    let dma_heap = if args.no_dma_buf {
+        None
+    } else {
+        Some(args.dma_heap.into())
+    };
+    let gadget_config = GadgetConfig::new(
+        ident,
+        args.queue_count,
+        args.queue_depth,
+        max_io_bytes,
+        dma_heap,
+    );
+    let mut gadget = SmooGadget::new(endpoints, gadget_config).context("init smoo gadget core")?;
     enum SetupAwait {
         Configured,
         Interrupted,
@@ -282,13 +241,10 @@ async fn handle_request(
         }
     };
 
-    let mut payload: Option<BufferHandle> = None;
+    let mut payload: Option<UblkBuffer<'_>> = None;
     let result = async {
         if matches!(opcode, OpCode::Read | OpCode::Write) && req_len > 0 {
-            let capacity = {
-                let pool = gadget.buffer_pool();
-                pool.buffer_len()
-            };
+            let capacity = device.buffer_len();
             if req_len > capacity {
                 warn!(
                     queue = req.queue_id,
@@ -303,11 +259,9 @@ async fn handle_request(
                 return Ok(());
             }
             payload = Some(
-                {
-                    let pool = gadget.buffer_pool();
-                    pool.checkout(req.queue_id, req.tag)
-                }
-                .context("checkout bulk buffer")?,
+                device
+                    .checkout_buffer(req.queue_id, req.tag)
+                    .context("checkout bulk buffer")?,
             );
         }
 
@@ -321,14 +275,14 @@ async fn handle_request(
         if opcode == OpCode::Read && req_len > 0 {
             if let Some(buf) = payload.as_mut() {
                 gadget
-                    .read_bulk_buffer(buf.as_mut(), req_len)
+                    .read_bulk_buffer(&mut buf.as_mut_slice()[..req_len])
                     .await
                     .context("read bulk payload")?;
             }
         } else if opcode == OpCode::Write && req_len > 0 {
             if let Some(buf) = payload.as_mut() {
                 gadget
-                    .write_bulk_buffer(buf.as_mut(), req_len)
+                    .write_bulk_buffer(&mut buf.as_mut_slice()[..req_len])
                     .await
                     .context("write bulk payload")?;
             }
@@ -352,11 +306,6 @@ async fn handle_request(
         Ok(())
     }
     .await;
-
-    if let Some(buf) = payload.take() {
-        let pool = gadget.buffer_pool();
-        pool.checkin(req.queue_id, req.tag, buf);
-    }
 
     result
 }

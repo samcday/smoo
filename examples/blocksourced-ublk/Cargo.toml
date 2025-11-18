@@ -7,7 +7,6 @@ edition = "2024"
 anyhow = "1.0.100"
 clap = { version = "4.5.20", features = ["derive"] }
 libc = "0.2.177"
-smoo-gadget-buffers = { path = "../../crates/smoo-gadget-buffers" }
 smoo-host-core = { path = "../../crates/smoo-host-core" }
 smoo-host-blocksources = { path = "../../crates/smoo-host-blocksources" }
 smoo-gadget-ublk = { path = "../../crates/smoo-gadget-ublk" }
