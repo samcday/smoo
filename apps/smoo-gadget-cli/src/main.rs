@@ -332,6 +332,13 @@ async fn run_event_loop(
             .await
             .context("stop ublk device")?;
         runtime.status().set_export_count(0).await;
+        if let Some(state_file) = runtime.state_file() {
+            if let Err(err) = state_file.clear() {
+                warn!(error = ?err, "failed to remove state file during shutdown");
+            } else {
+                debug!("state file cleared on shutdown");
+            }
+        }
     }
     if let Some(err) = io_error {
         Err(err)
