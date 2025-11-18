@@ -45,6 +45,9 @@ struct Args {
     /// Logical block count to expose.
     #[arg(long, value_name = "BLOCKS")]
     blocks: u64,
+    /// Disable the DMA-BUF fast path even if the kernel advertises support.
+    #[arg(long)]
+    no_dma_buf: bool,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -70,26 +73,34 @@ async fn main() -> Result<()> {
     let block_size = args.block_size as usize;
     let max_io_bytes = SmooUblk::max_io_bytes_hint(block_size, args.queue_depth)
         .context("compute max io bytes")?;
-    let buffer_pool: Box<dyn BufferPool> = match DmaBufPool::new(
-        args.queue_count,
-        args.queue_depth,
-        max_io_bytes,
-        endpoints.bulk_in.as_raw_fd(),
-        endpoints.bulk_out.as_raw_fd(),
-    ) {
-        Ok(pool) => {
-            info!("using DMA-BUF buffer pool");
-            Box::new(pool)
-        }
-        Err(err) => {
-            warn!(
-                error = ?err,
-                "DMA-BUF pool unavailable, falling back to VecBufferPool"
-            );
-            Box::new(
-                VecBufferPool::new(args.queue_count, args.queue_depth, max_io_bytes)
-                    .context("init vec buffer pool")?,
-            )
+    let buffer_pool: Box<dyn BufferPool> = if args.no_dma_buf {
+        info!("DMA-BUF disabled via --no-dma-buf; using Vec buffer pool");
+        Box::new(
+            VecBufferPool::new(args.queue_count, args.queue_depth, max_io_bytes)
+                .context("init vec buffer pool")?,
+        )
+    } else {
+        match DmaBufPool::new(
+            args.queue_count,
+            args.queue_depth,
+            max_io_bytes,
+            endpoints.bulk_in.as_raw_fd(),
+            endpoints.bulk_out.as_raw_fd(),
+        ) {
+            Ok(pool) => {
+                info!("using DMA-BUF buffer pool");
+                Box::new(pool)
+            }
+            Err(err) => {
+                warn!(
+                    error = ?err,
+                    "DMA-BUF pool unavailable, falling back to VecBufferPool"
+                );
+                Box::new(
+                    VecBufferPool::new(args.queue_count, args.queue_depth, max_io_bytes)
+                        .context("init vec buffer pool")?,
+                )
+            }
         }
     };
     let buffer_ptrs = buffer_pool

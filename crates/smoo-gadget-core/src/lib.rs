@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow, ensure};
-use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::{ioctl_readwrite, ioctl_write_ptr};
 use smoo_gadget_buffers::{Buffer, BufferPool};
 use smoo_proto::{IDENT_LEN, IDENT_REQUEST, Ident, RESPONSE_LEN, Request, Response};
