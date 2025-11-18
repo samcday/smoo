@@ -2,11 +2,11 @@ mod buffers;
 
 use crate::buffers::{BufferGuard, QueueBuffers};
 use crate::sys::{
-    UBLK_CMD_ADD_DEV, UBLK_CMD_DEL_DEV, UBLK_CMD_SET_PARAMS, UBLK_CMD_START_DEV,
-    UBLK_CMD_START_USER_RECOVERY, UBLK_CMD_STOP_DEV, UBLK_IO_OP_DISCARD, UBLK_IO_OP_FLUSH,
-    UBLK_IO_OP_READ, UBLK_IO_OP_WRITE, UBLK_PARAM_TYPE_BASIC, UBLK_U_IO_COMMIT_AND_FETCH_REQ,
-    UBLK_U_IO_FETCH_REQ, ublk_param_basic, ublk_params, ublksrv_ctrl_cmd, ublksrv_ctrl_dev_info,
-    ublksrv_io_cmd, ublksrv_io_desc,
+    UBLK_CMD_ADD_DEV, UBLK_CMD_DEL_DEV, UBLK_CMD_GET_DEV_INFO, UBLK_CMD_GET_DEV_INFO2,
+    UBLK_CMD_GET_PARAMS, UBLK_CMD_SET_PARAMS, UBLK_CMD_START_DEV, UBLK_CMD_START_USER_RECOVERY,
+    UBLK_CMD_STOP_DEV, UBLK_IO_OP_DISCARD, UBLK_IO_OP_FLUSH, UBLK_IO_OP_READ, UBLK_IO_OP_WRITE,
+    UBLK_PARAM_TYPE_BASIC, UBLK_U_IO_COMMIT_AND_FETCH_REQ, UBLK_U_IO_FETCH_REQ, ublk_param_basic,
+    ublk_params, ublksrv_ctrl_cmd, ublksrv_ctrl_dev_info, ublksrv_io_cmd, ublksrv_io_desc,
 };
 use anyhow::{Context, ensure};
 use async_channel::{Receiver, RecvError, Sender};
@@ -259,6 +259,59 @@ impl SmooUblk {
         })
     }
 
+    async fn get_device_info(&self, dev_id: u32) -> anyhow::Result<ublksrv_ctrl_dev_info> {
+        let mut info = ublksrv_ctrl_dev_info {
+            dev_id,
+            ..Default::default()
+        };
+        let mut cmd = ublksrv_ctrl_cmd {
+            dev_id,
+            queue_id: u16::MAX,
+            ..Default::default()
+        };
+        cmd.len = ctrl_cmd_len::<ublksrv_ctrl_dev_info>();
+        cmd.addr = &mut info as *mut _ as u64;
+        if let Err(err) = submit_ctrl_command(
+            &self.sender,
+            UBLK_CMD_GET_DEV_INFO2,
+            cmd,
+            "get device info",
+            None,
+        )
+        .await
+        {
+            if is_errno(&err, libc::EINVAL) {
+                submit_ctrl_command(
+                    &self.sender,
+                    UBLK_CMD_GET_DEV_INFO,
+                    cmd,
+                    "get device info (fallback)",
+                    None,
+                )
+                .await?;
+            } else {
+                return Err(err);
+            }
+        }
+        Ok(info)
+    }
+
+    async fn get_params(&self, dev_id: u32) -> anyhow::Result<ublk_params> {
+        let mut params = ublk_params {
+            len: size_of::<ublk_params>() as u32,
+            ..Default::default()
+        };
+        let mut cmd = ublksrv_ctrl_cmd {
+            dev_id,
+            queue_id: u16::MAX,
+            ..Default::default()
+        };
+        cmd.len = params.len as u16;
+        cmd.addr = &mut params as *mut _ as u64;
+        submit_ctrl_command(&self.sender, UBLK_CMD_GET_PARAMS, cmd, "get params", None).await?;
+        Ok(params)
+    }
+
     pub async fn setup_device(
         &mut self,
         block_size: usize,
@@ -444,8 +497,45 @@ impl SmooUblk {
         Ok(device)
     }
 
-    /// Attempt to recover a previously configured ublk device.
-    pub async fn recover_device(
+    /// Attempt to recover a previously configured ublk device using kernel-queryable metadata.
+    pub async fn recover_existing_device(&mut self, dev_id: u32) -> anyhow::Result<SmooUblkDevice> {
+        let info = self
+            .get_device_info(dev_id)
+            .await
+            .context("query ublk device info")?;
+        let params = self
+            .get_params(dev_id)
+            .await
+            .context("query ublk device params")?;
+        let queue_count = info.nr_hw_queues;
+        let queue_depth = info.queue_depth;
+        let ioctl_encode = (info.flags & (sys::UBLK_F_CMD_IOCTL_ENCODE as u64)) != 0;
+        let block_size_shift = params.basic.logical_bs_shift;
+        ensure!(block_size_shift >= 9, "invalid logical block size shift");
+        let block_size = 1usize << block_size_shift;
+        let dev_sectors = params.basic.dev_sectors;
+        ensure!(dev_sectors > 0, "device reports zero sectors");
+        let total_bytes = dev_sectors
+            .checked_mul(512)
+            .context("device size overflow")?;
+        ensure!(
+            total_bytes % block_size as u64 == 0,
+            "device size not aligned to block size"
+        );
+        let block_count =
+            usize::try_from(total_bytes / block_size as u64).context("block_count overflow")?;
+        self.recover_device_with_params(
+            dev_id,
+            block_size,
+            block_count,
+            queue_count,
+            queue_depth,
+            ioctl_encode,
+        )
+        .await
+    }
+
+    async fn recover_device_with_params(
         &mut self,
         dev_id: u32,
         block_size: usize,
@@ -610,6 +700,30 @@ impl SmooUblk {
             .await?;
         }
 
+        Ok(())
+    }
+
+    pub async fn force_remove_device(&self, dev_id: u32) -> anyhow::Result<()> {
+        let cmd = ublksrv_ctrl_cmd {
+            dev_id,
+            queue_id: u16::MAX,
+            ..Default::default()
+        };
+        if let Err(err) =
+            submit_ctrl_command(&self.sender, UBLK_CMD_STOP_DEV, cmd, "stop device", None).await
+        {
+            warn!(dev_id, error = ?err, "force stop failed");
+        }
+        let cmd = ublksrv_ctrl_cmd {
+            dev_id,
+            queue_id: u16::MAX,
+            ..Default::default()
+        };
+        if let Err(err) =
+            submit_ctrl_command(&self.sender, UBLK_CMD_DEL_DEV, cmd, "delete device", None).await
+        {
+            warn!(dev_id, error = ?err, "force delete failed");
+        }
         Ok(())
     }
 }
@@ -1101,4 +1215,11 @@ fn submit_ctrl_command_blocking(
         .map_err(anyhow::Error::from)
         .with_context(|| format!("{label} failed"))?;
     Ok(())
+}
+
+fn is_errno(err: &anyhow::Error, code: i32) -> bool {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<io::Error>())
+        .and_then(|io_err| io_err.raw_os_error())
+        == Some(code)
 }

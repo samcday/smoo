@@ -12,7 +12,7 @@ use std::{
     io,
     io::Write,
     os::fd::{FromRawFd, IntoRawFd, OwnedFd},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 use tokio::{
     signal,
@@ -544,41 +544,15 @@ async fn attempt_recovery(
     info!(
         path = ?state_file.path(),
         dev_id = export_state.ublk_dev_id,
-        block_size = export_state.block_size,
-        size_bytes = export_state.size_bytes,
-        queue_count = export_state.queue_count,
-        queue_depth = export_state.queue_depth,
-        ioctl_encode = export_state.ioctl_encode,
         "state file found, attempting ublk recovery"
     );
-    if export_state.size_bytes == 0 || export_state.block_size == 0 {
-        warn!("state file missing block size or size bytes; removing and starting cold");
+    let cdev_path = format!("/dev/ublkc{}", export_state.ublk_dev_id);
+    if !Path::new(&cdev_path).exists() {
+        warn!(?cdev_path, "ublk device missing; removing state file");
         let _ = state_file.clear();
         return Ok(None);
     }
-    if export_state.size_bytes % export_state.block_size as u64 != 0 {
-        warn!(
-            size_bytes = export_state.size_bytes,
-            block_size = export_state.block_size,
-            "state file size is not aligned to block size; removing"
-        );
-        let _ = state_file.clear();
-        return Ok(None);
-    }
-    let block_count_u64 = export_state.size_bytes / export_state.block_size as u64;
-    let block_count =
-        usize::try_from(block_count_u64).context("state export size exceeds usize for recovery")?;
-    match ublk
-        .recover_device(
-            export_state.ublk_dev_id,
-            export_state.block_size as usize,
-            block_count,
-            export_state.queue_count,
-            export_state.queue_depth,
-            export_state.ioctl_encode,
-        )
-        .await
-    {
+    match ublk.recover_existing_device(export_state.ublk_dev_id).await {
         Ok(device) => {
             info!(dev_id = export_state.ublk_dev_id, "ublk recovery succeeded");
             Ok(Some(device))
@@ -589,6 +563,15 @@ async fn attempt_recovery(
                 error = ?err,
                 "ublk recovery failed; removing state file"
             );
+            if Path::new(&cdev_path).exists() {
+                if let Err(clean_err) = ublk.force_remove_device(export_state.ublk_dev_id).await {
+                    warn!(
+                        dev_id = export_state.ublk_dev_id,
+                        error = ?clean_err,
+                        "failed to remove stale ublk device"
+                    );
+                }
+            }
             let _ = state_file.clear();
             Ok(None)
         }
@@ -665,16 +648,10 @@ async fn apply_config(
                 .await
                 .context("setup ublk device from CONFIG_EXPORTS")?;
             let dev_id = new_device.dev_id();
-            let ioctl_encode = new_device.ioctl_encode();
             *device_slot = Some(new_device);
             if let Some(state_file) = runtime.state_file() {
                 let export_state = ExportState {
-                    block_size: export.block_size,
-                    size_bytes: export.size_bytes,
                     ublk_dev_id: dev_id,
-                    queue_count: runtime.queue_count,
-                    queue_depth: runtime.queue_depth,
-                    ioctl_encode,
                 };
                 if let Err(err) = state_file.store(&export_state) {
                     warn!(error = ?err, "failed to write state file");
@@ -857,12 +834,7 @@ mod state {
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct ExportState {
-        pub block_size: u32,
-        pub size_bytes: u64,
         pub ublk_dev_id: u32,
-        pub queue_count: u16,
-        pub queue_depth: u16,
-        pub ioctl_encode: bool,
     }
 
     #[derive(Serialize, Deserialize)]
@@ -882,14 +854,7 @@ mod state {
             let dir = tempdir().unwrap();
             let path = dir.path().join("state.json");
             let state_file = StateFile::new(path.clone());
-            let export = ExportState {
-                block_size: 4096,
-                size_bytes: 4096 * 128,
-                ublk_dev_id: 7,
-                queue_count: 2,
-                queue_depth: 16,
-                ioctl_encode: true,
-            };
+            let export = ExportState { ublk_dev_id: 7 };
             state_file.store(&export).unwrap();
             let loaded = state_file.load().unwrap().expect("export");
             assert_eq!(export, loaded);
