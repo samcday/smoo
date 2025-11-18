@@ -2,7 +2,9 @@ use anyhow::{anyhow, ensure, Context, Result};
 use clap::{ArgGroup, Parser};
 use rusb::{Direction, TransferType, UsbContext};
 use smoo_host_blocksources::{DeviceBlockSource, FileBlockSource};
-use smoo_host_core::{BlockSource, BlockSourceResult, HostErrorKind, SmooHost};
+use smoo_host_core::{
+    BlockSource, BlockSourceResult, HostErrorKind, SmooHost, TransportError, TransportErrorKind,
+};
 use smoo_host_rusb::{ConfigExportsV0Payload, RusbTransport, RusbTransportConfig, StatusClient};
 use smoo_proto::SmooStatusV0;
 use std::{fmt, path::PathBuf, sync::Arc, time::Duration};
@@ -15,6 +17,8 @@ const SMOO_INTERFACE_PROTOCOL: u8 = 0x4D;
 const HEARTBEAT_INTERVAL_SECS: u64 = 1;
 const DISCOVERY_DELAY_INITIAL: Duration = Duration::from_millis(500);
 const DISCOVERY_DELAY_MAX: Duration = Duration::from_secs(5);
+const STATUS_RETRY_INTERVAL: Duration = Duration::from_millis(200);
+const STATUS_RETRY_ATTEMPTS: usize = 5;
 
 #[derive(Debug, Parser)]
 #[command(name = "smoo-host-cli")]
@@ -245,10 +249,16 @@ async fn run_session(
         "configured gadget export"
     );
     let status_client = transport.status_client();
-    let initial_status: SmooStatusV0 = status_client
-        .read_status()
-        .await
-        .context("SMOO_STATUS control transfer")?;
+    let initial_status =
+        match fetch_status_with_retry(&status_client, STATUS_RETRY_ATTEMPTS, STATUS_RETRY_INTERVAL)
+            .await
+        {
+            Ok(status) => status,
+            Err(err) => {
+                warn!(error = %err, "SMOO_STATUS failed after reconnect; gadget not ready");
+                return Ok(SessionEnd::TransportLost);
+            }
+        };
     ensure!(
         initial_status.export_active(),
         "gadget reports no active export after CONFIG_EXPORTS"
@@ -579,6 +589,35 @@ async fn run_heartbeat(
             }
             Err(err) => {
                 return Err(HeartbeatFailure::TransferFailed(err.to_string()));
+            }
+        }
+    }
+}
+
+async fn fetch_status_with_retry(
+    client: &StatusClient<rusb::Context>,
+    attempts: usize,
+    delay: Duration,
+) -> Result<SmooStatusV0, TransportError> {
+    let mut attempt = 0;
+    loop {
+        match client.read_status().await {
+            Ok(status) => return Ok(status),
+            Err(err) => {
+                if err.kind() == TransportErrorKind::Timeout && attempt == 0 {
+                    debug!(error = %err, "SMOO_STATUS timeout before retry");
+                }
+                attempt += 1;
+                if attempt >= attempts {
+                    return Err(err);
+                }
+                warn!(
+                    attempt,
+                    attempts,
+                    error = %err,
+                    "SMOO_STATUS attempt failed; retrying"
+                );
+                time::sleep(delay).await;
             }
         }
     }

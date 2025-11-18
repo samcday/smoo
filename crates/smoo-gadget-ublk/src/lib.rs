@@ -2,11 +2,12 @@ mod buffers;
 
 use crate::buffers::{BufferGuard, QueueBuffers};
 use crate::sys::{
-    UBLK_CMD_ADD_DEV, UBLK_CMD_DEL_DEV, UBLK_CMD_GET_DEV_INFO, UBLK_CMD_GET_DEV_INFO2,
-    UBLK_CMD_GET_PARAMS, UBLK_CMD_SET_PARAMS, UBLK_CMD_START_DEV, UBLK_CMD_START_USER_RECOVERY,
-    UBLK_CMD_STOP_DEV, UBLK_IO_OP_DISCARD, UBLK_IO_OP_FLUSH, UBLK_IO_OP_READ, UBLK_IO_OP_WRITE,
-    UBLK_PARAM_TYPE_BASIC, UBLK_U_IO_COMMIT_AND_FETCH_REQ, UBLK_U_IO_FETCH_REQ, ublk_param_basic,
-    ublk_params, ublksrv_ctrl_cmd, ublksrv_ctrl_dev_info, ublksrv_io_cmd, ublksrv_io_desc,
+    UBLK_CMD_ADD_DEV, UBLK_CMD_DEL_DEV, UBLK_CMD_END_USER_RECOVERY, UBLK_CMD_GET_DEV_INFO,
+    UBLK_CMD_GET_DEV_INFO2, UBLK_CMD_GET_PARAMS, UBLK_CMD_SET_PARAMS, UBLK_CMD_START_DEV,
+    UBLK_CMD_START_USER_RECOVERY, UBLK_CMD_STOP_DEV, UBLK_F_USER_RECOVERY, UBLK_IO_OP_DISCARD,
+    UBLK_IO_OP_FLUSH, UBLK_IO_OP_READ, UBLK_IO_OP_WRITE, UBLK_PARAM_TYPE_BASIC,
+    UBLK_U_IO_COMMIT_AND_FETCH_REQ, UBLK_U_IO_FETCH_REQ, ublk_param_basic, ublk_params,
+    ublksrv_ctrl_cmd, ublksrv_ctrl_dev_info, ublksrv_io_cmd, ublksrv_io_desc,
 };
 use anyhow::{Context, ensure};
 use async_channel::{Receiver, RecvError, Sender};
@@ -52,8 +53,10 @@ pub struct SmooUblkDevice {
     queue_count: u16,
     queue_depth: u16,
     block_size: usize,
+    block_count: usize,
     max_io_bytes: usize,
     ioctl_encode: bool,
+    recovery_pending: bool,
     buffers: QueueBuffers,
     request_rx: Receiver<UblkIoRequest>,
     completion_txs: Vec<Sender<QueueCompletion>>,
@@ -364,6 +367,7 @@ impl SmooUblk {
             ublksrv_pid: unsafe { libc::getpid() } as i32,
             ..Default::default()
         };
+        info.flags |= UBLK_F_USER_RECOVERY as u64;
 
         // ublk_params is passed in ublksrv_ctrl_dev_info during UBLK_CMD_SET_PARAMS
         let mut params = ublk_params {
@@ -460,8 +464,10 @@ impl SmooUblk {
             queue_count,
             queue_depth,
             block_size,
+            block_count,
             max_io_bytes,
             ioctl_encode,
+            recovery_pending: false,
             buffers,
             request_rx,
             completion_txs,
@@ -566,6 +572,7 @@ impl SmooUblk {
         let buffers = QueueBuffers::new(queue_count, queue_depth, max_io_bytes)
             .context("allocate ublk buffers")?;
         let queue_buf_ptrs = buffers.raw_ptrs();
+        self.start_user_recovery(dev_id).await?;
         let cdev_path = format!("/dev/ublkc{}", dev_id);
         let base_cdev = File::options()
             .read(true)
@@ -617,13 +624,15 @@ impl SmooUblk {
             );
         }
 
-        let mut device = SmooUblkDevice {
+        let device = SmooUblkDevice {
             dev_id,
             queue_count,
             queue_depth,
             block_size,
+            block_count,
             max_io_bytes,
             ioctl_encode,
+            recovery_pending: true,
             buffers,
             request_rx,
             completion_txs,
@@ -632,35 +641,51 @@ impl SmooUblk {
             shutdown: false,
         };
 
+        Ok(device)
+    }
+
+    pub async fn finalize_recovery(&self, device: &mut SmooUblkDevice) -> anyhow::Result<()> {
+        if !device.recovery_pending() {
+            return Ok(());
+        }
+        let dev_id = device.dev_id();
+        info!(dev_id, "issuing UBLK_CMD_END_USER_RECOVERY");
         let mut cmd = ublksrv_ctrl_cmd {
             dev_id,
             queue_id: u16::MAX,
             ..Default::default()
         };
-        cmd.len = 0;
-        cmd.addr = 0;
         cmd.data[0] = unsafe { libc::getpid() } as u64;
-        let ctrl_sender = self.sender.clone();
-        let start_thread = std::thread::Builder::new()
-            .name(format!("smoo-gadget-ublk-recover-{}", dev_id))
-            .spawn(move || {
-                info!(dev_id = dev_id, "start_user_recovery thread begin");
-                let res = submit_ctrl_command_blocking(
-                    &ctrl_sender,
-                    UBLK_CMD_START_USER_RECOVERY,
-                    cmd,
-                    "start user recovery",
-                );
-                match res {
-                    Ok(()) => info!(dev_id = dev_id, "start_user_recovery completed"),
-                    Err(err) => error!(dev_id = dev_id, "start_user_recovery failed: {:?}", err),
-                }
-            })
-            .context("spawn start_user_recovery thread")?;
-
-        device.start_handle = Some(start_thread);
-        Ok(device)
+        submit_ctrl_command(
+            &self.sender,
+            UBLK_CMD_END_USER_RECOVERY,
+            cmd,
+            "end user recovery",
+            None,
+        )
+        .await?;
+        device.mark_recovery_complete();
+        Ok(())
     }
+
+    async fn start_user_recovery(&self, dev_id: u32) -> anyhow::Result<()> {
+        let mut cmd = ublksrv_ctrl_cmd {
+            dev_id,
+            queue_id: u16::MAX,
+            ..Default::default()
+        };
+        cmd.data[0] = unsafe { libc::getpid() } as u64;
+        info!(dev_id, "issuing UBLK_CMD_START_USER_RECOVERY");
+        submit_ctrl_command(
+            &self.sender,
+            UBLK_CMD_START_USER_RECOVERY,
+            cmd,
+            "start user recovery",
+            None,
+        )
+        .await
+    }
+
     /// Gracefully stop a running device and optionally delete the control node.
     ///
     /// All queue workers and io_uring resources are torn down before
@@ -756,12 +781,24 @@ impl SmooUblkDevice {
         self.block_size
     }
 
+    pub fn block_count(&self) -> usize {
+        self.block_count
+    }
+
     pub fn max_io_bytes(&self) -> usize {
         self.max_io_bytes
     }
 
     pub fn buffer_len(&self) -> usize {
         self.buffers.buffer_len()
+    }
+
+    pub fn recovery_pending(&self) -> bool {
+        self.recovery_pending
+    }
+
+    fn mark_recovery_complete(&mut self) {
+        self.recovery_pending = false;
     }
 
     pub fn ioctl_encode(&self) -> bool {

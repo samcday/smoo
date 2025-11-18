@@ -122,7 +122,6 @@ async fn main() -> Result<()> {
         dma_heap,
     );
     let mut gadget = SmooGadget::new(endpoints, gadget_config).context("init smoo gadget core")?;
-    let initial_export_count = if recovered_device.is_some() { 1 } else { 0 };
     enum SetupAwait {
         Configured,
         Interrupted,
@@ -164,7 +163,7 @@ async fn main() -> Result<()> {
         .take_ep0_controller()
         .context("ep0 controller already taken")?;
     let (control_tx, control_rx) = mpsc::channel(8);
-    let status = GadgetStatusShared::new(GadgetStatus::new(session_id, initial_export_count));
+    let status = GadgetStatusShared::new(GadgetStatus::new(session_id, 0));
     let control_task = tokio::spawn(control_loop(ep0, ident, status.clone(), control_tx));
     let runtime = RuntimeConfig {
         queue_count: args.queue_count,
@@ -823,7 +822,31 @@ async fn apply_config(
             ensure!(blocks > 0, "export size too small");
             let block_count =
                 usize::try_from(blocks).context("block count exceeds usize capacity")?;
-            if let Some(device) = device_slot.take() {
+
+            if let Some(existing) = device_slot.as_mut() {
+                let matches = existing.block_size() == block_size
+                    && existing.block_count() == block_count
+                    && existing.queue_count() == runtime.queue_count
+                    && existing.queue_depth() == runtime.queue_depth;
+                if matches {
+                    info!("CONFIG_EXPORTS matches existing export; resuming recovered device");
+                    ublk.finalize_recovery(existing)
+                        .await
+                        .context("complete ublk recovery")?;
+                    runtime.status().set_export_count(1).await;
+                    if let Some(state_file) = runtime.state_file() {
+                        let export_state = ExportState {
+                            export_id: SINGLE_EXPORT_ID,
+                            ublk_dev_id: existing.dev_id(),
+                        };
+                        let session_id = runtime.status().session_id().await;
+                        if let Err(err) = state_file.store(session_id, &[export_state]) {
+                            warn!(error = ?err, "failed to write state file");
+                        }
+                    }
+                    return Ok(());
+                }
+                let device = device_slot.take().expect("device present");
                 info!("CONFIG_EXPORTS replacing existing export");
                 ublk.stop_dev(device, true)
                     .await
@@ -831,6 +854,7 @@ async fn apply_config(
             } else {
                 info!("CONFIG_EXPORTS creating export");
             }
+
             let new_device = ublk
                 .setup_device(
                     block_size,
@@ -840,19 +864,18 @@ async fn apply_config(
                 )
                 .await
                 .context("setup ublk device from CONFIG_EXPORTS")?;
-            let dev_id = new_device.dev_id();
-            *device_slot = Some(new_device);
             runtime.status().set_export_count(1).await;
             if let Some(state_file) = runtime.state_file() {
                 let export_state = ExportState {
                     export_id: SINGLE_EXPORT_ID,
-                    ublk_dev_id: dev_id,
+                    ublk_dev_id: new_device.dev_id(),
                 };
                 let session_id = runtime.status().session_id().await;
                 if let Err(err) = state_file.store(session_id, &[export_state]) {
                     warn!(error = ?err, "failed to write state file");
                 }
             }
+            *device_slot = Some(new_device);
             Ok(())
         }
     }
