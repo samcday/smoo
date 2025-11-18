@@ -1,8 +1,8 @@
 use anyhow::{anyhow, ensure, Context, Result};
 use clap::{Parser, ValueEnum};
 use dma_heap::HeapKind;
-use smoo_gadget_buffers::{BufferHandle, BufferPool, DmaBufPool, VecBufferPool};
-use smoo_gadget_core::{FunctionfsEndpoints, GadgetConfig, SmooGadget};
+use smoo_gadget_buffers::{BufferHandle, BufferPool, DmaEndpointPool, VecBufferPool};
+use smoo_gadget_core::{FunctionfsDmaScratch, FunctionfsEndpoints, GadgetConfig, SmooGadget};
 use smoo_gadget_ublk::{SmooUblk, SmooUblkDevice, UblkIoRequest, UblkOp};
 use smoo_proto::{Ident, OpCode, Request, Response};
 use std::{
@@ -94,34 +94,43 @@ async fn main() -> Result<()> {
     let block_size = args.block_size as usize;
     let max_io_bytes = SmooUblk::max_io_bytes_hint(block_size, args.queue_depth)
         .context("compute max io bytes")?;
-    let buffer_pool: Box<dyn BufferPool> = if args.no_dma_buf {
-        info!("DMA-BUF disabled via --no-dma-buf; using Vec buffer pool");
-        Box::new(
-            VecBufferPool::new(args.queue_count, args.queue_depth, max_io_bytes)
-                .context("init vec buffer pool")?,
-        )
+    let buffer_pool: Box<dyn BufferPool> = Box::new(
+        VecBufferPool::new(args.queue_count, args.queue_depth, max_io_bytes)
+            .context("init vec buffer pool")?,
+    );
+
+    let dma_scratch = if args.no_dma_buf {
+        info!("DMA-BUF disabled via --no-dma-buf; using memcpy path");
+        None
     } else {
-        match DmaBufPool::new(
-            args.queue_count,
-            args.queue_depth,
-            max_io_bytes,
-            args.dma_heap.into(),
-            endpoints.bulk_in.as_raw_fd(),
-            endpoints.bulk_out.as_raw_fd(),
+        let slot_count = (args.queue_count as usize)
+            .checked_mul(args.queue_depth as usize)
+            .context("scratch slot count overflow")?;
+        let heap_kind: HeapKind = args.dma_heap.into();
+        match (
+            DmaEndpointPool::new(
+                slot_count,
+                max_io_bytes,
+                heap_kind.clone(),
+                endpoints.bulk_in.as_raw_fd(),
+            ),
+            DmaEndpointPool::new(
+                slot_count,
+                max_io_bytes,
+                heap_kind,
+                endpoints.bulk_out.as_raw_fd(),
+            ),
         ) {
-            Ok(pool) => {
-                info!("using DMA-BUF buffer pool");
-                Box::new(pool)
+            (Ok(bulk_in), Ok(bulk_out)) => {
+                info!("DMA-BUF scratch pool enabled");
+                Some(FunctionfsDmaScratch::new(bulk_in, bulk_out))
             }
-            Err(err) => {
+            (Err(err), _) | (_, Err(err)) => {
                 warn!(
                     error = ?err,
-                    "DMA-BUF pool unavailable, falling back to VecBufferPool"
+                    "DMA-BUF scratch init failed, falling back to memcpy path"
                 );
-                Box::new(
-                    VecBufferPool::new(args.queue_count, args.queue_depth, max_io_bytes)
-                        .context("init vec buffer pool")?,
-                )
+                None
             }
         }
     };
@@ -145,8 +154,8 @@ async fn main() -> Result<()> {
 
     let ident = Ident::new(0, 1);
     let gadget_config = GadgetConfig::new(ident, args.queue_count, args.queue_depth, max_io_bytes);
-    let mut gadget =
-        SmooGadget::new(endpoints, gadget_config, buffer_pool).context("init smoo gadget core")?;
+    let mut gadget = SmooGadget::new(endpoints, gadget_config, buffer_pool, dma_scratch)
+        .context("init smoo gadget core")?;
     enum SetupAwait {
         Configured,
         Interrupted,

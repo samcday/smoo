@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow, ensure};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::{ioctl_readwrite, ioctl_write_ptr};
-use smoo_gadget_buffers::{Buffer, BufferPool};
+use smoo_gadget_buffers::{Buffer, BufferPool, DmaEndpointPool, DmaEndpointSlot};
 use smoo_proto::{IDENT_LEN, IDENT_REQUEST, Ident, RESPONSE_LEN, Request, Response};
 use std::{
     cmp,
@@ -116,6 +116,7 @@ pub struct SmooGadget {
     ident: Ident,
     configured: bool,
     buffer_pool: Box<dyn BufferPool>,
+    dma_scratch: Option<FunctionfsDmaScratch>,
 }
 
 impl SmooGadget {
@@ -123,6 +124,7 @@ impl SmooGadget {
         endpoints: FunctionfsEndpoints,
         config: GadgetConfig,
         buffer_pool: Box<dyn BufferPool>,
+        dma_scratch: Option<FunctionfsDmaScratch>,
     ) -> Result<Self> {
         ensure!(
             buffer_pool.buffer_len() == config.max_io_bytes,
@@ -137,6 +139,7 @@ impl SmooGadget {
             ident: config.ident,
             configured: false,
             buffer_pool,
+            dma_scratch,
         })
     }
 
@@ -244,11 +247,26 @@ impl SmooGadget {
         if len == 0 {
             return Ok(());
         }
-        if let Some(fd) = buf.dma_fd() {
-            self.queue_dmabuf_transfer(self.bulk_out.as_raw_fd(), fd, len)
-                .await
-                .context("FUNCTIONFS dmabuf transfer (OUT)")?;
-            buf.after_device_write(len)
+        if self.dma_scratch.is_some() {
+            let mut slot = {
+                let scratch = self.dma_scratch.as_mut().unwrap();
+                scratch
+                    .checkout_out()
+                    .context("checkout bulk OUT DMA buffer")?
+            };
+            let result = self
+                .queue_dmabuf_transfer(self.bulk_out.as_raw_fd(), slot.fd(), len)
+                .await;
+            if let Some(scratch) = self.dma_scratch.as_mut() {
+                if result.is_ok() {
+                    slot.finish_device_write()
+                        .context("invalidate DMA buffer after device write")?;
+                    let data = slot.as_slice();
+                    buf.as_mut_slice()[..len].copy_from_slice(&data[..len]);
+                }
+                scratch.checkin_out(slot);
+            }
+            result
         } else {
             self.read_bulk(&mut buf.as_mut_slice()[..len])
                 .await
@@ -262,11 +280,24 @@ impl SmooGadget {
         if len == 0 {
             return Ok(());
         }
-        if let Some(fd) = buf.dma_fd() {
-            buf.before_device_read(len)?;
-            self.queue_dmabuf_transfer(self.bulk_in.as_raw_fd(), fd, len)
+        if self.dma_scratch.is_some() {
+            let mut slot = {
+                let scratch = self.dma_scratch.as_mut().unwrap();
+                scratch
+                    .checkout_in()
+                    .context("checkout bulk IN DMA buffer")?
+            };
+            slot.as_mut_slice()[..len].copy_from_slice(&buf.as_slice()[..len]);
+            slot.prepare_device_read()
+                .context("flush DMA buffer before device read")?;
+            let result = self
+                .queue_dmabuf_transfer(self.bulk_in.as_raw_fd(), slot.fd(), len)
                 .await
-                .context("FUNCTIONFS dmabuf transfer (IN)")
+                .context("FUNCTIONFS dmabuf transfer (IN)");
+            if let Some(scratch) = self.dma_scratch.as_mut() {
+                scratch.checkin_in(slot);
+            }
+            result
         } else {
             self.write_bulk(&buf.as_slice()[..len])
                 .await
@@ -513,4 +544,34 @@ fn wait_for_dmabuf_completion(dmabuf_fd: RawFd) -> Result<()> {
     }
     trace!(buf_fd = dmabuf_fd, "dma-buf completion fence signaled");
     Ok(())
+}
+pub struct FunctionfsDmaScratch {
+    bulk_in: DmaEndpointPool,
+    bulk_out: DmaEndpointPool,
+}
+
+impl FunctionfsDmaScratch {
+    pub fn new(bulk_in: DmaEndpointPool, bulk_out: DmaEndpointPool) -> Self {
+        Self { bulk_in, bulk_out }
+    }
+
+    fn checkout_in(&mut self) -> Result<DmaEndpointSlot> {
+        self.bulk_in
+            .checkout()
+            .context("checkout bulk IN scratch buffer")
+    }
+
+    fn checkin_in(&mut self, slot: DmaEndpointSlot) {
+        self.bulk_in.checkin(slot);
+    }
+
+    fn checkout_out(&mut self) -> Result<DmaEndpointSlot> {
+        self.bulk_out
+            .checkout()
+            .context("checkout bulk OUT scratch buffer")
+    }
+
+    fn checkin_out(&mut self, slot: DmaEndpointSlot) {
+        self.bulk_out.checkin(slot);
+    }
 }

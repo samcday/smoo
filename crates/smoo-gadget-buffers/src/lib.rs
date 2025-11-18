@@ -208,119 +208,86 @@ impl BufferPool for VecBufferPool {
     }
 }
 
-/// Pool of DMA-BUF backed buffers attached to FunctionFS endpoints.
-pub struct DmaBufPool {
-    slots: Vec<Option<BufferHandle>>,
-    queue_count: usize,
-    queue_depth: usize,
-    buf_len: usize,
-    buffer_fds: Vec<RawFd>,
-    bulk_in: EndpointAttachments,
-    bulk_out: EndpointAttachments,
+/// Scratch DMA-BUF pool dedicated to a single FunctionFS endpoint.
+pub struct DmaEndpointPool {
+    buffers: Vec<Option<DmaBuffer>>,
+    attachments: EndpointAttachments,
 }
 
-impl DmaBufPool {
+pub struct DmaEndpointSlot {
+    idx: usize,
+    buf: DmaBuffer,
+}
+
+impl DmaEndpointPool {
     pub fn new(
-        queue_count: u16,
-        queue_depth: u16,
+        slot_count: usize,
         buf_len: usize,
         heap_kind: HeapKind,
-        bulk_in_fd: RawFd,
-        bulk_out_fd: RawFd,
+        endpoint_fd: RawFd,
     ) -> Result<Self> {
         ensure!(buf_len > 0, "buffer length must be positive");
-        let queue_count = queue_count as usize;
-        let queue_depth = queue_depth as usize;
-        let total = queue_count
-            .checked_mul(queue_depth)
-            .context("buffer pool size overflow")?;
-
         let heap = Heap::new(heap_kind).context("open DMA heap")?;
-        let mut slots = Vec::with_capacity(total);
-        let mut buffer_fds = Vec::with_capacity(total);
-        for _ in 0..total {
+        let mut buffers = Vec::with_capacity(slot_count);
+        for _ in 0..slot_count {
             let fd = heap.allocate(buf_len).context("allocate dma-buf")?;
-            let buffer = DmaBuffer::new(fd, buf_len).context("map dma-buf")?;
-            let buffer_fd = buffer.raw_fd();
-            buffer_fds.push(buffer_fd);
-            slots.push(Some(Box::new(buffer) as BufferHandle));
+            buffers.push(Some(DmaBuffer::new(fd, buf_len).context("map dma-buf")?));
         }
-
-        let mut bulk_in = EndpointAttachments::new(bulk_in_fd);
-        let mut bulk_out = EndpointAttachments::new(bulk_out_fd);
-        for fd in &buffer_fds {
-            bulk_in
-                .attach(*fd)
-                .with_context(|| format!("attach dma-buf {fd} to bulk IN"))?;
-            bulk_out
-                .attach(*fd)
-                .with_context(|| format!("attach dma-buf {fd} to bulk OUT"))?;
+        let mut attachments = EndpointAttachments::new(endpoint_fd);
+        for buf in buffers.iter().flatten() {
+            attachments
+                .attach(buf.raw_fd())
+                .with_context(|| format!("attach dma-buf {} to endpoint", buf.raw_fd()))?;
         }
-
         Ok(Self {
-            slots,
-            queue_count,
-            queue_depth,
-            buf_len,
-            buffer_fds,
-            bulk_in,
-            bulk_out,
+            buffers,
+            attachments,
         })
     }
 
-    fn index(&self, queue_id: u16, tag: u16) -> Result<usize> {
-        let queue = queue_id as usize;
-        let tag = tag as usize;
-        ensure!(queue < self.queue_count, "queue id out of range");
-        ensure!(tag < self.queue_depth, "tag out of range");
-        Ok(queue * self.queue_depth + tag)
+    pub fn checkout(&mut self) -> Result<DmaEndpointSlot> {
+        let (idx, buf) = self
+            .buffers
+            .iter_mut()
+            .enumerate()
+            .find_map(|(idx, slot)| slot.take().map(|buf| (idx, buf)))
+            .context("no DMA scratch buffers available")?;
+        Ok(DmaEndpointSlot { idx, buf })
     }
 
-    /// Returns the dma-buf fd for the queue/tag slot.
-    pub fn dma_buf_fd(&self, queue_id: u16, tag: u16) -> Result<RawFd> {
-        let idx = self.index(queue_id, tag)?;
-        Ok(self.buffer_fds[idx])
-    }
-}
-
-impl BufferPool for DmaBufPool {
-    fn buffer_len(&self) -> usize {
-        self.buf_len
-    }
-
-    fn buffer_ptrs(&self) -> Result<Vec<*mut u8>> {
-        self.slots
-            .iter()
-            .map(|slot| {
-                slot.as_ref()
-                    .map(|buf| buf.as_mut_ptr())
-                    .context("buffer slot missing while collecting pointers")
-            })
-            .collect()
-    }
-
-    fn checkout(&mut self, queue_id: u16, tag: u16) -> Result<BufferHandle> {
-        let idx = self.index(queue_id, tag)?;
-        self.slots[idx].take().context("buffer already checked out")
-    }
-
-    fn checkin(&mut self, queue_id: u16, tag: u16, buf: BufferHandle) {
-        debug_assert!(
-            buf.len() == self.buf_len,
-            "buffer length mismatch during checkin"
-        );
-        let idx = self
-            .index(queue_id, tag)
-            .expect("buffer index out of range");
-        let previous = self.slots[idx].replace(buf);
-        debug_assert!(previous.is_none(), "buffer slot occupied during checkin");
+    pub fn checkin(&mut self, slot: DmaEndpointSlot) {
+        let prev = self.buffers[slot.idx].replace(slot.buf);
+        debug_assert!(prev.is_none(), "DMA scratch slot already occupied");
     }
 }
 
-impl Drop for DmaBufPool {
+impl DmaEndpointSlot {
+    pub fn fd(&self) -> RawFd {
+        self.buf.raw_fd()
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        self.buf.as_slice()
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        self.buf.as_mut_slice()
+    }
+
+    pub fn prepare_device_read(&mut self) -> Result<()> {
+        dma_buf_sync_start(self.fd(), DMA_BUF_SYNC_WRITE_FLAG)?;
+        dma_buf_sync_end(self.fd(), DMA_BUF_SYNC_WRITE_FLAG)
+    }
+
+    pub fn finish_device_write(&mut self) -> Result<()> {
+        dma_buf_sync_start(self.fd(), DMA_BUF_SYNC_READ_FLAG)?;
+        dma_buf_sync_end(self.fd(), DMA_BUF_SYNC_READ_FLAG)
+    }
+}
+
+impl Drop for DmaEndpointPool {
     fn drop(&mut self) {
-        self.bulk_in.detach_all();
-        self.bulk_out.detach_all();
+        self.attachments.detach_all();
     }
 }
 

@@ -5,4 +5,5 @@ the buffers that are handed to ublk.
 
 The basic `VecBufferPool` works exactly like you'd expect.
 
-The `DmaBufPool` juggles a collection of dma-buf fds + their memory mappings rather than normal virtual mem.
+`DmaEndpointPool` provides dma-buf scratch buffers that stay attached to a single FunctionFS endpoint,
+making it easy to DMA payloads to/from USB without sharing those buffers with ublk.
