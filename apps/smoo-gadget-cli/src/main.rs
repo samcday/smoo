@@ -31,6 +31,8 @@ const SMOO_PROTOCOL: u8 = 0x4D;
 const SMOO_IDENT_REQ_TYPE: u8 = 0xC1;
 const DEFAULT_MAX_IO_BYTES: usize = 4 * 1024 * 1024;
 
+use state::{ExportState, StateFile};
+
 #[derive(Debug, Parser)]
 #[command(name = "smoo-gadget-cli")]
 #[command(about = "Expose a smoo gadget backed by FunctionFS + ublk", long_about = None)]
@@ -53,6 +55,9 @@ struct Args {
     /// DMA-HEAP to allocate from when DMA-BUF mode is enabled.
     #[arg(long, value_enum, default_value_t = DmaHeapSelection::System)]
     dma_heap: DmaHeapSelection,
+    /// Path to the recovery state file. When unset, crash recovery is disabled.
+    #[arg(long, value_name = "PATH")]
+    state_file: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -86,6 +91,15 @@ async fn main() -> Result<()> {
     let (endpoints, _gadget_guard) = setup_functionfs(&args).context("setup FunctionFS")?;
 
     let mut ublk = SmooUblk::new().context("init ublk")?;
+    let state_file = args
+        .state_file
+        .as_ref()
+        .map(|path| StateFile::new(path.clone()));
+    if let Some(file) = &state_file {
+        info!(path = ?file.path(), "state file configured");
+    } else {
+        debug!("state file disabled; crash recovery off");
+    }
 
     let ident = Ident::new(0, 1);
     let dma_heap = if args.no_dma_buf {
@@ -101,6 +115,13 @@ async fn main() -> Result<()> {
         dma_heap,
     );
     let mut gadget = SmooGadget::new(endpoints, gadget_config).context("init smoo gadget core")?;
+    let recovered_device = if let Some(state_file) = state_file.as_ref() {
+        attempt_recovery(&mut ublk, state_file)
+            .await
+            .context("attempt ublk recovery")?
+    } else {
+        None
+    };
     enum SetupAwait {
         Configured,
         Interrupted,
@@ -146,16 +167,25 @@ async fn main() -> Result<()> {
     let runtime = RuntimeConfig {
         queue_count: args.queue_count,
         queue_depth: args.queue_depth,
+        state_file: state_file.clone(),
     };
-    let result = run_event_loop(&mut ublk, gadget, runtime, control_rx).await;
+    let result = run_event_loop(&mut ublk, gadget, runtime, recovered_device, control_rx).await;
     control_task.abort();
     let _ = control_task.await;
     result
 }
 
+#[derive(Clone)]
 struct RuntimeConfig {
     queue_count: u16,
     queue_depth: u16,
+    state_file: Option<StateFile>,
+}
+
+impl RuntimeConfig {
+    fn state_file(&self) -> Option<&StateFile> {
+        self.state_file.as_ref()
+    }
 }
 
 struct ConfigCommand {
@@ -171,9 +201,9 @@ async fn run_event_loop(
     ublk: &mut SmooUblk,
     mut gadget: SmooGadget,
     runtime: RuntimeConfig,
+    mut device: Option<SmooUblkDevice>,
     mut control_rx: mpsc::Receiver<ControlMessage>,
 ) -> Result<()> {
-    let mut device: Option<SmooUblkDevice> = None;
     let shutdown = signal::ctrl_c();
     tokio::pin!(shutdown);
 
@@ -253,7 +283,8 @@ async fn handle_request(
     device: &SmooUblkDevice,
     req: UblkIoRequest,
 ) -> Result<()> {
-    let req_len = match request_byte_len(&req, device.block_size()) {
+    let block_size = device.block_size();
+    let req_len = match request_byte_len(&req, block_size) {
         Ok(len) => len,
         Err(err) => {
             let errno = errno_from_io(&err);
@@ -490,6 +521,80 @@ fn errno_from_io(err: &io::Error) -> i32 {
     })
 }
 
+async fn attempt_recovery(
+    ublk: &mut SmooUblk,
+    state_file: &StateFile,
+) -> Result<Option<SmooUblkDevice>> {
+    let export_state = match state_file.load() {
+        Ok(Some(state)) => state,
+        Ok(None) => {
+            debug!("state file missing or empty; starting cold");
+            return Ok(None);
+        }
+        Err(err) => {
+            warn!(
+                path = ?state_file.path(),
+                error = ?err,
+                "failed to read state file; ignoring"
+            );
+            let _ = state_file.clear();
+            return Ok(None);
+        }
+    };
+    info!(
+        path = ?state_file.path(),
+        dev_id = export_state.ublk_dev_id,
+        block_size = export_state.block_size,
+        size_bytes = export_state.size_bytes,
+        queue_count = export_state.queue_count,
+        queue_depth = export_state.queue_depth,
+        ioctl_encode = export_state.ioctl_encode,
+        "state file found, attempting ublk recovery"
+    );
+    if export_state.size_bytes == 0 || export_state.block_size == 0 {
+        warn!("state file missing block size or size bytes; removing and starting cold");
+        let _ = state_file.clear();
+        return Ok(None);
+    }
+    if export_state.size_bytes % export_state.block_size as u64 != 0 {
+        warn!(
+            size_bytes = export_state.size_bytes,
+            block_size = export_state.block_size,
+            "state file size is not aligned to block size; removing"
+        );
+        let _ = state_file.clear();
+        return Ok(None);
+    }
+    let block_count_u64 = export_state.size_bytes / export_state.block_size as u64;
+    let block_count =
+        usize::try_from(block_count_u64).context("state export size exceeds usize for recovery")?;
+    match ublk
+        .recover_device(
+            export_state.ublk_dev_id,
+            export_state.block_size as usize,
+            block_count,
+            export_state.queue_count,
+            export_state.queue_depth,
+            export_state.ioctl_encode,
+        )
+        .await
+    {
+        Ok(device) => {
+            info!(dev_id = export_state.ublk_dev_id, "ublk recovery succeeded");
+            Ok(Some(device))
+        }
+        Err(err) => {
+            warn!(
+                dev_id = export_state.ublk_dev_id,
+                error = ?err,
+                "ublk recovery failed; removing state file"
+            );
+            let _ = state_file.clear();
+            Ok(None)
+        }
+    }
+}
+
 async fn process_control_message(
     msg: ControlMessage,
     ublk: &mut SmooUblk,
@@ -522,6 +627,11 @@ async fn apply_config(
             } else {
                 info!("CONFIG_EXPORTS requested zero exports (already idle)");
             }
+            if let Some(state_file) = runtime.state_file() {
+                if let Err(err) = state_file.clear() {
+                    warn!(error = ?err, "failed to clear state file");
+                }
+            }
             Ok(())
         }
         Some(export) => {
@@ -535,7 +645,8 @@ async fn apply_config(
                 .checked_div(block_size as u64)
                 .context("size bytes smaller than block size")?;
             ensure!(blocks > 0, "export size too small");
-            let block_count = usize::try_from(blocks).context("block count exceeds usize")?;
+            let block_count =
+                usize::try_from(blocks).context("block count exceeds usize capacity")?;
             if let Some(device) = device_slot.take() {
                 info!("CONFIG_EXPORTS replacing existing export");
                 ublk.stop_dev(device, true)
@@ -553,7 +664,22 @@ async fn apply_config(
                 )
                 .await
                 .context("setup ublk device from CONFIG_EXPORTS")?;
+            let dev_id = new_device.dev_id();
+            let ioctl_encode = new_device.ioctl_encode();
             *device_slot = Some(new_device);
+            if let Some(state_file) = runtime.state_file() {
+                let export_state = ExportState {
+                    block_size: export.block_size,
+                    size_bytes: export.size_bytes,
+                    ublk_dev_id: dev_id,
+                    queue_count: runtime.queue_count,
+                    queue_depth: runtime.queue_depth,
+                    ioctl_encode,
+                };
+                if let Err(err) = state_file.store(&export_state) {
+                    warn!(error = ?err, "failed to write state file");
+                }
+            }
             Ok(())
         }
     }
@@ -665,4 +791,110 @@ fn to_owned_fd(file: File) -> OwnedFd {
 fn parse_hex_u16(input: &str) -> Result<u16, String> {
     let trimmed = input.trim_start_matches("0x").trim_start_matches("0X");
     u16::from_str_radix(trimmed, 16).map_err(|err| err.to_string())
+}
+
+mod state {
+    use super::*;
+    use serde::{Deserialize, Serialize};
+    use std::{
+        fs, io,
+        path::{Path, PathBuf},
+    };
+
+    #[derive(Clone)]
+    pub struct StateFile {
+        path: PathBuf,
+    }
+
+    impl StateFile {
+        pub fn new(path: PathBuf) -> Self {
+            Self { path }
+        }
+
+        pub fn path(&self) -> &Path {
+            &self.path
+        }
+
+        pub fn load(&self) -> Result<Option<ExportState>> {
+            let data = match fs::read(&self.path) {
+                Ok(data) => data,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(err) => {
+                    return Err(err).context(format!("read state file {}", self.path.display()))
+                }
+            };
+            let snapshot: Snapshot = serde_json::from_slice(&data).context("decode state file")?;
+            ensure!(
+                snapshot.version == 0,
+                "unsupported state file version {}",
+                snapshot.version
+            );
+            Ok(snapshot.export)
+        }
+
+        pub fn store(&self, export: &ExportState) -> Result<()> {
+            if let Some(dir) = self.path.parent() {
+                fs::create_dir_all(dir).context(format!("create {}", dir.display()))?;
+            }
+            let snapshot = Snapshot {
+                version: 0,
+                export: Some(export.clone()),
+            };
+            let data = serde_json::to_vec_pretty(&snapshot).context("encode state snapshot")?;
+            let tmp_path = self.path.with_extension("tmp");
+            fs::write(&tmp_path, &data).context(format!("write {}", tmp_path.display()))?;
+            fs::rename(&tmp_path, &self.path).context(format!("commit {}", self.path.display()))
+        }
+
+        pub fn clear(&self) -> Result<()> {
+            match fs::remove_file(&self.path) {
+                Ok(()) => Ok(()),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(err) => Err(err).context(format!("remove state file {}", self.path.display())),
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ExportState {
+        pub block_size: u32,
+        pub size_bytes: u64,
+        pub ublk_dev_id: u32,
+        pub queue_count: u16,
+        pub queue_depth: u16,
+        pub ioctl_encode: bool,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct Snapshot {
+        version: u32,
+        #[serde(default)]
+        export: Option<ExportState>,
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use tempfile::tempdir;
+
+        #[test]
+        fn round_trip_state_file() {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("state.json");
+            let state_file = StateFile::new(path.clone());
+            let export = ExportState {
+                block_size: 4096,
+                size_bytes: 4096 * 128,
+                ublk_dev_id: 7,
+                queue_count: 2,
+                queue_depth: 16,
+                ioctl_encode: true,
+            };
+            state_file.store(&export).unwrap();
+            let loaded = state_file.load().unwrap().expect("export");
+            assert_eq!(export, loaded);
+            state_file.clear().unwrap();
+            assert!(state_file.load().unwrap().is_none());
+        }
+    }
 }
