@@ -29,6 +29,7 @@ const SMOO_CLASS: u8 = 0xFF;
 const SMOO_SUBCLASS: u8 = 0x53;
 const SMOO_PROTOCOL: u8 = 0x4D;
 const SMOO_IDENT_REQ_TYPE: u8 = 0xC1;
+const DEFAULT_MAX_IO_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "smoo-gadget-cli")]
@@ -46,12 +47,6 @@ struct Args {
     /// Depth of each ublk queue.
     #[arg(long, default_value_t = 16)]
     queue_depth: u16,
-    /// Logical block size presented to the kernel (bytes).
-    #[arg(long, default_value_t = 512)]
-    block_size: u32,
-    /// Logical block count to expose.
-    #[arg(long, value_name = "BLOCKS")]
-    blocks: u64,
     /// Disable the DMA-BUF fast path even if the kernel advertises support.
     #[arg(long)]
     no_dma_buf: bool,
@@ -87,19 +82,10 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    ensure!(
-        args.block_size.is_power_of_two(),
-        "block size must be a power-of-two"
-    );
-    let default_block_count = usize::try_from(args.blocks).context("block count exceeds usize")?;
-
     usb_gadget::remove_all().context("remove existing USB gadgets")?;
     let (endpoints, _gadget_guard) = setup_functionfs(&args).context("setup FunctionFS")?;
 
     let mut ublk = SmooUblk::new().context("init ublk")?;
-    let max_block_size = args.block_size as usize;
-    let max_io_bytes = SmooUblk::max_io_bytes_hint(max_block_size, args.queue_depth)
-        .context("compute max io bytes")?;
 
     let ident = Ident::new(0, 1);
     let dma_heap = if args.no_dma_buf {
@@ -111,7 +97,7 @@ async fn main() -> Result<()> {
         ident,
         args.queue_count,
         args.queue_depth,
-        max_io_bytes,
+        DEFAULT_MAX_IO_BYTES,
         dma_heap,
     );
     let mut gadget = SmooGadget::new(endpoints, gadget_config).context("init smoo gadget core")?;
@@ -160,8 +146,6 @@ async fn main() -> Result<()> {
     let runtime = RuntimeConfig {
         queue_count: args.queue_count,
         queue_depth: args.queue_depth,
-        max_block_size,
-        default_block_count,
     };
     let result = run_event_loop(&mut ublk, gadget, runtime, control_rx).await;
     control_task.abort();
@@ -172,8 +156,6 @@ async fn main() -> Result<()> {
 struct RuntimeConfig {
     queue_count: u16,
     queue_depth: u16,
-    max_block_size: usize,
-    default_block_count: usize,
 }
 
 struct ConfigCommand {
@@ -192,14 +174,12 @@ async fn run_event_loop(
     mut control_rx: mpsc::Receiver<ControlMessage>,
 ) -> Result<()> {
     let mut device: Option<SmooUblkDevice> = None;
-    let mut current_block_size: Option<usize> = None;
     let shutdown = signal::ctrl_c();
     tokio::pin!(shutdown);
 
     let mut io_error = None;
     loop {
         if let Some(active_device) = device.as_ref() {
-            let block_size = current_block_size.expect("block size must be set when device active");
             tokio::select! {
                 _ = &mut shutdown => {
                     info!("shutdown signal received");
@@ -212,7 +192,6 @@ async fn run_event_loop(
                             ublk,
                             &mut device,
                             &runtime,
-                            &mut current_block_size,
                         )
                         .await?;
                     } else {
@@ -227,7 +206,7 @@ async fn run_event_loop(
                             break;
                         }
                     };
-                    if let Err(err) = handle_request(&mut gadget, active_device, req, block_size).await {
+                    if let Err(err) = handle_request(&mut gadget, active_device, req).await {
                         io_error = Some(err);
                         break;
                     }
@@ -246,7 +225,6 @@ async fn run_event_loop(
                             ublk,
                             &mut device,
                             &runtime,
-                            &mut current_block_size,
                         )
                         .await?;
                     } else {
@@ -274,9 +252,8 @@ async fn handle_request(
     gadget: &mut SmooGadget,
     device: &SmooUblkDevice,
     req: UblkIoRequest,
-    block_size: usize,
 ) -> Result<()> {
-    let req_len = match request_byte_len(&req, block_size) {
+    let req_len = match request_byte_len(&req, device.block_size()) {
         Ok(len) => len,
         Err(err) => {
             let errno = errno_from_io(&err);
@@ -518,16 +495,10 @@ async fn process_control_message(
     ublk: &mut SmooUblk,
     device: &mut Option<SmooUblkDevice>,
     runtime: &RuntimeConfig,
-    current_block_size: &mut Option<usize>,
 ) -> Result<()> {
     match msg {
         ControlMessage::Config(cmd) => {
             let result = apply_config(ublk, device, runtime, cmd.payload).await;
-            if let Ok(Some(bs)) = result.as_ref() {
-                *current_block_size = Some(*bs);
-            } else if result.is_ok() {
-                *current_block_size = None;
-            }
             let reply = result.map(|_| ());
             let _ = cmd.respond_to.send(reply);
         }
@@ -540,7 +511,7 @@ async fn apply_config(
     device_slot: &mut Option<SmooUblkDevice>,
     runtime: &RuntimeConfig,
     config: ConfigExportsV0,
-) -> Result<Option<usize>> {
+) -> Result<()> {
     match config.export() {
         None => {
             if let Some(device) = device_slot.take() {
@@ -551,26 +522,20 @@ async fn apply_config(
             } else {
                 info!("CONFIG_EXPORTS requested zero exports (already idle)");
             }
-            Ok(None)
+            Ok(())
         }
         Some(export) => {
             let block_size = export.block_size as usize;
             ensure!(
-                block_size <= runtime.max_block_size,
-                "requested block size {} exceeds gadget limit {}",
-                block_size,
-                runtime.max_block_size
+                export.size_bytes != 0,
+                "CONFIG_EXPORTS size_bytes must be non-zero"
             );
-            let block_count = if export.size_bytes == 0 {
-                runtime.default_block_count
-            } else {
-                let blocks = export
-                    .size_bytes
-                    .checked_div(block_size as u64)
-                    .context("size bytes smaller than block size")?;
-                ensure!(blocks > 0, "export size too small");
-                usize::try_from(blocks).context("block count exceeds usize")?
-            };
+            let blocks = export
+                .size_bytes
+                .checked_div(block_size as u64)
+                .context("size bytes smaller than block size")?;
+            ensure!(blocks > 0, "export size too small");
+            let block_count = usize::try_from(blocks).context("block count exceeds usize")?;
             if let Some(device) = device_slot.take() {
                 info!("CONFIG_EXPORTS replacing existing export");
                 ublk.stop_dev(device, true)
@@ -589,7 +554,7 @@ async fn apply_config(
                 .await
                 .context("setup ublk device from CONFIG_EXPORTS")?;
             *device_slot = Some(new_device);
-            Ok(Some(block_size))
+            Ok(())
         }
     }
 }
