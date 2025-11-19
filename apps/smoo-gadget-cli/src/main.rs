@@ -5,7 +5,7 @@ use smoo_gadget_core::{
     ConfigExportsV0, DmaHeap, Ep0Controller, Ep0Event, ExportConfig, FunctionfsEndpoints,
     GadgetConfig, SetupPacket, SmooGadget, CONFIG_EXPORTS_REQUEST, SMOO_CONFIG_REQ_TYPE,
 };
-use smoo_gadget_ublk::{SmooUblk, SmooUblkDevice, UblkBuffer, UblkIoRequest, UblkOp};
+use smoo_gadget_ublk::{DeviceState, SmooUblk, SmooUblkDevice, UblkBuffer, UblkIoRequest, UblkOp};
 use smoo_proto::{
     Ident, OpCode, Request, Response, SmooStatusV0, IDENT_LEN, IDENT_REQUEST,
     SMOO_STATUS_FLAG_EXPORT_ACTIVE, SMOO_STATUS_LEN, SMOO_STATUS_REQUEST, SMOO_STATUS_REQ_TYPE,
@@ -362,16 +362,37 @@ impl ExportSlot {
         }
     }
 
-    async fn wait_until_online(&mut self) -> Result<()> {
-        self.device
-            .wait_until_online()
-            .await
-            .with_context(|| format!("export {} START_DEV", self.export_id))
-    }
-
     fn into_device(mut self) -> SmooUblkDevice {
         self.stop_request_task();
         self.device
+    }
+
+    fn reconcile_device_state(&mut self) -> Option<DeviceState> {
+        match self.device.state() {
+            DeviceState::Online if self.lifecycle == ExportLifecycle::Starting => {
+                self.transition(ExportLifecycle::Online);
+                Some(DeviceState::Online)
+            }
+            DeviceState::Failed if self.lifecycle != ExportLifecycle::Failed => {
+                if let Some(err) = self.device.last_error() {
+                    warn!(
+                        export_id = self.export_id,
+                        dev_id = self.device.dev_id(),
+                        error = %err,
+                        "ublk device failed during startup"
+                    );
+                } else {
+                    warn!(
+                        export_id = self.export_id,
+                        dev_id = self.device.dev_id(),
+                        "ublk device failed during startup"
+                    );
+                }
+                self.transition(ExportLifecycle::Failed);
+                Some(DeviceState::Failed)
+            }
+            _ => None,
+        }
     }
 
     fn device(&self) -> &SmooUblkDevice {
@@ -429,6 +450,16 @@ impl ExportsRuntime {
 
     fn get_mut(&mut self, export_id: u32) -> Option<&mut ExportSlot> {
         self.entries.get_mut(&export_id)
+    }
+
+    fn refresh_lifecycles(&mut self) -> Vec<u32> {
+        let mut failed = Vec::new();
+        for slot in self.entries.values_mut() {
+            if matches!(slot.reconcile_device_state(), Some(DeviceState::Failed)) {
+                failed.push(slot.export_id);
+            }
+        }
+        failed
     }
 
     async fn remove(&mut self, export_id: u32, ublk: &mut SmooUblk) -> Result<()> {
@@ -489,6 +520,13 @@ async fn run_event_loop(
 
     let mut io_error = None;
     loop {
+        let failed_exports = exports.refresh_lifecycles();
+        for export_id in failed_exports {
+            warn!(export_id, "removing failed export");
+            if let Err(err) = exports.remove(export_id, ublk).await {
+                warn!(export_id, error = ?err, "failed to remove failed export");
+            }
+        }
         if exports.is_empty() {
             tokio::select! {
                 _ = &mut shutdown => {
@@ -1189,26 +1227,6 @@ async fn provision_export_slot(
     slot.start_request_task(runtime.pending_tx())
         .with_context(|| format!("spawn request loop for export {}", entry.export_id))?;
     slot.transition(ExportLifecycle::Starting);
-    if let Err(err) = slot.wait_until_online().await {
-        slot.transition(ExportLifecycle::Failed);
-        warn!(
-            export_id = entry.export_id,
-            dev_id = slot.device().dev_id(),
-            state = %slot.device().state(),
-            error = ?err,
-            "START_DEV failed; cleaning up export"
-        );
-        let device = slot.into_device();
-        if let Err(stop_err) = ublk.stop_dev(device, true).await {
-            warn!(
-                export_id = entry.export_id,
-                error = ?stop_err,
-                "failed to remove ublk device after START_DEV failure"
-            );
-        }
-        return Err(err);
-    }
-    slot.transition(ExportLifecycle::Online);
     Ok(slot)
 }
 
