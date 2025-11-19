@@ -1,0 +1,31 @@
+[package]
+name = "smoo-host-transport-webusb"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+
+[dependencies]
+async-trait = "0.1.89"
+js-sys = "0.3.82"
+smoo-host-core = { path = "../smoo-host-core" }
+smoo-proto = { path = "../smoo-proto" }
+wasm-bindgen = "0.2.105"
+wasm-bindgen-futures = "0.4.55"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-sys = { version = "0.3.82", features = [
+    "DomException",
+    "UsbAlternateInterface",
+    "UsbConfiguration",
+    "UsbControlTransferParameters",
+    "UsbDevice",
+    "UsbDirection",
+    "UsbEndpoint",
+    "UsbEndpointType",
+    "UsbInTransferResult",
+    "UsbInterface",
+    "UsbOutTransferResult",
+    "UsbRecipient",
+    "UsbRequestType",
+    "UsbTransferStatus",
+] }
