@@ -5,15 +5,11 @@ use clap::{Parser, ValueEnum};
 use rand::{rngs::OsRng, RngCore};
 use smoo_gadget_core::{
     ConfigExportsV0, DmaHeap, Ep0Controller, Ep0Event, FunctionfsEndpoints, GadgetConfig,
-    SetupPacket, SmooGadget, CONFIG_EXPORTS_REQUEST, SMOO_CONFIG_REQ_TYPE,
+    GadgetControl, GadgetStatusReport, SetupCommand, SmooGadget,
 };
 use smoo_gadget_ublk::{SmooUblk, SmooUblkDevice, UblkBuffer, UblkIoRequest, UblkOp};
-use smoo_proto::{
-    Ident, OpCode, Request, Response, SmooStatusV0, IDENT_LEN, IDENT_REQUEST,
-    SMOO_STATUS_FLAG_EXPORT_ACTIVE, SMOO_STATUS_LEN, SMOO_STATUS_REQUEST, SMOO_STATUS_REQ_TYPE,
-};
+use smoo_proto::{Ident, OpCode, Request, Response};
 use std::{
-    cmp,
     fs::File,
     io,
     io::Write,
@@ -23,7 +19,7 @@ use std::{
 };
 use tokio::{
     signal,
-    sync::{mpsc, oneshot, RwLock},
+    sync::{mpsc, RwLock},
 };
 use tracing::{debug, info, warn};
 use tracing_subscriber::prelude::*;
@@ -35,7 +31,6 @@ use usb_gadget::{
 const SMOO_CLASS: u8 = 0xFF;
 const SMOO_SUBCLASS: u8 = 0x53;
 const SMOO_PROTOCOL: u8 = 0x4D;
-const SMOO_IDENT_REQ_TYPE: u8 = 0xC1;
 const DEFAULT_MAX_IO_BYTES: usize = 4 * 1024 * 1024;
 const SINGLE_EXPORT_ID: u32 = 0;
 
@@ -96,7 +91,7 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     usb_gadget::remove_all().context("remove existing USB gadgets")?;
-    let (endpoints, _gadget_guard) = setup_functionfs(&args).context("setup FunctionFS")?;
+    let (ep0, endpoints, _gadget_guard) = setup_functionfs(&args).context("setup FunctionFS")?;
 
     let mut ublk = SmooUblk::new().context("init ublk")?;
     let state_file = args
@@ -123,36 +118,7 @@ async fn main() -> Result<()> {
         DEFAULT_MAX_IO_BYTES,
         dma_heap,
     );
-    let mut gadget = SmooGadget::new(endpoints, gadget_config).context("init smoo gadget core")?;
-    enum SetupAwait {
-        Configured,
-        Interrupted,
-    }
-    let setup_outcome = {
-        #[allow(unused_mut)]
-        let mut setup_fut = gadget.setup();
-        tokio::pin!(setup_fut);
-        #[allow(unused_mut)]
-        let mut setup_shutdown = signal::ctrl_c();
-        tokio::pin!(setup_shutdown);
-        tokio::select! {
-            res = &mut setup_fut => {
-                res.context("complete FunctionFS setup")?;
-                SetupAwait::Configured
-            }
-            res = &mut setup_shutdown => {
-                if let Err(err) = res {
-                    warn!(error = ?err, "ctrl-c listener failed during FunctionFS setup");
-                }
-                SetupAwait::Interrupted
-            }
-        }
-    };
-
-    if matches!(setup_outcome, SetupAwait::Interrupted) {
-        info!("shutdown requested before host completed ident exchange");
-        return Ok(());
-    }
+    let gadget = SmooGadget::new(endpoints, gadget_config).context("init smoo gadget core")?;
     info!(
         ident_major = ident.major,
         ident_minor = ident.minor,
@@ -161,12 +127,15 @@ async fn main() -> Result<()> {
         "smoo gadget initialized"
     );
 
-    let ep0 = gadget
-        .take_ep0_controller()
-        .context("ep0 controller already taken")?;
+    let control_handler = gadget.control_handler();
     let (control_tx, control_rx) = mpsc::channel(8);
     let status = GadgetStatusShared::new(GadgetStatus::new(session_id, 0));
-    let control_task = tokio::spawn(control_loop(ep0, ident, status.clone(), control_tx));
+    let control_task = tokio::spawn(control_loop(
+        ep0,
+        control_handler,
+        status.clone(),
+        control_tx,
+    ));
     let runtime = RuntimeConfig {
         queue_count: args.queue_count,
         queue_depth: args.queue_depth,
@@ -192,10 +161,6 @@ impl GadgetStatus {
             export_count,
         }
     }
-
-    fn export_active(&self) -> bool {
-        self.export_count > 0
-    }
 }
 
 #[derive(Clone)]
@@ -216,6 +181,11 @@ impl GadgetStatusShared {
 
     async fn session_id(&self) -> u64 {
         self.inner.read().await.session_id
+    }
+
+    async fn report(&self) -> GadgetStatusReport {
+        let snapshot = self.snapshot().await;
+        GadgetStatusReport::new(snapshot.session_id, snapshot.export_count)
     }
 
     async fn set_export_count(&self, export_count: u32) {
@@ -251,13 +221,8 @@ fn generate_session_id() -> u64 {
     }
 }
 
-struct ConfigCommand {
-    payload: ConfigExportsV0,
-    respond_to: oneshot::Sender<Result<()>>,
-}
-
 enum ControlMessage {
-    Config(ConfigCommand),
+    Config(ConfigExportsV0),
 }
 
 async fn run_event_loop(
@@ -460,9 +425,9 @@ async fn handle_request(
 
 async fn control_loop(
     mut ep0: Ep0Controller,
-    ident: Ident,
+    handler: GadgetControl,
     status: GadgetStatusShared,
-    mut tx: mpsc::Sender<ControlMessage>,
+    tx: mpsc::Sender<ControlMessage>,
 ) -> Result<()> {
     loop {
         let event = ep0
@@ -477,124 +442,21 @@ async fn control_loop(
             Ep0Event::Suspend => debug!("FunctionFS suspend event (control loop)"),
             Ep0Event::Resume => debug!("FunctionFS resume event (control loop)"),
             Ep0Event::Setup(setup) => {
-                if setup.request() == IDENT_REQUEST && setup.request_type() == SMOO_IDENT_REQ_TYPE {
-                    if let Err(err) = respond_ident(&mut ep0, ident, setup).await {
-                        warn!(error = ?err, "failed to reply to IDENT");
-                        ep0.stall().await.context("stall IDENT failure")?;
+                let report = status.report().await;
+                match handler.handle_setup_packet(&mut ep0, setup, &report).await {
+                    Ok(Some(SetupCommand::Config(payload))) => {
+                        if tx.send(ControlMessage::Config(payload)).await.is_err() {
+                            anyhow::bail!("control channel closed");
+                        }
                     }
-                    continue;
-                }
-                if setup.request() == CONFIG_EXPORTS_REQUEST
-                    && setup.request_type() == SMOO_CONFIG_REQ_TYPE
-                {
-                    if let Err(err) = handle_config_request(&mut ep0, setup, &mut tx).await {
-                        warn!(error = ?err, "CONFIG_EXPORTS failed");
-                        ep0.stall().await.context("stall CONFIG_EXPORTS failure")?;
+                    Ok(None) => {}
+                    Err(err) => {
+                        warn!(error = ?err, "vendor setup handling failed");
+                        ep0.stall().await.context("stall vendor request failure")?;
                     }
-                    continue;
                 }
-                if setup.request() == SMOO_STATUS_REQUEST
-                    && setup.request_type() == SMOO_STATUS_REQ_TYPE
-                {
-                    if let Err(err) = respond_status(&mut ep0, setup, &status).await {
-                        warn!(error = ?err, "SMOO_STATUS failed");
-                        ep0.stall().await.context("stall SMOO_STATUS failure")?;
-                    }
-                    continue;
-                }
-                warn!(
-                    request = setup.request(),
-                    request_type = setup.request_type(),
-                    length = setup.length(),
-                    "unsupported control request"
-                );
-                ep0.stall().await.context("stall unsupported request")?;
             }
         }
-    }
-}
-
-async fn respond_ident(ep0: &mut Ep0Controller, ident: Ident, setup: SetupPacket) -> Result<()> {
-    ensure!(
-        setup.request_type() & 0x80 != 0,
-        "IDENT must be an IN transfer"
-    );
-    ensure!(
-        setup.length() as usize >= IDENT_LEN,
-        "IDENT buffer too small"
-    );
-    let encoded = ident.encode();
-    let len = cmp::min(encoded.len(), setup.length() as usize);
-    ep0.write_in(&encoded[..len])
-        .await
-        .context("write IDENT response")
-}
-
-async fn respond_status(
-    ep0: &mut Ep0Controller,
-    setup: SetupPacket,
-    status: &GadgetStatusShared,
-) -> Result<()> {
-    ensure!(
-        setup.request_type() == SMOO_STATUS_REQ_TYPE,
-        "SMOO_STATUS request type mismatch"
-    );
-    ensure!(
-        setup.request_type() & 0x80 != 0,
-        "SMOO_STATUS must be an IN transfer"
-    );
-    ensure!(
-        setup.length() as usize >= SMOO_STATUS_LEN,
-        "SMOO_STATUS buffer too small"
-    );
-    let snapshot = status.snapshot().await;
-    let mut flags = 0;
-    if snapshot.export_active() {
-        flags |= SMOO_STATUS_FLAG_EXPORT_ACTIVE;
-    }
-    let payload = SmooStatusV0::new(flags, snapshot.export_count, snapshot.session_id);
-    debug!(
-        export_count = snapshot.export_count,
-        export_active = snapshot.export_active(),
-        session_id = snapshot.session_id,
-        "responding to SMOO_STATUS"
-    );
-    let encoded = payload.encode();
-    let len = cmp::min(encoded.len(), setup.length() as usize);
-    ep0.write_in(&encoded[..len])
-        .await
-        .context("write SMOO_STATUS response")
-}
-
-async fn handle_config_request(
-    ep0: &mut Ep0Controller,
-    setup: SetupPacket,
-    tx: &mut mpsc::Sender<ControlMessage>,
-) -> Result<()> {
-    ensure!(
-        setup.length() as usize == ConfigExportsV0::ENCODED_LEN,
-        "CONFIG_EXPORTS payload length mismatch"
-    );
-    let mut buf = [0u8; ConfigExportsV0::ENCODED_LEN];
-    ep0.read_out(&mut buf)
-        .await
-        .context("read CONFIG_EXPORTS")?;
-    let config = ConfigExportsV0::parse(&buf).context("parse CONFIG_EXPORTS payload")?;
-    let (respond_to, response_rx) = oneshot::channel();
-    let cmd = ConfigCommand {
-        payload: config,
-        respond_to,
-    };
-    if tx.send(ControlMessage::Config(cmd)).await.is_err() {
-        anyhow::bail!("control channel closed");
-    }
-    match response_rx.await {
-        Ok(Ok(())) => {
-            ep0.write_in(&[]).await.context("ACK CONFIG_EXPORTS")?;
-            Ok(())
-        }
-        Ok(Err(err)) => Err(err),
-        Err(_) => anyhow::bail!("config responder dropped"),
     }
 }
 
@@ -785,10 +647,10 @@ async fn process_control_message(
     runtime: &RuntimeConfig,
 ) -> Result<()> {
     match msg {
-        ControlMessage::Config(cmd) => {
-            let result = apply_config(ublk, device, runtime, cmd.payload).await;
-            let reply = result.map(|_| ());
-            let _ = cmd.respond_to.send(reply);
+        ControlMessage::Config(config) => {
+            if let Err(err) = apply_config(ublk, device, runtime, config).await {
+                warn!(error = ?err, "CONFIG_EXPORTS application failed");
+            }
         }
     }
     Ok(())
@@ -901,7 +763,7 @@ struct GadgetGuard {
     registration: RegGadget,
 }
 
-fn setup_functionfs(args: &Args) -> Result<(FunctionfsEndpoints, GadgetGuard)> {
+fn setup_functionfs(args: &Args) -> Result<(Ep0Controller, FunctionfsEndpoints, GadgetGuard)> {
     let mut builder = Custom::builder().with_interface(
         Interface::new(Class::vendor_specific(SMOO_SUBCLASS, SMOO_PROTOCOL), "smoo")
             .with_endpoint(interrupt_in_ep())
@@ -936,15 +798,11 @@ fn setup_functionfs(args: &Args) -> Result<(FunctionfsEndpoints, GadgetGuard)> {
     let interrupt_out = open_endpoint_fd(ffs_dir.join("ep2")).context("open interrupt OUT")?;
     let bulk_in = open_endpoint_fd(ffs_dir.join("ep3")).context("open bulk IN")?;
     let bulk_out = open_endpoint_fd(ffs_dir.join("ep4")).context("open bulk OUT")?;
-    let endpoints = FunctionfsEndpoints::new(
-        to_owned_fd(ep0),
-        interrupt_in,
-        interrupt_out,
-        bulk_in,
-        bulk_out,
-    );
+    let ep0 = Ep0Controller::from_owned_fd(to_owned_fd(ep0)).context("wrap ep0 controller")?;
+    let endpoints = FunctionfsEndpoints::new(interrupt_in, interrupt_out, bulk_in, bulk_out);
 
     Ok((
+        ep0,
         endpoints,
         GadgetGuard {
             custom,

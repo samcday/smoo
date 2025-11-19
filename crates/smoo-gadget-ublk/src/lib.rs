@@ -228,11 +228,8 @@ impl SmooUblk {
                         );
                     }
 
-                    let completion = completion.unwrap_or_else(|| {
-                        Err(io::Error::other(
-                            "ctrl completion missing result",
-                        ))
-                    });
+                    let completion = completion
+                        .unwrap_or_else(|| Err(io::Error::other("ctrl completion missing result")));
                     let completion_code = match &completion {
                         Ok(res) => *res,
                         Err(err) => -err.raw_os_error().unwrap_or(libc::EIO),
@@ -303,7 +300,14 @@ impl SmooUblk {
         };
         cmd.len = params.len as u16;
         cmd.addr = &mut params as *mut _ as u64;
-        submit_ctrl_command(&self.sender, UBLK_CMD_GET_PARAMS, cmd, "get params", Some(Duration::from_secs(1))).await?;
+        submit_ctrl_command(
+            &self.sender,
+            UBLK_CMD_GET_PARAMS,
+            cmd,
+            "get params",
+            Some(Duration::from_secs(1)),
+        )
+        .await?;
         Ok(params)
     }
 
@@ -749,9 +753,10 @@ impl Drop for SmooUblk {
     fn drop(&mut self) {
         self.sender.close();
         if let Some(handle) = self.handle.take()
-            && let Err(err) = handle.join() {
-                warn!("smoo-gadget-ublk ctrl loop panicked: {:?}", err);
-            }
+            && let Err(err) = handle.join()
+        {
+            warn!("smoo-gadget-ublk ctrl loop panicked: {:?}", err);
+        }
     }
 }
 
@@ -858,9 +863,10 @@ impl SmooUblkDevice {
             }
         }
         if let Some(handle) = self.start_handle.take()
-            && let Err(err) = handle.join() {
-                error!("start_dev thread join failed: {:?}", err);
-            }
+            && let Err(err) = handle.join()
+        {
+            error!("start_dev thread join failed: {:?}", err);
+        }
     }
 }
 

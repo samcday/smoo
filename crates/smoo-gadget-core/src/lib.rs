@@ -1,6 +1,10 @@
 use anyhow::{Context, Result, anyhow, ensure};
 use dma_heap::HeapKind;
-use smoo_proto::{IDENT_LEN, IDENT_REQUEST, Ident, RESPONSE_LEN, Request, Response};
+use smoo_proto::{
+    IDENT_LEN, IDENT_REQUEST, Ident, RESPONSE_LEN, Request, Response,
+    SMOO_STATUS_FLAG_EXPORT_ACTIVE, SMOO_STATUS_LEN, SMOO_STATUS_REQ_TYPE, SMOO_STATUS_REQUEST,
+    SmooStatusV0,
+};
 use std::{
     cmp,
     fs::File as StdFile,
@@ -12,7 +16,6 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     task,
 };
-use tracing::{debug, trace, warn};
 
 mod dma;
 
@@ -100,9 +103,8 @@ pub struct SingleExport {
 const SETUP_STAGE_LEN: usize = 8;
 const FUNCTIONFS_EVENT_SIZE: usize = SETUP_STAGE_LEN + 4;
 
-/// File descriptor bundle for a FunctionFS interface.
+/// File descriptor bundle for a FunctionFS interface (data-plane endpoints only).
 pub struct FunctionfsEndpoints {
-    pub ep0: OwnedFd,
     pub interrupt_in: OwnedFd,
     pub interrupt_out: OwnedFd,
     pub bulk_in: OwnedFd,
@@ -111,14 +113,12 @@ pub struct FunctionfsEndpoints {
 
 impl FunctionfsEndpoints {
     pub fn new(
-        ep0: OwnedFd,
         interrupt_in: OwnedFd,
         interrupt_out: OwnedFd,
         bulk_in: OwnedFd,
         bulk_out: OwnedFd,
     ) -> Self {
         Self {
-            ep0,
             interrupt_in,
             interrupt_out,
             bulk_in,
@@ -139,6 +139,12 @@ pub struct Ep0Controller {
 }
 
 impl Ep0Controller {
+    /// Construct a controller from a FunctionFS ep0 file descriptor.
+    pub fn from_owned_fd(fd: OwnedFd) -> io::Result<Self> {
+        let file = to_tokio_file(fd)?;
+        Ok(Self::new(file))
+    }
+
     fn new(ep0: File) -> Self {
         Self { ep0 }
     }
@@ -345,7 +351,6 @@ impl DmaHeap {
 
 /// High-level FunctionFS gadget driver.
 pub struct SmooGadget {
-    ep0: Option<Ep0Controller>,
     data_plane: GadgetDataPlane,
     ident: Ident,
 }
@@ -353,14 +358,12 @@ pub struct SmooGadget {
 impl SmooGadget {
     pub fn new(endpoints: FunctionfsEndpoints, config: GadgetConfig) -> Result<Self> {
         let FunctionfsEndpoints {
-            ep0,
             interrupt_in,
             interrupt_out,
             bulk_in,
             bulk_out,
         } = endpoints;
         Ok(Self {
-            ep0: Some(Ep0Controller::new(to_tokio_file(ep0)?)),
             data_plane: GadgetDataPlane::new(
                 interrupt_in,
                 interrupt_out,
@@ -373,66 +376,6 @@ impl SmooGadget {
             )?,
             ident: config.ident,
         })
-    }
-
-    /// Run the FunctionFS control handshake and reply to the GET_IDENT request.
-    pub async fn setup(&mut self) -> Result<()> {
-        if self.data_plane.configured {
-            return Ok(());
-        }
-        debug!("waiting for FunctionFS ident handshake");
-        loop {
-            let event = {
-                let ep0 = self
-                    .ep0
-                    .as_mut()
-                    .context("FunctionFS ep0 controller unavailable")?;
-                ep0.next_event().await.context("read FunctionFS event")?
-            };
-            trace!(?event, "ep0 event");
-            match event {
-                Ep0Event::Bind => {
-                    debug!("FunctionFS bind event received");
-                }
-                Ep0Event::Unbind => {
-                    debug!("FunctionFS unbind event received");
-                }
-                Ep0Event::Enable => {
-                    debug!("FunctionFS interface enabled");
-                }
-                Ep0Event::Suspend => {
-                    debug!("FunctionFS suspend event received");
-                }
-                Ep0Event::Resume => {
-                    debug!("FunctionFS resume event received");
-                }
-                Ep0Event::Disable => {
-                    debug!("FunctionFS disable event received");
-                    self.data_plane.configured = false;
-                }
-                Ep0Event::Setup(setup) => {
-                    debug!(
-                        request = setup.request(),
-                        request_type = setup.request_type(),
-                        length = setup.length(),
-                        "FunctionFS setup request"
-                    );
-                    if SmooGadget::handle_setup_request(
-                        self.ident,
-                        self.ep0
-                            .as_mut()
-                            .context("FunctionFS ep0 controller unavailable")?,
-                        setup,
-                    )
-                    .await?
-                    {
-                        self.data_plane.configured = true;
-                        debug!("FunctionFS ident handshake complete");
-                        return Ok(());
-                    }
-                }
-            }
-        }
     }
 
     /// Send a Request message to the host over the interrupt IN endpoint.
@@ -465,62 +408,6 @@ impl SmooGadget {
         self.data_plane.write_bulk_buffer(buf).await
     }
 
-    async fn handle_setup_request(
-        ident: Ident,
-        ep0: &mut Ep0Controller,
-        setup: SetupPacket,
-    ) -> Result<bool> {
-        if setup.request() == IDENT_REQUEST && setup.request_type() == SMOO_REQ_TYPE {
-            ensure!(
-                setup.direction() == ControlDirection::In,
-                "GET_IDENT must be an IN transfer"
-            );
-            ensure!(
-                setup.length() as usize >= IDENT_LEN,
-                "GET_IDENT length too small"
-            );
-            let ident = ident.encode();
-            let len = cmp::min(setup.length() as usize, ident.len());
-            ep0.write_in(&ident[..len])
-                .await
-                .context("reply to GET_IDENT")?;
-            return Ok(true);
-        }
-
-        if setup.request_type() & USB_DIR_IN == 0 && setup.length() == 0 {
-            trace!(
-                request = setup.request(),
-                "acknowledging status-only control request"
-            );
-            ep0.write_in(&[])
-                .await
-                .context("ack control status stage")?;
-            return Ok(false);
-        }
-
-        warn!(
-            request = setup.request(),
-            request_type = setup.request_type(),
-            length = setup.length(),
-            "unsupported setup request"
-        );
-        Err(anyhow!(
-            "unsupported setup request {:#x} type {:#x}",
-            setup.request(),
-            setup.request_type()
-        ))
-    }
-
-    /// Access the raw EP0 controller for custom control-plane handling.
-    pub fn ep0_mut(&mut self) -> Option<&mut Ep0Controller> {
-        self.ep0.as_mut()
-    }
-
-    /// Take ownership of the EP0 controller, preventing further use by [`SmooGadget`].
-    pub fn take_ep0_controller(&mut self) -> Option<Ep0Controller> {
-        self.ep0.take()
-    }
-
     /// Access the data-plane controller directly.
     pub fn data_plane_mut(&mut self) -> &mut GadgetDataPlane {
         &mut self.data_plane
@@ -530,6 +417,120 @@ impl SmooGadget {
     pub fn ident(&self) -> Ident {
         self.ident
     }
+
+    /// Create a control-plane helper for parsing vendor SETUP packets.
+    pub fn control_handler(&self) -> GadgetControl {
+        GadgetControl::new(self.ident)
+    }
+}
+
+/// Snapshot of dynamic gadget status advertised via SMOO_STATUS.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GadgetStatusReport {
+    pub session_id: u64,
+    pub export_count: u32,
+}
+
+impl GadgetStatusReport {
+    pub fn new(session_id: u64, export_count: u32) -> Self {
+        Self {
+            session_id,
+            export_count,
+        }
+    }
+
+    pub fn export_active(&self) -> bool {
+        self.export_count > 0
+    }
+}
+
+/// Control-plane helper that parses vendor SETUP packets and emits high-level commands.
+#[derive(Clone, Copy, Debug)]
+pub struct GadgetControl {
+    ident: Ident,
+}
+
+impl GadgetControl {
+    fn new(ident: Ident) -> Self {
+        Self { ident }
+    }
+
+    /// Handle a vendor-specific SETUP packet.
+    ///
+    /// Returns [`SetupCommand`] when additional action is required (e.g. CONFIG_EXPORTS).
+    /// All control responses/ACKs are written to `ep0` internally.
+    pub async fn handle_setup_packet(
+        &self,
+        ep0: &mut Ep0Controller,
+        setup: SetupPacket,
+        status: &GadgetStatusReport,
+    ) -> Result<Option<SetupCommand>> {
+        if setup.request() == IDENT_REQUEST && setup.request_type() == SMOO_REQ_TYPE {
+            ensure!(
+                setup.direction() == ControlDirection::In,
+                "GET_IDENT must be an IN transfer"
+            );
+            ensure!(
+                setup.length() as usize >= IDENT_LEN,
+                "GET_IDENT length too small"
+            );
+            let ident = self.ident.encode();
+            let len = cmp::min(setup.length() as usize, ident.len());
+            ep0.write_in(&ident[..len])
+                .await
+                .context("reply to GET_IDENT")?;
+            return Ok(None);
+        }
+
+        if setup.request() == SMOO_STATUS_REQUEST && setup.request_type() == SMOO_STATUS_REQ_TYPE {
+            ensure!(
+                setup.direction() == ControlDirection::In,
+                "SMOO_STATUS must be an IN transfer"
+            );
+            ensure!(
+                setup.length() as usize >= SMOO_STATUS_LEN,
+                "SMOO_STATUS buffer too small"
+            );
+            let mut flags = 0;
+            if status.export_active() {
+                flags |= SMOO_STATUS_FLAG_EXPORT_ACTIVE;
+            }
+            let payload = SmooStatusV0::new(flags, status.export_count, status.session_id);
+            let encoded = payload.encode();
+            let len = cmp::min(encoded.len(), setup.length() as usize);
+            ep0.write_in(&encoded[..len])
+                .await
+                .context("write SMOO_STATUS response")?;
+            return Ok(None);
+        }
+
+        if setup.request() == CONFIG_EXPORTS_REQUEST && setup.request_type() == SMOO_CONFIG_REQ_TYPE
+        {
+            ensure!(
+                setup.length() as usize == ConfigExportsV0::ENCODED_LEN,
+                "CONFIG_EXPORTS payload length mismatch"
+            );
+            let mut buf = [0u8; ConfigExportsV0::ENCODED_LEN];
+            ep0.read_out(&mut buf)
+                .await
+                .context("read CONFIG_EXPORTS")?;
+            let payload = ConfigExportsV0::parse(&buf).context("parse CONFIG_EXPORTS payload")?;
+            ep0.write_in(&[]).await.context("ACK CONFIG_EXPORTS")?;
+            return Ok(Some(SetupCommand::Config(payload)));
+        }
+
+        Err(anyhow!(
+            "unsupported setup request {:#x} type {:#x}",
+            setup.request(),
+            setup.request_type()
+        ))
+    }
+}
+
+/// Commands emitted by [`GadgetControl`] for the runtime to apply.
+#[derive(Clone, Debug)]
+pub enum SetupCommand {
+    Config(ConfigExportsV0),
 }
 
 /// Data-plane controller that owns the FunctionFS interrupt and bulk endpoints.
@@ -542,7 +543,6 @@ pub struct GadgetDataPlane {
     interrupt_out: File,
     bulk_in: File,
     bulk_out: File,
-    configured: bool,
     dma_scratch: Option<FunctionfsDmaScratch>,
 }
 
@@ -577,13 +577,11 @@ impl GadgetDataPlane {
             interrupt_out: to_tokio_file(interrupt_out)?,
             bulk_in: to_tokio_file(bulk_in)?,
             bulk_out: to_tokio_file(bulk_out)?,
-            configured: false,
             dma_scratch,
         })
     }
 
     pub async fn send_request(&mut self, request: Request) -> Result<()> {
-        ensure!(self.configured, "gadget not configured");
         let encoded = request.encode();
         self.interrupt_in
             .write_all(&encoded)
@@ -597,7 +595,6 @@ impl GadgetDataPlane {
     }
 
     pub async fn read_response(&mut self) -> Result<Response> {
-        ensure!(self.configured, "gadget not configured");
         let mut buf = [0u8; RESPONSE_LEN];
         self.interrupt_out
             .read_exact(&mut buf)
@@ -607,7 +604,6 @@ impl GadgetDataPlane {
     }
 
     pub async fn read_bulk(&mut self, buf: &mut [u8]) -> Result<()> {
-        ensure!(self.configured, "gadget not configured");
         if buf.is_empty() {
             return Ok(());
         }
@@ -619,7 +615,6 @@ impl GadgetDataPlane {
     }
 
     pub async fn write_bulk(&mut self, buf: &[u8]) -> Result<()> {
-        ensure!(self.configured, "gadget not configured");
         if buf.is_empty() {
             return Ok(());
         }
@@ -631,7 +626,6 @@ impl GadgetDataPlane {
     }
 
     pub async fn read_bulk_buffer(&mut self, buf: &mut [u8]) -> Result<()> {
-        ensure!(self.configured, "gadget not configured");
         if buf.is_empty() {
             return Ok(());
         }
@@ -661,7 +655,6 @@ impl GadgetDataPlane {
     }
 
     pub async fn write_bulk_buffer(&mut self, buf: &mut [u8]) -> Result<()> {
-        ensure!(self.configured, "gadget not configured");
         if buf.is_empty() {
             return Ok(());
         }
