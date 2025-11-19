@@ -9,7 +9,7 @@ use crate::sys::{
     UBLK_U_IO_COMMIT_AND_FETCH_REQ, UBLK_U_IO_FETCH_REQ, ublk_param_basic, ublk_params,
     ublksrv_ctrl_cmd, ublksrv_ctrl_dev_info, ublksrv_io_cmd, ublksrv_io_desc,
 };
-use anyhow::{Context, ensure};
+use anyhow::{Context, anyhow, ensure};
 use async_channel::{Receiver, RecvError, Sender};
 use io_uring::{IoUring, cqueue, squeue, types};
 use std::cmp;
@@ -59,6 +59,7 @@ pub struct SmooUblkDevice {
     recovery_pending: bool,
     buffers: QueueBuffers,
     request_rx: Option<Receiver<UblkIoRequest>>,
+    start_notify: Option<async_channel::Receiver<anyhow::Result<()>>>,
     completion_txs: Vec<Sender<QueueCompletion>>,
     workers: Vec<QueueWorkerHandle>,
     start_handle: Option<JoinHandle<()>>,
@@ -424,6 +425,7 @@ impl SmooUblk {
             .open(&cdev_path)
             .with_context(|| format!("open {}", cdev_path))?;
         let (request_tx, request_rx) = async_channel::unbounded::<UblkIoRequest>();
+        let (start_tx, start_rx) = async_channel::bounded::<anyhow::Result<()>>(1);
         let mut completion_txs = Vec::with_capacity(queue_count as usize);
         let mut workers = Vec::with_capacity(queue_count as usize);
         let mut ready_rxs = Vec::with_capacity(queue_count as usize);
@@ -477,6 +479,7 @@ impl SmooUblk {
             recovery_pending: false,
             buffers,
             request_rx: Some(request_rx),
+            start_notify: None,
             completion_txs,
             workers,
             start_handle: None,
@@ -492,21 +495,29 @@ impl SmooUblk {
             .name(format!("smoo-gadget-ublk-start-{}", dev_id))
             .spawn(move || {
                 info!(dev_id = dev_id, "start_dev thread begin");
-                let res = submit_ctrl_command_blocking(
+                let result = submit_ctrl_command_blocking(
                     &ctrl_sender,
                     UBLK_CMD_START_DEV,
                     start_cmd,
                     "start device",
                 );
-                match res {
+                match &result {
                     Ok(()) => info!(dev_id = dev_id, "start_dev completed"),
                     Err(err) => error!(dev_id = dev_id, "start_dev failed: {:?}", err),
+                }
+                if let Err(send_err) = start_tx.send_blocking(result.map_err(|err| anyhow!(err))) {
+                    warn!(
+                        dev_id = dev_id,
+                        error = ?send_err,
+                        "failed to notify start_dev completion"
+                    );
                 }
             })
             .context("spawn start_dev thread")?;
 
         let mut device = device;
         device.start_handle = Some(start_thread);
+        device.start_notify = Some(start_rx);
         Ok(device)
     }
 
@@ -642,6 +653,7 @@ impl SmooUblk {
             recovery_pending: true,
             buffers,
             request_rx: Some(request_rx),
+            start_notify: None,
             completion_txs,
             workers,
             start_handle: None,
@@ -818,14 +830,19 @@ impl SmooUblkDevice {
             .context("checkout ublk buffer")
     }
 
-    pub fn take_start_handle(&mut self) -> Option<JoinHandle<()>> {
-        self.start_handle.take()
-    }
-
     pub fn take_request_receiver(&mut self) -> anyhow::Result<Receiver<UblkIoRequest>> {
         self.request_rx
             .take()
             .context("request channel unavailable")
+    }
+
+    pub async fn await_start(&mut self) -> anyhow::Result<()> {
+        if let Some(rx) = self.start_notify.take() {
+            let result = rx.recv().await.context("wait for start_dev completion")?;
+            result?;
+        }
+        self.join_start_handle();
+        Ok(())
     }
 
     pub async fn next_io(&self) -> anyhow::Result<UblkIoRequest> {
@@ -886,17 +903,23 @@ impl SmooUblkDevice {
                 error!("queue worker join failed: {:?}", e);
             }
         }
-        if let Some(handle) = self.take_start_handle() {
-            if let Err(err) = handle.join() {
-                error!("start_dev thread join failed: {:?}", err);
-            }
-        }
+        self.join_start_handle();
     }
 }
 
 impl Drop for SmooUblkDevice {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+impl SmooUblkDevice {
+    fn join_start_handle(&mut self) {
+        if let Some(handle) = self.start_handle.take() {
+            if let Err(err) = handle.join() {
+                error!("start_dev thread join failed: {:?}", err);
+            }
+        }
     }
 }
 

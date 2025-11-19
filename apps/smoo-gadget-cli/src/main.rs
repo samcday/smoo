@@ -23,7 +23,7 @@ use std::{
 use tokio::{
     signal,
     sync::{mpsc, oneshot, RwLock},
-    task::{self, JoinHandle},
+    task::JoinHandle,
 };
 use tracing::{debug, info, warn};
 use tracing_subscriber::prelude::*;
@@ -341,16 +341,10 @@ impl ExportSlot {
     }
 
     async fn wait_for_start(&mut self) -> Result<()> {
-        if let Some(handle) = self.device.take_start_handle() {
-            task::spawn_blocking(move || {
-                handle
-                    .join()
-                    .map_err(|err| anyhow!("start_dev thread failed: {:?}", err))
-            })
+        self.device
+            .await_start()
             .await
-            .context("join start_dev thread task")??;
-        }
-        Ok(())
+            .context("wait for start_dev")
     }
 }
 
