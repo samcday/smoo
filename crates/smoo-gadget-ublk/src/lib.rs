@@ -10,7 +10,7 @@ use crate::sys::{
     ublksrv_ctrl_cmd, ublksrv_ctrl_dev_info, ublksrv_io_cmd, ublksrv_io_desc,
 };
 use anyhow::{Context, ensure};
-use async_channel::{Receiver, RecvError, Sender};
+use async_channel::{Receiver, RecvError, Sender, TryRecvError};
 use io_uring::{IoUring, cqueue, squeue, types};
 use std::cmp;
 use std::fmt;
@@ -1092,6 +1092,56 @@ struct QueueWorkerConfig {
     ready_tx: mpsc::Sender<()>,
 }
 
+#[derive(Clone, Copy)]
+struct RequestPathFailure {
+    code: i32,
+    terminal: bool,
+}
+
+struct InflightTracker {
+    slots: Vec<bool>,
+}
+
+impl InflightTracker {
+    fn new(queue_depth: usize) -> Self {
+        Self {
+            slots: vec![false; queue_depth],
+        }
+    }
+
+    fn mark(&mut self, tag: u16) {
+        let idx = tag as usize;
+        if idx < self.slots.len() {
+            self.slots[idx] = true;
+        }
+    }
+
+    fn finish(&mut self, tag: u16) -> bool {
+        let idx = tag as usize;
+        if idx >= self.slots.len() {
+            return false;
+        }
+        let was_active = self.slots[idx];
+        self.slots[idx] = false;
+        was_active
+    }
+
+    fn drain_active(&mut self) -> Vec<u16> {
+        let mut tags = Vec::new();
+        for (idx, active) in self.slots.iter_mut().enumerate() {
+            if *active {
+                *active = false;
+                tags.push(idx as u16);
+            }
+        }
+        tags
+    }
+
+    fn is_empty(&self) -> bool {
+        self.slots.iter().all(|active| !active)
+    }
+}
+
 struct CmdBuf {
     ptr: *mut libc::c_void,
     len: usize,
@@ -1203,29 +1253,83 @@ fn queue_worker_main(cfg: QueueWorkerConfig) -> anyhow::Result<()> {
 
     let timeout = types::Timespec::from(Duration::from_millis(5));
     let submit_args = types::SubmitArgs::new().timespec(&timeout);
+    let mut inflight = InflightTracker::new(queue_depth as usize);
+    let mut failure_state: Option<RequestPathFailure> = None;
+    let mut pending_abort: usize = 0;
 
-    while !stop.load(Ordering::SeqCst) {
-        while let Ok(comp) = completion_rx.try_recv() {
-            let cmd_addr = buf_ptrs[comp.tag as usize];
-            trace!(
-                dev_id = dev_id,
-                queue_id = queue_id,
-                tag = comp.tag,
-                result = comp.result,
-                "issuing COMMIT_AND_FETCH"
-            );
-            queue_cmd(
-                QueueCmdCtx {
-                    ring: &mut ring,
-                    fd,
-                    ioctl_encode,
-                },
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            enter_fail_fast_mode(
+                &mut failure_state,
+                "queue stopping",
+                sys::UBLK_IO_RES_ABORT,
+                true,
+                &mut pending_abort,
+                dev_id,
                 queue_id,
-                comp.tag,
-                cmd_addr,
-                UBLK_U_IO_COMMIT_AND_FETCH_REQ,
-                comp.result,
+                &mut ring,
+                fd,
+                ioctl_encode,
+                &buf_ptrs,
+                &mut inflight,
             )?;
+        }
+
+        loop {
+            match completion_rx.try_recv() {
+                Ok(comp) => {
+                    inflight.finish(comp.tag);
+                    let cmd_addr = buf_ptrs[comp.tag as usize];
+                    trace!(
+                        dev_id = dev_id,
+                        queue_id = queue_id,
+                        tag = comp.tag,
+                        result = comp.result,
+                        "issuing COMMIT_AND_FETCH"
+                    );
+                    queue_cmd(
+                        QueueCmdCtx {
+                            ring: &mut ring,
+                            fd,
+                            ioctl_encode,
+                        },
+                        queue_id,
+                        comp.tag,
+                        cmd_addr,
+                        UBLK_U_IO_COMMIT_AND_FETCH_REQ,
+                        comp.result,
+                    )?;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Closed) => {
+                    enter_fail_fast_mode(
+                        &mut failure_state,
+                        "completion channel closed",
+                        sys::UBLK_IO_RES_ABORT,
+                        true,
+                        &mut pending_abort,
+                        dev_id,
+                        queue_id,
+                        &mut ring,
+                        fd,
+                        ioctl_encode,
+                        &buf_ptrs,
+                        &mut inflight,
+                    )?;
+                    break;
+                }
+            }
+        }
+
+        if let Some(failure) = failure_state {
+            if failure.terminal && pending_abort == 0 && inflight.is_empty() {
+                debug!(
+                    dev_id = dev_id,
+                    queue_id = queue_id,
+                    "queue worker drained after fail-fast"
+                );
+                break;
+            }
         }
 
         match ring.submitter().submit_with_args(1, &submit_args) {
@@ -1241,8 +1345,37 @@ fn queue_worker_main(cfg: QueueWorkerConfig) -> anyhow::Result<()> {
             }
         }
 
-        while let Some(cqe) = ring.completion().next() {
-            let result = cqe.result();
+        while let Some((result, tag)) = {
+            ring.completion()
+                .next()
+                .map(|cqe| (cqe.result(), cqe.user_data() as u16))
+        } {
+            if result == sys::UBLK_IO_RES_ABORT {
+                pending_abort = pending_abort.saturating_sub(1);
+                trace!(
+                    dev_id = dev_id,
+                    queue_id = queue_id,
+                    remaining_abort = pending_abort,
+                    "queue received abort completion"
+                );
+                if failure_state.is_none() {
+                    enter_fail_fast_mode(
+                        &mut failure_state,
+                        "kernel aborted queue",
+                        sys::UBLK_IO_RES_ABORT,
+                        true,
+                        &mut pending_abort,
+                        dev_id,
+                        queue_id,
+                        &mut ring,
+                        fd,
+                        ioctl_encode,
+                        &buf_ptrs,
+                        &mut inflight,
+                    )?;
+                }
+                continue;
+            }
             if result < 0 {
                 warn!(
                     dev = dev_id,
@@ -1252,7 +1385,6 @@ fn queue_worker_main(cfg: QueueWorkerConfig) -> anyhow::Result<()> {
                 );
                 return Err(io::Error::from_raw_os_error(-result).into());
             }
-            let tag = cqe.user_data() as u16;
             let desc = unsafe { ptr::read(iod_base.add(tag as usize)) };
             let request = UblkIoRequest {
                 dev_id,
@@ -1271,18 +1403,122 @@ fn queue_worker_main(cfg: QueueWorkerConfig) -> anyhow::Result<()> {
                 num_sectors = request.num_sectors,
                 "queue received io"
             );
+            if let Some(failure) = failure_state {
+                pending_abort += 1;
+                complete_io_with_error(
+                    &mut ring,
+                    fd,
+                    ioctl_encode,
+                    queue_id,
+                    &buf_ptrs,
+                    tag,
+                    failure.code,
+                )?;
+                continue;
+            }
+            inflight.mark(tag);
             if request_tx.send_blocking(request).is_err() {
-                debug!(
-                    dev_id = dev_id,
-                    queue_id = queue_id,
-                    "request channel closed, terminating queue worker"
-                );
-                return Ok(());
+                inflight.finish(tag);
+                enter_fail_fast_mode(
+                    &mut failure_state,
+                    "request channel closed",
+                    sys::UBLK_IO_RES_ABORT,
+                    true,
+                    &mut pending_abort,
+                    dev_id,
+                    queue_id,
+                    &mut ring,
+                    fd,
+                    ioctl_encode,
+                    &buf_ptrs,
+                    &mut inflight,
+                )?;
+                pending_abort += 1;
+                complete_io_with_error(
+                    &mut ring,
+                    fd,
+                    ioctl_encode,
+                    queue_id,
+                    &buf_ptrs,
+                    tag,
+                    sys::UBLK_IO_RES_ABORT,
+                )?;
             }
         }
     }
 
     Ok(())
+}
+
+fn enter_fail_fast_mode(
+    failure: &mut Option<RequestPathFailure>,
+    reason: &'static str,
+    code: i32,
+    terminal: bool,
+    pending_abort: &mut usize,
+    dev_id: u32,
+    queue_id: u16,
+    ring: &mut IoUring<io_uring::squeue::Entry, io_uring::cqueue::Entry>,
+    fd: i32,
+    ioctl_encode: bool,
+    buf_ptrs: &[u64],
+    inflight: &mut InflightTracker,
+) -> io::Result<()> {
+    if failure.is_some() {
+        return Ok(());
+    }
+    warn!(
+        dev_id = dev_id,
+        queue_id = queue_id,
+        error = code,
+        reason = reason,
+        "queue entering fail-fast mode"
+    );
+    *failure = Some(RequestPathFailure { code, terminal });
+    *pending_abort +=
+        fail_all_inflight(ring, fd, ioctl_encode, queue_id, buf_ptrs, inflight, code)?;
+    Ok(())
+}
+
+fn fail_all_inflight(
+    ring: &mut IoUring<io_uring::squeue::Entry, io_uring::cqueue::Entry>,
+    fd: i32,
+    ioctl_encode: bool,
+    queue_id: u16,
+    buf_ptrs: &[u64],
+    inflight: &mut InflightTracker,
+    code: i32,
+) -> io::Result<usize> {
+    let mut count = 0;
+    for tag in inflight.drain_active() {
+        complete_io_with_error(ring, fd, ioctl_encode, queue_id, buf_ptrs, tag, code)?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+fn complete_io_with_error(
+    ring: &mut IoUring<io_uring::squeue::Entry, io_uring::cqueue::Entry>,
+    fd: i32,
+    ioctl_encode: bool,
+    queue_id: u16,
+    buf_ptrs: &[u64],
+    tag: u16,
+    code: i32,
+) -> io::Result<()> {
+    let cmd_addr = buf_ptrs[tag as usize];
+    queue_cmd(
+        QueueCmdCtx {
+            ring,
+            fd,
+            ioctl_encode,
+        },
+        queue_id,
+        tag,
+        cmd_addr,
+        UBLK_U_IO_COMMIT_AND_FETCH_REQ,
+        code,
+    )
 }
 
 struct QueueCmdCtx<'ring> {
