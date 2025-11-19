@@ -228,14 +228,19 @@ impl Ep0Controller {
         Self { ep0 }
     }
 
-    /// Read the next FunctionFS event from ep0.
-    pub async fn next_event(&mut self) -> Result<Ep0Event> {
+    /// Read the next FunctionFS event from ep0, timing out if the host stops driving ep0.
+    pub async fn next_event(&mut self) -> Result<Option<Ep0Event>> {
         let mut buf = [0u8; FUNCTIONFS_EVENT_SIZE];
-        self.ep0
-            .read_exact(&mut buf)
-            .await
-            .context("read ep0 event")?;
-        Ep0Event::from_bytes(buf)
+        match time::timeout(EP0_IO_TIMEOUT, self.ep0.read_exact(&mut buf)).await {
+            Ok(result) => {
+                result.context("read ep0 event")?;
+                Ep0Event::from_bytes(buf).map(Some)
+            }
+            Err(_) => {
+                debug!("timeout waiting for FunctionFS control event");
+                Ok(None)
+            }
+        }
     }
 
     /// Send an IN data stage (device → host) for the current control transfer.
@@ -486,7 +491,10 @@ impl SmooGadget {
                     .ep0
                     .as_mut()
                     .context("FunctionFS ep0 controller unavailable")?;
-                ep0.next_event().await.context("read FunctionFS event")?
+                match ep0.next_event().await.context("poll FunctionFS event")? {
+                    Some(event) => event,
+                    None => continue,
+                }
             };
             trace!(?event, "ep0 event");
             match event {

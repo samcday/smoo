@@ -1002,10 +1002,17 @@ async fn control_loop(
     mut tx: mpsc::Sender<ControlMessage>,
 ) -> Result<()> {
     loop {
-        let event = ep0
+        let event = match ep0
             .next_event()
             .await
-            .context("read FunctionFS control event")?;
+            .context("poll FunctionFS control event")?
+        {
+            Some(event) => event,
+            None => {
+                debug!("FunctionFS control event poll timed out, continuing");
+                continue;
+            }
+        };
         match event {
             Ep0Event::Bind => debug!("FunctionFS bind event (control loop)"),
             Ep0Event::Unbind => debug!("FunctionFS unbind event (control loop)"),
