@@ -58,7 +58,7 @@ pub struct SmooUblkDevice {
     ioctl_encode: bool,
     recovery_pending: bool,
     buffers: QueueBuffers,
-    request_rx: Receiver<UblkIoRequest>,
+    request_rx: Option<Receiver<UblkIoRequest>>,
     completion_txs: Vec<Sender<QueueCompletion>>,
     workers: Vec<QueueWorkerHandle>,
     start_handle: Option<JoinHandle<()>>,
@@ -311,7 +311,14 @@ impl SmooUblk {
         };
         cmd.len = params.len as u16;
         cmd.addr = &mut params as *mut _ as u64;
-        submit_ctrl_command(&self.sender, UBLK_CMD_GET_PARAMS, cmd, "get params", Some(Duration::from_secs(1))).await?;
+        submit_ctrl_command(
+            &self.sender,
+            UBLK_CMD_GET_PARAMS,
+            cmd,
+            "get params",
+            Some(Duration::from_secs(1)),
+        )
+        .await?;
         Ok(params)
     }
 
@@ -469,7 +476,7 @@ impl SmooUblk {
             ioctl_encode,
             recovery_pending: false,
             buffers,
-            request_rx,
+            request_rx: Some(request_rx),
             completion_txs,
             workers,
             start_handle: None,
@@ -634,7 +641,7 @@ impl SmooUblk {
             ioctl_encode,
             recovery_pending: true,
             buffers,
-            request_rx,
+            request_rx: Some(request_rx),
             completion_txs,
             workers,
             start_handle: None,
@@ -811,9 +818,18 @@ impl SmooUblkDevice {
             .context("checkout ublk buffer")
     }
 
+    pub fn take_request_receiver(&mut self) -> anyhow::Result<Receiver<UblkIoRequest>> {
+        self.request_rx
+            .take()
+            .context("request channel unavailable")
+    }
+
     pub async fn next_io(&self) -> anyhow::Result<UblkIoRequest> {
-        let req = self
+        let receiver = self
             .request_rx
+            .as_ref()
+            .context("request channel unavailable")?;
+        let req = receiver
             .recv()
             .await
             .context("smoo-gadget-ublk device channel closed")?;

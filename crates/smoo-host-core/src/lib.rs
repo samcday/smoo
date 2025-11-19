@@ -7,5 +7,5 @@ pub mod host;
 pub mod transport;
 
 pub use block::{BlockSource, BlockSourceError, BlockSourceErrorKind, BlockSourceResult};
-pub use host::{HostError, HostErrorKind, HostResult, SmooHost};
+pub use host::{HostError, HostErrorKind, HostExport, HostResult, SmooHost};
 pub use transport::{Transport, TransportError, TransportErrorKind, TransportResult};

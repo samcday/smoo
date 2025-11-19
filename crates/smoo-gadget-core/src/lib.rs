@@ -26,72 +26,107 @@ pub const SMOO_CONFIG_REQ_TYPE: u8 = USB_TYPE_VENDOR | USB_RECIP_INTERFACE;
 /// Vendor control bRequest for CONFIG_EXPORTS.
 pub const CONFIG_EXPORTS_REQUEST: u8 = 0x02;
 
-/// Parsed representation of the v0 CONFIG_EXPORTS payload (single export max).
+/// Parsed representation of the v0 CONFIG_EXPORTS payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConfigExportsV0 {
-    export: Option<SingleExport>,
+    entries: Vec<ExportConfig>,
 }
 
 impl ConfigExportsV0 {
-    /// Number of bytes in the encoded payload.
-    pub const ENCODED_LEN: usize = 28;
+    pub const HEADER_LEN: usize = 8;
+    pub const ENTRY_LEN: usize = 24;
+    pub const MAX_EXPORTS: usize = 32;
 
     pub fn parse(data: &[u8]) -> Result<Self> {
         ensure!(
-            data.len() == Self::ENCODED_LEN,
-            "CONFIG_EXPORTS payload must be {} bytes",
-            Self::ENCODED_LEN
+            data.len() >= Self::HEADER_LEN,
+            "CONFIG_EXPORTS payload must include a header"
         );
         let version = u16::from_le_bytes([data[0], data[1]]);
         ensure!(version == 0, "unsupported CONFIG_EXPORTS version {version}");
-        let count = u16::from_le_bytes([data[2], data[3]]);
-        ensure!(count <= 1, "CONFIG_EXPORTS count must be 0 or 1");
+        let count = u16::from_le_bytes([data[2], data[3]]) as usize;
+        ensure!(
+            count <= Self::MAX_EXPORTS,
+            "CONFIG_EXPORTS count {} exceeds maximum {}",
+            count,
+            Self::MAX_EXPORTS
+        );
         let flags = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
         ensure!(flags == 0, "CONFIG_EXPORTS header flags must be zero");
-        let block_size = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-        let size_bytes = u64::from_le_bytes([
-            data[12], data[13], data[14], data[15], data[16], data[17], data[18], data[19],
-        ]);
-        let reserved0 = u32::from_le_bytes([data[20], data[21], data[22], data[23]]);
-        let reserved1 = u32::from_le_bytes([data[24], data[25], data[26], data[27]]);
+        let expected_len = Self::HEADER_LEN + count * Self::ENTRY_LEN;
+        ensure!(
+            data.len() == expected_len,
+            "CONFIG_EXPORTS payload length {} does not match count {}",
+            data.len(),
+            count
+        );
+        let mut seen_ids = std::collections::HashSet::with_capacity(count);
+        let mut entries = Vec::with_capacity(count);
+        for idx in 0..count {
+            let offset = Self::HEADER_LEN + idx * Self::ENTRY_LEN;
+            let entry = Self::parse_entry(&data[offset..offset + Self::ENTRY_LEN])?;
+            ensure!(
+                seen_ids.insert(entry.export_id),
+                "duplicate export_id {}",
+                entry.export_id
+            );
+            entries.push(entry);
+        }
+        Ok(Self { entries })
+    }
+
+    fn parse_entry(bytes: &[u8]) -> Result<ExportConfig> {
+        let mut id_bytes = [0u8; 4];
+        id_bytes.copy_from_slice(&bytes[0..4]);
+        let export_id = u32::from_le_bytes(id_bytes);
+        ensure!(export_id != 0, "export_id must be non-zero");
+        let mut block_bytes = [0u8; 4];
+        block_bytes.copy_from_slice(&bytes[4..8]);
+        let block_size = u32::from_le_bytes(block_bytes);
+        ensure!(
+            block_size.is_power_of_two(),
+            "block size must be power-of-two"
+        );
+        ensure!(
+            block_size >= 512 && block_size <= 65536,
+            "block size {block_size} out of supported range"
+        );
+        let mut size_bytes_buf = [0u8; 8];
+        size_bytes_buf.copy_from_slice(&bytes[8..16]);
+        let size_bytes = u64::from_le_bytes(size_bytes_buf);
+        if size_bytes != 0 {
+            ensure!(
+                size_bytes % block_size as u64 == 0,
+                "size_bytes must be multiple of block_size"
+            );
+        }
+        let mut reserved0_bytes = [0u8; 4];
+        reserved0_bytes.copy_from_slice(&bytes[16..20]);
+        let reserved0 = u32::from_le_bytes(reserved0_bytes);
+        let mut reserved1_bytes = [0u8; 4];
+        reserved1_bytes.copy_from_slice(&bytes[20..24]);
+        let reserved1 = u32::from_le_bytes(reserved1_bytes);
         ensure!(
             reserved0 == 0 && reserved1 == 0,
             "reserved fields must be zero"
         );
-        let export = if count == 0 {
-            None
-        } else {
-            ensure!(
-                block_size.is_power_of_two(),
-                "block size must be power-of-two"
-            );
-            ensure!(
-                block_size >= 512 && block_size <= 65536,
-                "block size {block_size} out of supported range"
-            );
-            if size_bytes != 0 {
-                ensure!(
-                    size_bytes % block_size as u64 == 0,
-                    "size_bytes must be multiple of block_size"
-                );
-            }
-            Some(SingleExport {
-                block_size,
-                size_bytes,
-            })
-        };
-        Ok(Self { export })
+        Ok(ExportConfig {
+            export_id,
+            block_size,
+            size_bytes,
+        })
     }
 
-    /// Returns the desired export, if any.
-    pub fn export(&self) -> Option<SingleExport> {
-        self.export.clone()
+    /// Returns the parsed entries.
+    pub fn entries(&self) -> &[ExportConfig] {
+        &self.entries
     }
 }
 
-/// Parameters describing a single export entry in v0 CONFIG_EXPORTS payloads.
+/// Parameters describing a single export entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SingleExport {
+pub struct ExportConfig {
+    pub export_id: u32,
     pub block_size: u32,
     pub size_bytes: u64,
 }
@@ -1075,29 +1110,53 @@ fn dma_buf_sync_end(fd: RawFd, dir: u64) -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn config_exports_none() {
-        let payload = [0u8; ConfigExportsV0::ENCODED_LEN];
-        let parsed = ConfigExportsV0::parse(&payload).expect("parse");
-        assert!(parsed.export().is_none());
+    const HEADER_LEN: usize = ConfigExportsV0::HEADER_LEN;
+    const ENTRY_LEN: usize = ConfigExportsV0::ENTRY_LEN;
+
+    fn build_payload(entries: &[(u32, u32, u64)]) -> Vec<u8> {
+        let mut buf = vec![0u8; HEADER_LEN + entries.len() * ENTRY_LEN];
+        buf[2..4].copy_from_slice(&(entries.len() as u16).to_le_bytes());
+        for (idx, (id, block_size, size_bytes)) in entries.iter().enumerate() {
+            let offset = HEADER_LEN + idx * ENTRY_LEN;
+            buf[offset..offset + 4].copy_from_slice(&id.to_le_bytes());
+            buf[offset + 4..offset + 8].copy_from_slice(&block_size.to_le_bytes());
+            buf[offset + 8..offset + 16].copy_from_slice(&size_bytes.to_le_bytes());
+        }
+        buf
     }
 
     #[test]
-    fn config_exports_single() {
-        let mut payload = [0u8; ConfigExportsV0::ENCODED_LEN];
-        payload[2] = 1;
-        payload[8..12].copy_from_slice(&4096u32.to_le_bytes());
-        payload[12..20].copy_from_slice(&(4096u64 * 8).to_le_bytes());
+    fn config_exports_empty() {
+        let payload = build_payload(&[]);
         let parsed = ConfigExportsV0::parse(&payload).expect("parse");
-        let export = parsed.export().expect("export");
-        assert_eq!(export.block_size, 4096);
-        assert_eq!(export.size_bytes, 4096 * 8);
+        assert!(parsed.entries().is_empty());
+    }
+
+    #[test]
+    fn config_exports_multi_valid() {
+        let payload = build_payload(&[(1, 4096, 4096 * 8), (2, 512, 512 * 4)]);
+        let parsed = ConfigExportsV0::parse(&payload).expect("parse");
+        assert_eq!(parsed.entries().len(), 2);
+        assert_eq!(parsed.entries()[0].export_id, 1);
+        assert_eq!(parsed.entries()[1].block_size, 512);
     }
 
     #[test]
     fn config_exports_invalid_flags() {
-        let mut payload = [0u8; ConfigExportsV0::ENCODED_LEN];
+        let mut payload = build_payload(&[]);
         payload[4] = 1;
+        assert!(ConfigExportsV0::parse(&payload).is_err());
+    }
+
+    #[test]
+    fn config_exports_duplicate_ids() {
+        let payload = build_payload(&[(3, 4096, 4096 * 2), (3, 4096, 4096 * 4)]);
+        assert!(ConfigExportsV0::parse(&payload).is_err());
+    }
+
+    #[test]
+    fn config_exports_invalid_block_size() {
+        let payload = build_payload(&[(5, 0, 0)]);
         assert!(ConfigExportsV0::parse(&payload).is_err());
     }
 }

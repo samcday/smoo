@@ -123,6 +123,7 @@ impl<T: UsbContext + Send + Sync + 'static> RusbTransport<T> {
         let interface = self.config.interface;
         let timeout = self.config.timeout;
         let data = payload.encode();
+        let expected_len = data.len();
         let written = task::spawn_blocking(move || {
             let handle = handle.lock().unwrap();
             handle.write_control(
@@ -137,10 +138,9 @@ impl<T: UsbContext + Send + Sync + 'static> RusbTransport<T> {
         .await
         .map_err(|err| join_error("CONFIG_EXPORTS control transfer", err))?
         .map_err(|err| map_rusb_error("CONFIG_EXPORTS control transfer", err))?;
-        if written != ConfigExportsV0Payload::ENCODED_LEN {
+        if written != expected_len {
             return Err(protocol_error(format!(
-                "CONFIG_EXPORTS transfer truncated (expected {}, got {written})",
-                ConfigExportsV0Payload::ENCODED_LEN
+                "CONFIG_EXPORTS transfer truncated (expected {expected_len}, got {written})"
             )));
         }
         Ok(())
@@ -335,56 +335,67 @@ fn not_ready() -> TransportError {
 fn protocol_error(message: impl Into<String>) -> TransportError {
     TransportError::with_message(TransportErrorKind::Protocol, message.into())
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConfigExportsV0Payload {
-    count: u16,
-    block_size: u32,
-    size_bytes: u64,
+    entries: Vec<ConfigExportEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfigExportEntry {
+    pub export_id: u32,
+    pub block_size: u32,
+    pub size_bytes: u64,
 }
 
 impl ConfigExportsV0Payload {
-    pub const ENCODED_LEN: usize = 28;
+    pub const HEADER_LEN: usize = 8;
+    pub const ENTRY_LEN: usize = 24;
+    pub const MAX_EXPORTS: usize = 32;
 
-    pub fn zero_exports() -> Self {
-        Self {
-            count: 0,
-            block_size: 0,
-            size_bytes: 0,
+    pub fn new(entries: Vec<ConfigExportEntry>) -> TransportResult<Self> {
+        if entries.len() > Self::MAX_EXPORTS {
+            return Err(protocol_error(format!(
+                "CONFIG_EXPORTS entry count {} exceeds maximum {}",
+                entries.len(),
+                Self::MAX_EXPORTS
+            )));
         }
+        Ok(Self { entries })
     }
 
-    pub fn single_export(block_size: u32, size_bytes: u64) -> Self {
-        Self {
-            count: 1,
-            block_size,
-            size_bytes,
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = vec![0u8; Self::HEADER_LEN + self.entries.len() * Self::ENTRY_LEN];
+        buf[2..4].copy_from_slice(&(self.entries.len() as u16).to_le_bytes());
+        for (idx, entry) in self.entries.iter().enumerate() {
+            let offset = Self::HEADER_LEN + idx * Self::ENTRY_LEN;
+            buf[offset..offset + 4].copy_from_slice(&entry.export_id.to_le_bytes());
+            buf[offset + 4..offset + 8].copy_from_slice(&entry.block_size.to_le_bytes());
+            buf[offset + 8..offset + 16].copy_from_slice(&entry.size_bytes.to_le_bytes());
         }
-    }
-
-    pub fn encode(&self) -> [u8; Self::ENCODED_LEN] {
-        let mut buf = [0u8; Self::ENCODED_LEN];
-        buf[0..2].copy_from_slice(&0u16.to_le_bytes());
-        buf[2..4].copy_from_slice(&self.count.to_le_bytes());
-        buf[4..8].copy_from_slice(&0u32.to_le_bytes());
-        buf[8..12].copy_from_slice(&self.block_size.to_le_bytes());
-        buf[12..20].copy_from_slice(&self.size_bytes.to_le_bytes());
-        buf[20..24].copy_from_slice(&0u32.to_le_bytes());
-        buf[24..28].copy_from_slice(&0u32.to_le_bytes());
         buf
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::ConfigExportsV0Payload;
+    use super::{ConfigExportEntry, ConfigExportsV0Payload};
 
     #[test]
     fn config_exports_single_encodes_fields() {
-        let payload = ConfigExportsV0Payload::single_export(4096, 8192);
+        let payload = ConfigExportsV0Payload::new(vec![ConfigExportEntry {
+            export_id: 5,
+            block_size: 4096,
+            size_bytes: 8192,
+        }])
+        .expect("payload");
         let encoded = payload.encode();
-        assert_eq!(encoded.len(), ConfigExportsV0Payload::ENCODED_LEN);
+        assert_eq!(
+            encoded.len(),
+            ConfigExportsV0Payload::HEADER_LEN + ConfigExportsV0Payload::ENTRY_LEN
+        );
         assert_eq!(&encoded[2..4], &[1, 0]);
-        assert_eq!(&encoded[8..12], &4096u32.to_le_bytes());
-        assert_eq!(&encoded[12..20], &8192u64.to_le_bytes());
+        assert_eq!(&encoded[8..12], &5u32.to_le_bytes());
+        assert_eq!(&encoded[12..16], &4096u32.to_le_bytes());
+        assert_eq!(&encoded[16..24], &8192u64.to_le_bytes());
     }
 }

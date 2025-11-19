@@ -2,8 +2,8 @@ use anyhow::{anyhow, ensure, Context, Result};
 use clap::{Parser, ValueEnum};
 use rand::{rngs::OsRng, RngCore};
 use smoo_gadget_core::{
-    ConfigExportsV0, DmaHeap, Ep0Controller, Ep0Event, FunctionfsEndpoints, GadgetConfig,
-    SetupPacket, SmooGadget, CONFIG_EXPORTS_REQUEST, SMOO_CONFIG_REQ_TYPE,
+    ConfigExportsV0, DmaHeap, Ep0Controller, Ep0Event, ExportConfig, FunctionfsEndpoints,
+    GadgetConfig, SetupPacket, SmooGadget, CONFIG_EXPORTS_REQUEST, SMOO_CONFIG_REQ_TYPE,
 };
 use smoo_gadget_ublk::{SmooUblk, SmooUblkDevice, UblkBuffer, UblkIoRequest, UblkOp};
 use smoo_proto::{
@@ -12,6 +12,7 @@ use smoo_proto::{
 };
 use std::{
     cmp,
+    collections::{HashMap, HashSet},
     fs::File,
     io,
     io::Write,
@@ -22,6 +23,7 @@ use std::{
 use tokio::{
     signal,
     sync::{mpsc, oneshot, RwLock},
+    task::JoinHandle,
 };
 use tracing::{debug, info, warn};
 use tracing_subscriber::prelude::*;
@@ -35,7 +37,6 @@ const SMOO_SUBCLASS: u8 = 0x53;
 const SMOO_PROTOCOL: u8 = 0x4D;
 const SMOO_IDENT_REQ_TYPE: u8 = 0xC1;
 const DEFAULT_MAX_IO_BYTES: usize = 4 * 1024 * 1024;
-const SINGLE_EXPORT_ID: u32 = 0;
 
 use state::{ExportState, StateFile, StateSnapshot};
 
@@ -107,7 +108,8 @@ async fn main() -> Result<()> {
         debug!("state file disabled; crash recovery off");
     }
 
-    let (session_id, recovered_device) = initialize_session(&mut ublk, state_file.as_ref()).await?;
+    let (session_id, recovered_exports) =
+        initialize_session(&mut ublk, state_file.as_ref()).await?;
     let ident = Ident::new(0, 1);
     let dma_heap = if args.no_dma_buf {
         None
@@ -163,6 +165,7 @@ async fn main() -> Result<()> {
         .take_ep0_controller()
         .context("ep0 controller already taken")?;
     let (control_tx, control_rx) = mpsc::channel(8);
+    let (pending_tx, pending_rx) = mpsc::channel(64);
     let status = GadgetStatusShared::new(GadgetStatus::new(session_id, 0));
     let control_task = tokio::spawn(control_loop(ep0, ident, status.clone(), control_tx));
     let runtime = RuntimeConfig {
@@ -170,8 +173,21 @@ async fn main() -> Result<()> {
         queue_depth: args.queue_depth,
         state_file: state_file.clone(),
         status,
+        pending_requests: pending_tx.clone(),
     };
-    let result = run_event_loop(&mut ublk, gadget, runtime, recovered_device, control_rx).await;
+    let mut exports_runtime = ExportsRuntime::new();
+    for slot in recovered_exports {
+        exports_runtime.insert(slot);
+    }
+    let result = run_event_loop(
+        &mut ublk,
+        gadget,
+        runtime,
+        exports_runtime,
+        control_rx,
+        pending_rx,
+    )
+    .await;
     control_task.abort();
     let _ = control_task.await;
     result
@@ -228,6 +244,7 @@ struct RuntimeConfig {
     queue_depth: u16,
     state_file: Option<StateFile>,
     status: GadgetStatusShared,
+    pending_requests: mpsc::Sender<PendingRequest>,
 }
 
 impl RuntimeConfig {
@@ -237,6 +254,147 @@ impl RuntimeConfig {
 
     fn status(&self) -> &GadgetStatusShared {
         &self.status
+    }
+
+    fn pending_tx(&self) -> mpsc::Sender<PendingRequest> {
+        self.pending_requests.clone()
+    }
+}
+
+struct PendingRequest {
+    export_id: u32,
+    request: UblkIoRequest,
+}
+
+struct ExportSlot {
+    export_id: u32,
+    block_size: u32,
+    size_bytes: u64,
+    device: SmooUblkDevice,
+    request_task: Option<JoinHandle<()>>,
+}
+
+impl ExportSlot {
+    fn new(export_id: u32, block_size: u32, size_bytes: u64, device: SmooUblkDevice) -> Self {
+        Self {
+            export_id,
+            block_size,
+            size_bytes,
+            device,
+            request_task: None,
+        }
+    }
+
+    fn start_request_task(&mut self, tx: mpsc::Sender<PendingRequest>) -> Result<()> {
+        if self.request_task.is_some() {
+            return Ok(());
+        }
+        let receiver = self
+            .device
+            .take_request_receiver()
+            .context("request channel unavailable")?;
+        let export_id = self.export_id;
+        let task = tokio::spawn(async move {
+            while let Ok(request) = receiver.recv().await {
+                if tx
+                    .send(PendingRequest { export_id, request })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        self.request_task = Some(task);
+        Ok(())
+    }
+
+    fn stop_request_task(&mut self) {
+        if let Some(handle) = self.request_task.take() {
+            handle.abort();
+        }
+    }
+
+    fn device(&self) -> &SmooUblkDevice {
+        &self.device
+    }
+
+    fn device_mut(&mut self) -> &mut SmooUblkDevice {
+        &mut self.device
+    }
+
+    fn export_state(&self) -> ExportState {
+        ExportState {
+            export_id: self.export_id,
+            block_size: self.block_size,
+            size_bytes: self.size_bytes,
+            ublk_dev_id: self.device.dev_id(),
+        }
+    }
+
+    fn capacity_blocks(&self) -> Option<u64> {
+        if self.size_bytes == 0 {
+            None
+        } else {
+            Some(self.size_bytes / self.block_size as u64)
+        }
+    }
+}
+
+struct ExportsRuntime {
+    entries: HashMap<u32, ExportSlot>,
+}
+
+impl ExportsRuntime {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn insert(&mut self, slot: ExportSlot) {
+        self.entries.insert(slot.export_id, slot);
+    }
+
+    fn get(&self, export_id: u32) -> Option<&ExportSlot> {
+        self.entries.get(&export_id)
+    }
+
+    fn get_mut(&mut self, export_id: u32) -> Option<&mut ExportSlot> {
+        self.entries.get_mut(&export_id)
+    }
+
+    async fn remove(&mut self, export_id: u32, ublk: &mut SmooUblk) -> Result<()> {
+        if let Some(mut slot) = self.entries.remove(&export_id) {
+            slot.stop_request_task();
+            ublk.stop_dev(slot.device, true)
+                .await
+                .with_context(|| format!("stop ublk device for export {export_id}"))?;
+        }
+        Ok(())
+    }
+
+    async fn clear(&mut self, ublk: &mut SmooUblk) -> Result<()> {
+        let ids: Vec<u32> = self.entries.keys().copied().collect();
+        for id in ids {
+            self.remove(id, ublk).await?;
+        }
+        Ok(())
+    }
+
+    fn export_states(&self) -> Vec<ExportState> {
+        self.entries
+            .values()
+            .map(|slot| slot.export_state())
+            .collect()
     }
 }
 
@@ -262,15 +420,16 @@ async fn run_event_loop(
     ublk: &mut SmooUblk,
     mut gadget: SmooGadget,
     runtime: RuntimeConfig,
-    mut device: Option<SmooUblkDevice>,
+    mut exports: ExportsRuntime,
     mut control_rx: mpsc::Receiver<ControlMessage>,
+    mut pending_rx: mpsc::Receiver<PendingRequest>,
 ) -> Result<()> {
     let shutdown = signal::ctrl_c();
     tokio::pin!(shutdown);
 
     let mut io_error = None;
     loop {
-        if let Some(active_device) = device.as_ref() {
+        if exports.is_empty() {
             tokio::select! {
                 _ = &mut shutdown => {
                     info!("shutdown signal received");
@@ -281,24 +440,11 @@ async fn run_event_loop(
                         process_control_message(
                             msg,
                             ublk,
-                            &mut device,
+                            &mut exports,
                             &runtime,
                         )
                         .await?;
                     } else {
-                        break;
-                    }
-                }
-                req = active_device.next_io() => {
-                    let req = match req {
-                        Ok(req) => req,
-                        Err(err) => {
-                            io_error = Some(err.context("receive ublk io"));
-                            break;
-                        }
-                    };
-                    if let Err(err) = handle_request(&mut gadget, active_device, req).await {
-                        io_error = Some(err);
                         break;
                     }
                 }
@@ -314,7 +460,7 @@ async fn run_event_loop(
                         process_control_message(
                             msg,
                             ublk,
-                            &mut device,
+                            &mut exports,
                             &runtime,
                         )
                         .await?;
@@ -322,22 +468,45 @@ async fn run_event_loop(
                         break;
                     }
                 }
+                pending = pending_rx.recv() => {
+                    match pending {
+                        Some(pending_req) => {
+                            let Some(slot) = exports.get(pending_req.export_id) else {
+                                warn!(
+                                    export_id = pending_req.export_id,
+                                    "received request for unknown export"
+                                );
+                                continue;
+                            };
+                            if let Err(err) = handle_request(
+                                &mut gadget,
+                                slot.export_id,
+                                slot,
+                                pending_req.request,
+                            )
+                            .await
+                            {
+                                io_error = Some(err);
+                                break;
+                            }
+                        }
+                        None => {
+                            warn!("pending request channel closed");
+                            break;
+                        }
+                    }
+                }
             }
         }
     }
 
-    if let Some(device) = device.take() {
-        info!("stopping ublk device");
-        ublk.stop_dev(device, true)
-            .await
-            .context("stop ublk device")?;
-        runtime.status().set_export_count(0).await;
-        if let Some(state_file) = runtime.state_file() {
-            if let Err(err) = state_file.clear() {
-                warn!(error = ?err, "failed to remove state file during shutdown");
-            } else {
-                debug!("state file cleared on shutdown");
-            }
+    exports.clear(ublk).await?;
+    runtime.status().set_export_count(0).await;
+    if let Some(state_file) = runtime.state_file() {
+        if let Err(err) = state_file.clear() {
+            warn!(error = ?err, "failed to remove state file during shutdown");
+        } else {
+            debug!("state file cleared on shutdown");
         }
     }
     if let Some(err) = io_error {
@@ -349,10 +518,11 @@ async fn run_event_loop(
 
 async fn handle_request(
     gadget: &mut SmooGadget,
-    device: &SmooUblkDevice,
+    export_id: u32,
+    slot: &ExportSlot,
     req: UblkIoRequest,
 ) -> Result<()> {
-    let block_size = device.block_size();
+    let block_size = slot.block_size as usize;
     let req_len = match request_byte_len(&req, block_size) {
         Ok(len) => len,
         Err(err) => {
@@ -364,12 +534,34 @@ async fn handle_request(
                 ?req.op,
                 "invalid request length: {err}"
             );
-            device
+            slot.device()
                 .complete_io(req, -errno)
                 .context("complete invalid request")?;
             return Ok(());
         }
     };
+    let num_blocks = match u32::try_from(req_len / block_size) {
+        Ok(val) => val,
+        Err(_) => {
+            slot.device()
+                .complete_io(req, -libc::EINVAL)
+                .context("complete request with excessive block count")?;
+            return Ok(());
+        }
+    };
+    if !request_within_bounds(slot, req.sector, num_blocks) {
+        warn!(
+            queue = req.queue_id,
+            tag = req.tag,
+            lba = req.sector,
+            blocks = num_blocks,
+            "request exceeds export bounds"
+        );
+        slot.device()
+            .complete_io(req, -libc::ERANGE)
+            .context("complete out-of-range request")?;
+        return Ok(());
+    }
 
     let opcode = match opcode_from_ublk(req.op) {
         Some(op) => op,
@@ -380,7 +572,7 @@ async fn handle_request(
                 op = ?req.op,
                 "unsupported ublk opcode"
             );
-            device
+            slot.device()
                 .complete_io(req, -libc::EOPNOTSUPP)
                 .context("complete unsupported opcode")?;
             return Ok(());
@@ -390,7 +582,7 @@ async fn handle_request(
     let mut payload: Option<UblkBuffer<'_>> = None;
     let result = async {
         if matches!(opcode, OpCode::Read | OpCode::Write) && req_len > 0 {
-            let capacity = device.buffer_len();
+            let capacity = slot.device().buffer_len();
             if req_len > capacity {
                 warn!(
                     queue = req.queue_id,
@@ -399,20 +591,19 @@ async fn handle_request(
                     buf_cap = capacity,
                     "request exceeds buffer capacity"
                 );
-                device
+                slot.device()
                     .complete_io(req, -libc::EINVAL)
                     .context("complete oversized request")?;
                 return Ok(());
             }
             payload = Some(
-                device
+                slot.device()
                     .checkout_buffer(req.queue_id, req.tag)
                     .context("checkout bulk buffer")?,
             );
         }
 
-        let byte_len = u32::try_from(req_len).context("request length exceeds protocol limit")?;
-        let proto_req = Request::new(opcode, req.sector, byte_len, 0);
+        let proto_req = Request::new(export_id, opcode, req.sector, num_blocks, 0);
         gadget
             .send_request(proto_req)
             .await
@@ -437,16 +628,16 @@ async fn handle_request(
         let response = gadget.read_response().await.context("read smoo response")?;
 
         let status = response_status(&response, req_len)?;
-        if status >= 0 && status as usize != req_len {
+        if status >= 0 && response.num_blocks as usize != num_blocks as usize {
             warn!(
                 queue = req.queue_id,
                 tag = req.tag,
-                expected = req_len,
-                reported = status,
-                "response byte count mismatch"
+                expected_blocks = num_blocks,
+                reported_blocks = response.num_blocks,
+                "response block count mismatch"
             );
         }
-        device
+        slot.device()
             .complete_io(req, status)
             .context("complete ublk request")?;
         Ok(())
@@ -569,11 +760,18 @@ async fn handle_config_request(
     setup: SetupPacket,
     tx: &mut mpsc::Sender<ControlMessage>,
 ) -> Result<()> {
+    let length = setup.length() as usize;
     ensure!(
-        setup.length() as usize == ConfigExportsV0::ENCODED_LEN,
-        "CONFIG_EXPORTS payload length mismatch"
+        length >= ConfigExportsV0::HEADER_LEN,
+        "CONFIG_EXPORTS payload too short"
     );
-    let mut buf = [0u8; ConfigExportsV0::ENCODED_LEN];
+    let max_len =
+        ConfigExportsV0::HEADER_LEN + ConfigExportsV0::MAX_EXPORTS * ConfigExportsV0::ENTRY_LEN;
+    ensure!(
+        length <= max_len,
+        "CONFIG_EXPORTS payload too large ({length} bytes)"
+    );
+    let mut buf = vec![0u8; length];
     ep0.read_out(&mut buf)
         .await
         .context("read CONFIG_EXPORTS")?;
@@ -607,14 +805,10 @@ fn opcode_from_ublk(op: UblkOp) -> Option<OpCode> {
 }
 
 fn response_status(resp: &Response, expected_len: usize) -> Result<i32> {
-    if resp.flags != 0 {
-        let errno = i32::try_from(resp.flags).unwrap_or(libc::EIO);
-        return Ok(-errno);
+    if resp.status != 0 {
+        return Ok(-i32::from(resp.status));
     }
-    let len = resp.byte_len as usize;
-    i32::try_from(len)
-        .or_else(|_| i32::try_from(expected_len))
-        .map_err(|_| anyhow!("response length exceeds i32"))
+    i32::try_from(expected_len).map_err(|_| anyhow!("response length exceeds i32"))
 }
 
 fn request_byte_len(req: &UblkIoRequest, block_size: usize) -> io::Result<usize> {
@@ -623,6 +817,18 @@ fn request_byte_len(req: &UblkIoRequest, block_size: usize) -> io::Result<usize>
     sectors
         .checked_mul(block_size)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "request byte length overflow"))
+}
+
+fn request_within_bounds(slot: &ExportSlot, lba: u64, num_blocks: u32) -> bool {
+    if let Some(capacity) = slot.capacity_blocks() {
+        let num = num_blocks as u64;
+        match lba.checked_add(num) {
+            Some(end) => end <= capacity,
+            None => false,
+        }
+    } else {
+        true
+    }
 }
 
 fn errno_from_io(err: &io::Error) -> i32 {
@@ -636,41 +842,34 @@ fn errno_from_io(err: &io::Error) -> i32 {
     })
 }
 
-struct RecoveryOutcome {
-    device: Option<SmooUblkDevice>,
-    session_valid: bool,
-}
-
 async fn initialize_session(
     ublk: &mut SmooUblk,
     state_file: Option<&StateFile>,
-) -> Result<(u64, Option<SmooUblkDevice>)> {
+) -> Result<(u64, Vec<ExportSlot>)> {
     if let Some(state_file) = state_file {
         match state_file.load() {
-            Ok(Some(snapshot)) => {
-                let recovery = attempt_recovery(ublk, state_file, &snapshot).await?;
-                if recovery.session_valid {
+            Ok(Some(snapshot)) => match recover_exports(ublk, state_file, &snapshot).await {
+                Ok(slots) => {
                     info!(
                         session_id = snapshot.session_id,
+                        exports = slots.len(),
                         "restored gadget session from state file"
                     );
-                    Ok((snapshot.session_id, recovery.device))
-                } else {
-                    let session_id = generate_session_id();
-                    info!(
-                        session_id,
-                        "state file invalid; starting new gadget session"
-                    );
-                    Ok((session_id, None))
+                    Ok((snapshot.session_id, slots))
                 }
-            }
+                Err(err) => {
+                    warn!(error = ?err, "state file invalid; starting new gadget session");
+                    let session_id = generate_session_id();
+                    Ok((session_id, Vec::new()))
+                }
+            },
             Ok(None) => {
                 let session_id = generate_session_id();
                 info!(
                     session_id,
                     "state file missing or empty; starting cold session"
                 );
-                Ok((session_id, None))
+                Ok((session_id, Vec::new()))
             }
             Err(err) => {
                 warn!(
@@ -684,7 +883,7 @@ async fn initialize_session(
                     session_id,
                     "state file cleared after read failure; starting new session"
                 );
-                Ok((session_id, None))
+                Ok((session_id, Vec::new()))
             }
         }
     } else {
@@ -693,98 +892,96 @@ async fn initialize_session(
             session_id,
             "state tracking disabled; starting new gadget session"
         );
-        Ok((session_id, None))
+        Ok((session_id, Vec::new()))
     }
 }
 
-async fn attempt_recovery(
+async fn recover_exports(
     ublk: &mut SmooUblk,
     state_file: &StateFile,
     snapshot: &StateSnapshot,
-) -> Result<RecoveryOutcome> {
+) -> Result<Vec<ExportSlot>> {
     if snapshot.exports.is_empty() {
         debug!(
             path = ?state_file.path(),
             "state file present but no exports recorded; nothing to recover"
         );
-        return Ok(RecoveryOutcome {
-            device: None,
-            session_valid: true,
-        });
+        return Ok(Vec::new());
     }
-    if snapshot.exports.len() > 1 {
-        warn!(
+    let mut slots = Vec::new();
+    for export_state in &snapshot.exports {
+        info!(
             path = ?state_file.path(),
-            exports = snapshot.exports.len(),
-            "multi-export state unsupported; clearing state file"
+            export_id = export_state.export_id,
+            dev_id = export_state.ublk_dev_id,
+            "state file found, attempting ublk recovery"
         );
-        let _ = state_file.clear();
-        return Ok(RecoveryOutcome {
-            device: None,
-            session_valid: false,
-        });
-    }
-    let export_state = &snapshot.exports[0];
-    info!(
-        path = ?state_file.path(),
-        export_id = export_state.export_id,
-        dev_id = export_state.ublk_dev_id,
-        "state file found, attempting ublk recovery"
-    );
-    let cdev_path = format!("/dev/ublkc{}", export_state.ublk_dev_id);
-    if !Path::new(&cdev_path).exists() {
-        warn!(?cdev_path, "ublk device missing; removing state file");
-        let _ = state_file.clear();
-        return Ok(RecoveryOutcome {
-            device: None,
-            session_valid: false,
-        });
-    }
-    match ublk.recover_existing_device(export_state.ublk_dev_id).await {
-        Ok(device) => {
-            info!(
-                dev_id = export_state.ublk_dev_id,
-                session_id = snapshot.session_id,
-                "ublk recovery succeeded"
-            );
-            Ok(RecoveryOutcome {
-                device: Some(device),
-                session_valid: true,
-            })
-        }
-        Err(err) => {
-            warn!(
-                dev_id = export_state.ublk_dev_id,
-                error = ?err,
-                "ublk recovery failed; removing state file"
-            );
-            if Path::new(&cdev_path).exists() {
-                if let Err(clean_err) = ublk.force_remove_device(export_state.ublk_dev_id).await {
-                    warn!(
-                        dev_id = export_state.ublk_dev_id,
-                        error = ?clean_err,
-                        "failed to remove stale ublk device"
-                    );
-                }
-            }
+        let cdev_path = format!("/dev/ublkc{}", export_state.ublk_dev_id);
+        if !Path::new(&cdev_path).exists() {
+            warn!(?cdev_path, "ublk device missing; removing state file");
             let _ = state_file.clear();
-            Ok(RecoveryOutcome {
-                device: None,
-                session_valid: false,
-            })
+            return Err(anyhow!("ublk device {} missing", export_state.ublk_dev_id));
+        }
+        match ublk.recover_existing_device(export_state.ublk_dev_id).await {
+            Ok(device) => {
+                ensure!(
+                    device.block_size() as u32 == export_state.block_size,
+                    "recovered export block size mismatch"
+                );
+                let expected_blocks = export_state
+                    .size_bytes
+                    .checked_div(export_state.block_size as u64)
+                    .context("state file size smaller than block size")?;
+                ensure!(expected_blocks > 0, "state file export size too small");
+                ensure!(
+                    device.block_count() as u64 == expected_blocks,
+                    "recovered export capacity mismatch"
+                );
+                slots.push(ExportSlot::new(
+                    export_state.export_id,
+                    export_state.block_size,
+                    export_state.size_bytes,
+                    device,
+                ));
+            }
+            Err(err) => {
+                warn!(
+                    dev_id = export_state.ublk_dev_id,
+                    error = ?err,
+                    "ublk recovery failed; removing state file"
+                );
+                if Path::new(&cdev_path).exists() {
+                    if let Err(clean_err) = ublk.force_remove_device(export_state.ublk_dev_id).await
+                    {
+                        warn!(
+                            dev_id = export_state.ublk_dev_id,
+                            error = ?clean_err,
+                            "failed to remove stale ublk device"
+                        );
+                    }
+                }
+                for slot in slots.drain(..) {
+                    if let Err(stop_err) = ublk.stop_dev(slot.device, true).await {
+                        warn!(error = ?stop_err, "failed to stop recovered device during cleanup");
+                    }
+                }
+                let _ = state_file.clear();
+                return Err(anyhow!("ublk recovery failed"));
+            }
         }
     }
+    Ok(slots)
 }
 
 async fn process_control_message(
     msg: ControlMessage,
     ublk: &mut SmooUblk,
-    device: &mut Option<SmooUblkDevice>,
+    exports: &mut ExportsRuntime,
     runtime: &RuntimeConfig,
 ) -> Result<()> {
     match msg {
         ControlMessage::Config(cmd) => {
-            let result = apply_config(ublk, device, runtime, cmd.payload).await;
+            let result = apply_config(ublk, exports, runtime, cmd.payload).await;
             let reply = result.map(|_| ());
             let _ = cmd.respond_to.send(reply);
         }
@@ -794,102 +991,123 @@ async fn process_control_message(
 
 async fn apply_config(
     ublk: &mut SmooUblk,
-    device_slot: &mut Option<SmooUblkDevice>,
+    exports: &mut ExportsRuntime,
     runtime: &RuntimeConfig,
     config: ConfigExportsV0,
 ) -> Result<()> {
-    match config.export() {
-        None => {
-            if let Some(device) = device_slot.take() {
-                info!("CONFIG_EXPORTS removing current export");
-                ublk.stop_dev(device, true)
-                    .await
-                    .context("stop ublk device after CONFIG_EXPORTS (count=0)")?;
-            } else {
-                info!("CONFIG_EXPORTS requested zero exports (already idle)");
-            }
-            if let Some(state_file) = runtime.state_file() {
-                if let Err(err) = state_file.clear() {
-                    warn!(error = ?err, "failed to clear state file");
-                }
-            }
-            runtime.status().set_export_count(0).await;
-            Ok(())
-        }
-        Some(export) => {
-            let block_size = export.block_size as usize;
-            ensure!(
-                export.size_bytes != 0,
-                "CONFIG_EXPORTS size_bytes must be non-zero"
-            );
-            let blocks = export
-                .size_bytes
-                .checked_div(block_size as u64)
-                .context("size bytes smaller than block size")?;
-            ensure!(blocks > 0, "export size too small");
-            let block_count =
-                usize::try_from(blocks).context("block count exceeds usize capacity")?;
-
-            if let Some(existing) = device_slot.as_mut() {
-                if existing.recovery_pending() {
-                    let matches = existing.block_size() == block_size
-                        && existing.block_count() == block_count
-                        && existing.queue_count() == runtime.queue_count
-                        && existing.queue_depth() == runtime.queue_depth;
-                    ensure!(
-                        matches,
-                        "recovered export geometry mismatch; clear state file and retry"
-                    );
-                    info!("CONFIG_EXPORTS matches recovered export; finalizing recovery");
-                    ublk.finalize_recovery(existing)
-                        .await
-                        .context("complete ublk recovery")?;
-                    runtime.status().set_export_count(1).await;
-                    if let Some(state_file) = runtime.state_file() {
-                        let export_state = ExportState {
-                            export_id: SINGLE_EXPORT_ID,
-                            ublk_dev_id: existing.dev_id(),
-                        };
-                        let session_id = runtime.status().session_id().await;
-                        if let Err(err) = state_file.store(session_id, &[export_state]) {
-                            warn!(error = ?err, "failed to write state file");
-                        }
-                    }
-                    return Ok(());
-                }
-                let device = device_slot.take().expect("device present");
-                info!("CONFIG_EXPORTS replacing existing export");
-                ublk.stop_dev(device, true)
-                    .await
-                    .context("stop ublk device before reconfigure")?;
-            } else {
-                info!("CONFIG_EXPORTS creating export");
-            }
-
-            let new_device = ublk
-                .setup_device(
-                    block_size,
-                    block_count,
-                    runtime.queue_count,
-                    runtime.queue_depth,
-                )
-                .await
-                .context("setup ublk device from CONFIG_EXPORTS")?;
-            runtime.status().set_export_count(1).await;
-            if let Some(state_file) = runtime.state_file() {
-                let export_state = ExportState {
-                    export_id: SINGLE_EXPORT_ID,
-                    ublk_dev_id: new_device.dev_id(),
-                };
-                let session_id = runtime.status().session_id().await;
-                if let Err(err) = state_file.store(session_id, &[export_state]) {
-                    warn!(error = ?err, "failed to write state file");
-                }
-            }
-            *device_slot = Some(new_device);
-            Ok(())
+    let desired = config.entries();
+    let desired_ids: HashSet<u32> = desired.iter().map(|entry| entry.export_id).collect();
+    let current_ids: Vec<u32> = exports.entries.keys().copied().collect();
+    for export_id in current_ids {
+        if !desired_ids.contains(&export_id) {
+            info!(export_id, "CONFIG_EXPORTS removing export");
+            exports.remove(export_id, ublk).await?;
         }
     }
+    for entry in desired {
+        match exports.get_mut(entry.export_id) {
+            Some(slot) => {
+                if slot.device().recovery_pending() {
+                    ensure!(
+                        slot.block_size == entry.block_size,
+                        "recovered export {} block size mismatch",
+                        entry.export_id
+                    );
+                    let required_blocks = required_block_count(entry)?;
+                    ensure!(
+                        slot.device().block_count() == required_blocks,
+                        "recovered export {} capacity mismatch",
+                        entry.export_id
+                    );
+                    ensure!(
+                        slot.device().queue_count() == runtime.queue_count
+                            && slot.device().queue_depth() == runtime.queue_depth,
+                        "recovered export {} queue geometry mismatch",
+                        entry.export_id
+                    );
+                    info!(
+                        export_id = entry.export_id,
+                        "CONFIG_EXPORTS matches recovered export; finalizing recovery"
+                    );
+                    ublk.finalize_recovery(slot.device_mut())
+                        .await
+                        .context("complete ublk recovery")?;
+                    slot.start_request_task(runtime.pending_tx())?;
+                } else {
+                    info!(
+                        export_id = entry.export_id,
+                        "CONFIG_EXPORTS replacing active export"
+                    );
+                    exports.remove(entry.export_id, ublk).await?;
+                    let mut slot = new_export_slot(ublk, runtime, entry).await?;
+                    slot.start_request_task(runtime.pending_tx())?;
+                    exports.insert(slot);
+                }
+            }
+            None => {
+                info!(
+                    export_id = entry.export_id,
+                    "CONFIG_EXPORTS creating export"
+                );
+                let mut slot = new_export_slot(ublk, runtime, entry).await?;
+                slot.start_request_task(runtime.pending_tx())?;
+                exports.insert(slot);
+            }
+        }
+    }
+    runtime
+        .status()
+        .set_export_count(exports.len() as u32)
+        .await;
+    if let Some(state_file) = runtime.state_file() {
+        let session_id = runtime.status().session_id().await;
+        if exports.len() > 0 {
+            let states = exports.export_states();
+            if let Err(err) = state_file.store(session_id, &states) {
+                warn!(error = ?err, "failed to write state file");
+            }
+        } else if let Err(err) = state_file.clear() {
+            warn!(error = ?err, "failed to clear state file");
+        }
+    }
+    Ok(())
+}
+
+fn required_block_count(entry: &ExportConfig) -> Result<usize> {
+    ensure!(
+        entry.size_bytes != 0,
+        "CONFIG_EXPORTS size_bytes must be non-zero for export {}",
+        entry.export_id
+    );
+    let blocks = entry
+        .size_bytes
+        .checked_div(entry.block_size as u64)
+        .context("size bytes smaller than block size")?;
+    ensure!(blocks > 0, "export {} size too small", entry.export_id);
+    usize::try_from(blocks).context("block count exceeds usize capacity")
+}
+
+async fn new_export_slot(
+    ublk: &mut SmooUblk,
+    runtime: &RuntimeConfig,
+    entry: &ExportConfig,
+) -> Result<ExportSlot> {
+    let block_count = required_block_count(entry)?;
+    let device = ublk
+        .setup_device(
+            entry.block_size as usize,
+            block_count,
+            runtime.queue_count,
+            runtime.queue_depth,
+        )
+        .await
+        .context("setup ublk device from CONFIG_EXPORTS")?;
+    Ok(ExportSlot::new(
+        entry.export_id,
+        entry.block_size,
+        entry.size_bytes,
+        device,
+    ))
 }
 
 struct GadgetGuard {
@@ -1007,7 +1225,7 @@ mod state {
         fs, io,
         path::{Path, PathBuf},
     };
-    const SNAPSHOT_VERSION: u32 = 0;
+    const SNAPSHOT_VERSION: u32 = 1;
 
     #[derive(Clone)]
     pub struct StateFile {
@@ -1068,6 +1286,8 @@ mod state {
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct ExportState {
         pub export_id: u32,
+        pub block_size: u32,
+        pub size_bytes: u64,
         pub ublk_dev_id: u32,
     }
 
@@ -1091,6 +1311,8 @@ mod state {
             let state_file = StateFile::new(path.clone());
             let exports = vec![ExportState {
                 export_id: 0,
+                block_size: 4096,
+                size_bytes: 4096 * 128,
                 ublk_dev_id: 7,
             }];
             state_file.store(42, &exports).unwrap();

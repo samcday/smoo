@@ -3,6 +3,7 @@ use crate::{
     TransportErrorKind,
 };
 use alloc::{
+    collections::BTreeMap,
     string::{String, ToString},
     vec::Vec,
 };
@@ -79,19 +80,46 @@ pub type HostResult<T> = core::result::Result<T, HostError>;
 /// Core host driver tying a [`Transport`] to a [`BlockSource`].
 pub struct SmooHost<T, S> {
     transport: T,
-    source: S,
+    exports: BTreeMap<u32, ExportHandle<S>>,
     ident: Option<Ident>,
+}
+
+/// Descriptor for a host-side export.
+#[derive(Clone)]
+pub struct HostExport<S> {
+    pub export_id: u32,
+    pub source: S,
+    pub block_size: u32,
+    pub size_bytes: u64,
+}
+
+#[derive(Clone)]
+struct ExportHandle<S> {
+    source: S,
+    block_size: u32,
+    size_bytes: u64,
 }
 
 impl<T, S> SmooHost<T, S>
 where
     T: Transport,
-    S: BlockSource,
+    S: BlockSource + Clone,
 {
-    pub fn new(transport: T, source: S) -> Self {
+    pub fn new(transport: T, exports: Vec<HostExport<S>>) -> Self {
+        let mut map = BTreeMap::new();
+        for entry in exports {
+            map.insert(
+                entry.export_id,
+                ExportHandle {
+                    source: entry.source,
+                    block_size: entry.block_size,
+                    size_bytes: entry.size_bytes,
+                },
+            );
+        }
         Self {
             transport,
-            source,
+            exports: map,
             ident: None,
         }
     }
@@ -123,49 +151,58 @@ where
     }
 
     async fn handle_request(&mut self, request: Request) -> HostResult<Response> {
+        let export = match self.exports.get(&request.export_id) {
+            Some(export) => export.clone(),
+            None => return Ok(missing_export_response(&request)),
+        };
         match request.op {
-            OpCode::Read => self.handle_read(request).await,
-            OpCode::Write => self.handle_write(request).await,
-            OpCode::Flush => match self.source.flush().await {
+            OpCode::Read => self.handle_read(export.clone(), &request).await,
+            OpCode::Write => self.handle_write(export.clone(), &request).await,
+            OpCode::Flush => match export.source.flush().await {
                 Ok(()) => Ok(Response::new(
+                    request.export_id,
                     OpCode::Flush,
+                    0,
                     request.lba,
-                    request.byte_len,
+                    request.num_blocks,
                     0,
                 )),
-                Err(err) => Ok(response_from_block_error(request, err)),
+                Err(err) => Ok(response_from_block_error(&request, err)),
             },
             OpCode::Discard => {
-                let block_size = self.source.block_size();
-                let blocks = match self.byte_len_to_blocks(request.byte_len, block_size) {
-                    Ok(value) => value,
-                    Err(_) => return Ok(invalid_request_response(request)),
-                };
-                match self.source.discard(request.lba, blocks).await {
+                if !self.validate_bounds(&export, &request) {
+                    return Ok(invalid_request_response(&request));
+                }
+                match export.source.discard(request.lba, request.num_blocks).await {
                     Ok(()) => Ok(Response::new(
+                        request.export_id,
                         OpCode::Discard,
+                        0,
                         request.lba,
-                        request.byte_len,
+                        request.num_blocks,
                         0,
                     )),
-                    Err(err) => Ok(response_from_block_error(request, err)),
+                    Err(err) => Ok(response_from_block_error(&request, err)),
                 }
             }
         }
     }
 
-    async fn handle_read(&mut self, request: Request) -> HostResult<Response> {
-        let block_size = self.source.block_size();
-        if self
-            .byte_len_to_blocks(request.byte_len, block_size)
-            .is_err()
-        {
+    async fn handle_read(
+        &mut self,
+        export: ExportHandle<S>,
+        request: &Request,
+    ) -> HostResult<Response> {
+        if !self.validate_bounds(&export, request) {
             return Ok(invalid_request_response(request));
         }
-        let byte_len = request.byte_len as usize;
+        let byte_len = match blocks_to_bytes(request.num_blocks, export.block_size) {
+            Ok(len) => len,
+            Err(_) => return Ok(invalid_request_response(request)),
+        };
         if byte_len > 0 {
             let mut buf: Vec<u8> = vec![0u8; byte_len];
-            let read = match self.source.read_blocks(request.lba, &mut buf).await {
+            let read = match export.source.read_blocks(request.lba, &mut buf).await {
                 Ok(len) => len,
                 Err(err) => return Ok(response_from_block_error(request, err)),
             };
@@ -175,26 +212,31 @@ where
             self.transport.write_bulk(&buf).await?;
         }
         Ok(Response::new(
+            request.export_id,
             OpCode::Read,
+            0,
             request.lba,
-            request.byte_len,
+            request.num_blocks,
             0,
         ))
     }
 
-    async fn handle_write(&mut self, request: Request) -> HostResult<Response> {
-        let block_size = self.source.block_size();
-        if self
-            .byte_len_to_blocks(request.byte_len, block_size)
-            .is_err()
-        {
+    async fn handle_write(
+        &mut self,
+        export: ExportHandle<S>,
+        request: &Request,
+    ) -> HostResult<Response> {
+        if !self.validate_bounds(&export, request) {
             return Ok(invalid_request_response(request));
         }
-        let byte_len = request.byte_len as usize;
+        let byte_len = match blocks_to_bytes(request.num_blocks, export.block_size) {
+            Ok(len) => len,
+            Err(_) => return Ok(invalid_request_response(request)),
+        };
         if byte_len > 0 {
             let mut buf: Vec<u8> = vec![0u8; byte_len];
             self.transport.read_bulk(&mut buf).await?;
-            let written = match self.source.write_blocks(request.lba, &buf).await {
+            let written = match export.source.write_blocks(request.lba, &buf).await {
                 Ok(len) => len,
                 Err(err) => return Ok(response_from_block_error(request, err)),
             };
@@ -203,47 +245,92 @@ where
             }
         }
         Ok(Response::new(
+            request.export_id,
             OpCode::Write,
+            0,
             request.lba,
-            request.byte_len,
+            request.num_blocks,
             0,
         ))
     }
 
-    fn byte_len_to_blocks(&self, byte_len: u32, block_size: u32) -> HostResult<u32> {
-        if block_size == 0 {
-            return Err(HostError::with_message(
-                HostErrorKind::InvalidRequest,
-                "block size is zero",
-            ));
+    fn validate_bounds(&self, export: &ExportHandle<S>, request: &Request) -> bool {
+        if export.block_size == 0 {
+            return false;
         }
-        if byte_len % block_size != 0 {
-            return Err(HostError::with_message(
-                HostErrorKind::InvalidRequest,
-                "request byte length must align to block size",
-            ));
+        if let Some(capacity_blocks) = capacity_blocks(export.size_bytes, export.block_size) {
+            let request_blocks = request.num_blocks as u64;
+            if request_blocks == 0 {
+                return request.lba <= capacity_blocks;
+            }
+            match request.lba.checked_add(request_blocks) {
+                Some(end) => end <= capacity_blocks,
+                None => false,
+            }
+        } else {
+            true
         }
-        Ok(byte_len / block_size)
     }
 }
 
-const ERRNO_EINVAL: u32 = 22;
-const ERRNO_EIO: u32 = 5;
-const ERRNO_EOPNOTSUPP: u32 = 95;
+const ERRNO_EINVAL: u8 = 22;
+const ERRNO_EIO: u8 = 5;
+const ERRNO_EOPNOTSUPP: u8 = 95;
 
-fn invalid_request_response(request: Request) -> Response {
-    Response::new(request.op, request.lba, 0, ERRNO_EINVAL)
+fn invalid_request_response(request: &Request) -> Response {
+    Response::new(
+        request.export_id,
+        request.op,
+        ERRNO_EINVAL,
+        request.lba,
+        request.num_blocks,
+        0,
+    )
 }
 
-fn short_io_response(request: Request) -> Response {
-    Response::new(request.op, request.lba, 0, ERRNO_EIO)
+fn short_io_response(request: &Request) -> Response {
+    Response::new(
+        request.export_id,
+        request.op,
+        ERRNO_EIO,
+        request.lba,
+        request.num_blocks,
+        0,
+    )
 }
 
-fn response_from_block_error(request: Request, err: BlockSourceError) -> Response {
+fn missing_export_response(request: &Request) -> Response {
+    Response::new(request.export_id, request.op, ERRNO_EINVAL, 0, 0, 0)
+}
+
+fn response_from_block_error(request: &Request, err: BlockSourceError) -> Response {
     let errno = match err.kind() {
         BlockSourceErrorKind::InvalidInput | BlockSourceErrorKind::OutOfRange => ERRNO_EINVAL,
         BlockSourceErrorKind::Unsupported => ERRNO_EOPNOTSUPP,
         BlockSourceErrorKind::Io | BlockSourceErrorKind::Other => ERRNO_EIO,
     };
-    Response::new(request.op, request.lba, 0, errno)
+    Response::new(
+        request.export_id,
+        request.op,
+        errno,
+        request.lba,
+        request.num_blocks,
+        0,
+    )
+}
+
+fn blocks_to_bytes(num_blocks: u32, block_size: u32) -> HostResult<usize> {
+    let block_size = block_size as usize;
+    let blocks = num_blocks as usize;
+    block_size.checked_mul(blocks).ok_or_else(|| {
+        HostError::with_message(HostErrorKind::InvalidRequest, "block count overflow")
+    })
+}
+
+fn capacity_blocks(size_bytes: u64, block_size: u32) -> Option<u64> {
+    if size_bytes == 0 {
+        None
+    } else {
+        Some(size_bytes / block_size as u64)
+    }
 }

@@ -1,11 +1,14 @@
 use anyhow::{anyhow, ensure, Context, Result};
-use clap::{ArgGroup, Parser};
+use clap::Parser;
 use rusb::{Direction, TransferType, UsbContext};
-use smoo_host_blocksources::{DeviceBlockSource, FileBlockSource};
+use smoo_host_blocksources::FileBlockSource;
 use smoo_host_core::{
-    BlockSource, BlockSourceResult, HostErrorKind, SmooHost, TransportError, TransportErrorKind,
+    BlockSource, BlockSourceResult, HostErrorKind, HostExport, SmooHost, TransportError,
+    TransportErrorKind,
 };
-use smoo_host_rusb::{ConfigExportsV0Payload, RusbTransport, RusbTransportConfig, StatusClient};
+use smoo_host_rusb::{
+    ConfigExportEntry, ConfigExportsV0Payload, RusbTransport, RusbTransportConfig, StatusClient,
+};
 use smoo_proto::SmooStatusV0;
 use std::{fmt, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{signal, sync::mpsc, time};
@@ -27,7 +30,6 @@ const RECONNECT_PAUSE: Duration = Duration::from_secs(1);
     about = "Host shim for smoo gadgets",
     long_about = "Host shim for smoo gadgets. By default all visible USB devices are scanned and the first interface matching the vendor triple 0xFF/0x53/0x4D is selected."
 )]
-#[command(group = ArgGroup::new("backing").args(["file", "device"]).required(true))]
 struct Args {
     /// Optional USB vendor ID filter (hex). Defaults to all vendors.
     #[arg(long, value_name = "HEX", value_parser = parse_hex_u16)]
@@ -35,12 +37,9 @@ struct Args {
     /// Optional USB product ID filter (hex). Defaults to all products.
     #[arg(long, value_name = "HEX", value_parser = parse_hex_u16)]
     product_id: Option<u16>,
-    /// Optional disk image backing file
-    #[arg(long, value_name = "PATH")]
-    file: Option<PathBuf>,
-    /// Optional block device backing file
-    #[arg(long, value_name = "PATH")]
-    device: Option<PathBuf>,
+    /// Disk image backing file(s). Repeatable for multiple exports.
+    #[arg(long = "file", value_name = "PATH", required = true)]
+    files: Vec<PathBuf>,
     /// Logical block size exposed through the gadget (bytes)
     #[arg(long, default_value_t = 512)]
     block_size: u32,
@@ -51,7 +50,6 @@ struct Args {
 
 enum HostSource {
     File(FileBlockSource),
-    Device(DeviceBlockSource),
 }
 
 #[derive(Clone)]
@@ -72,42 +70,36 @@ impl BlockSource for HostSource {
     fn block_size(&self) -> u32 {
         match self {
             HostSource::File(inner) => inner.block_size(),
-            HostSource::Device(inner) => inner.block_size(),
         }
     }
 
     async fn total_blocks(&self) -> BlockSourceResult<u64> {
         match self {
             HostSource::File(inner) => inner.total_blocks().await,
-            HostSource::Device(inner) => inner.total_blocks().await,
         }
     }
 
     async fn read_blocks(&self, lba: u64, buf: &mut [u8]) -> BlockSourceResult<usize> {
         match self {
             HostSource::File(inner) => inner.read_blocks(lba, buf).await,
-            HostSource::Device(inner) => inner.read_blocks(lba, buf).await,
         }
     }
 
     async fn write_blocks(&self, lba: u64, buf: &[u8]) -> BlockSourceResult<usize> {
         match self {
             HostSource::File(inner) => inner.write_blocks(lba, buf).await,
-            HostSource::Device(inner) => inner.write_blocks(lba, buf).await,
         }
     }
 
     async fn flush(&self) -> BlockSourceResult<()> {
         match self {
             HostSource::File(inner) => inner.flush().await,
-            HostSource::Device(inner) => inner.flush().await,
         }
     }
 
     async fn discard(&self, lba: u64, num_blocks: u32) -> BlockSourceResult<()> {
         match self {
             HostSource::File(inner) => inner.discard(lba, num_blocks).await,
-            HostSource::Device(inner) => inner.discard(lba, num_blocks).await,
         }
     }
 }
@@ -139,6 +131,15 @@ impl BlockSource for SharedSource {
     }
 }
 
+#[derive(Clone)]
+struct ExportSourceConfig {
+    export_id: u32,
+    source: SharedSource,
+    block_size: u32,
+    size_bytes: u64,
+    path: PathBuf,
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -148,28 +149,11 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let source = SharedSource::new(open_source(&args).await.context("open block source")?);
-    let block_size = source.block_size();
-    let size_bytes = match source.total_blocks().await {
-        Ok(blocks) => blocks.checked_mul(block_size as u64).unwrap_or(0),
-        Err(err) => {
-            warn!(error = %err, "determine total blocks failed; advertising dynamic size");
-            0
-        }
-    };
+    let exports = open_sources(&args).await.context("open export sources")?;
     let mut expected_session_id = None;
     let mut has_connected = false;
     loop {
-        match run_session(
-            &args,
-            source.clone(),
-            block_size,
-            size_bytes,
-            &mut expected_session_id,
-            has_connected,
-        )
-        .await?
-        {
+        match run_session(&args, &exports, &mut expected_session_id, has_connected).await? {
             SessionEnd::Shutdown => break,
             SessionEnd::TransportLost => {
                 info!("gadget disconnected; waiting for reconnection");
@@ -189,9 +173,7 @@ enum SessionEnd {
 
 async fn run_session(
     args: &Args,
-    source: SharedSource,
-    block_size: u32,
-    size_bytes: u64,
+    exports: &[ExportSourceConfig],
     expected_session_id: &mut Option<u64>,
     has_connected: bool,
 ) -> Result<SessionEnd> {
@@ -240,16 +222,31 @@ async fn run_session(
         minor = ident.minor,
         "gadget IDENT response"
     );
-    let config_payload = ConfigExportsV0Payload::single_export(block_size, size_bytes);
+    let config_entries: Vec<ConfigExportEntry> = exports
+        .iter()
+        .map(|cfg| ConfigExportEntry {
+            export_id: cfg.export_id,
+            block_size: cfg.block_size,
+            size_bytes: cfg.size_bytes,
+        })
+        .collect();
+    let config_payload = ConfigExportsV0Payload::new(config_entries)
+        .map_err(|err| anyhow!(err.to_string()))
+        .context("build CONFIG_EXPORTS payload")?;
     transport
         .send_config_exports_v0(&config_payload)
         .await
         .context("CONFIG_EXPORTS control transfer")?;
-    info!(
-        block_size = block_size,
-        size_bytes = size_bytes,
-        "configured gadget export"
-    );
+    info!(count = exports.len(), "configured gadget exports");
+    for cfg in exports {
+        info!(
+            export_id = cfg.export_id,
+            path = %cfg.path.display(),
+            block_size = cfg.block_size,
+            size_bytes = cfg.size_bytes,
+            "export ready"
+        );
+    }
     let status_client = transport.status_client();
     let initial_status =
         match fetch_status_with_retry(&status_client, STATUS_RETRY_ATTEMPTS, STATUS_RETRY_INTERVAL)
@@ -266,8 +263,9 @@ async fn run_session(
         "gadget reports no active export after CONFIG_EXPORTS"
     );
     ensure!(
-        initial_status.export_count >= 1,
-        "gadget export count invalid ({})",
+        initial_status.export_count as usize == exports.len(),
+        "gadget export count mismatch (expected {}, got {})",
+        exports.len(),
         initial_status.export_count
     );
     match expected_session_id {
@@ -297,7 +295,16 @@ async fn run_session(
             let _ = heartbeat_tx.send(err);
         }
     });
-    let mut host = SmooHost::new(transport, source);
+    let host_exports = exports
+        .iter()
+        .map(|cfg| HostExport {
+            export_id: cfg.export_id,
+            source: cfg.source.clone(),
+            block_size: cfg.block_size,
+            size_bytes: cfg.size_bytes,
+        })
+        .collect();
+    let mut host = SmooHost::new(transport, host_exports);
     let ident = host.setup().await.context("ident handshake")?;
     info!(
         major = ident.major,
@@ -353,17 +360,35 @@ async fn run_session(
     Ok(outcome)
 }
 
-async fn open_source(args: &Args) -> Result<HostSource> {
-    let block_size = args.block_size;
-    match (&args.file, &args.device) {
-        (Some(path), None) => Ok(HostSource::File(
-            FileBlockSource::open(path, block_size).await?,
-        )),
-        (None, Some(path)) => Ok(HostSource::Device(
-            DeviceBlockSource::open(path, block_size).await?,
-        )),
-        _ => unreachable!("clap enforces mutually exclusive arguments"),
+async fn open_sources(args: &Args) -> Result<Vec<ExportSourceConfig>> {
+    let mut exports = Vec::with_capacity(args.files.len());
+    for (idx, path) in args.files.iter().enumerate() {
+        let export_id =
+            u32::try_from(idx + 1).map_err(|_| anyhow!("too many exports for u32 export_id"))?;
+        let source = SharedSource::new(HostSource::File(
+            FileBlockSource::open(path, args.block_size).await?,
+        ));
+        let block_size = source.block_size();
+        let size_bytes = match source.total_blocks().await {
+            Ok(blocks) => blocks.checked_mul(block_size as u64).unwrap_or(0),
+            Err(err) => {
+                warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "determine total blocks failed; advertising dynamic size"
+                );
+                0
+            }
+        };
+        exports.push(ExportSourceConfig {
+            export_id,
+            source,
+            block_size,
+            size_bytes,
+            path: path.clone(),
+        });
     }
+    Ok(exports)
 }
 
 fn discover_device(args: &Args, log_scan: bool) -> Result<(rusb::DeviceHandle<rusb::Context>, u8)> {
