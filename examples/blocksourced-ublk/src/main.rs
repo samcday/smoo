@@ -21,7 +21,7 @@ use anyhow::{Context, ensure};
 use clap::{ArgGroup, Parser};
 use smoo_gadget_ublk::{SmooUblk, UblkIoRequest, UblkOp};
 use smoo_host_blocksources::{DeviceBlockSource, FileBlockSource};
-use smoo_host_core::BlockSource;
+use smoo_host_core::{BlockSource, BlockSourceError, BlockSourceErrorKind};
 use smoo_purrfection::{DebugPatternProvider, Geometry, VirtualFatBlockSource};
 use std::{io, path::PathBuf, sync::Arc};
 use tokio::sync::Notify;
@@ -160,7 +160,7 @@ async fn main() -> anyhow::Result<()> {
                     "handling request"
                 );
 
-                let result_bytes = match req.op {
+                let op_result: Result<usize, BlockSourceError> = match req.op {
                     UblkOp::Read => {
                         if req_len > device.buffer_len() {
                             warn!(
@@ -178,11 +178,13 @@ async fn main() -> anyhow::Result<()> {
                         let mut buf = device
                             .checkout_buffer(req.queue_id, req.tag)
                             .context("checkout buffer")?;
-                        source
+                        match source
                             .read_blocks(req_geom.lba, &mut buf.as_mut_slice()[..req_len])
                             .await
-                            .context("read backing source")?;
-                        req_len
+                        {
+                            Ok(_) => Ok(req_len),
+                            Err(err) => Err(err),
+                        }
                     }
                     UblkOp::Write => {
                         if req_len > device.buffer_len() {
@@ -201,22 +203,20 @@ async fn main() -> anyhow::Result<()> {
                         let buf = device
                             .checkout_buffer(req.queue_id, req.tag)
                             .context("checkout buffer")?;
-                        source
+                        match source
                             .write_blocks(req_geom.lba, &buf.as_slice()[..req_len])
                             .await
-                            .context("write backing source")?;
-                        req_len
+                        {
+                            Ok(_) => Ok(req_len),
+                            Err(err) => Err(err),
+                        }
                     }
-                    UblkOp::Flush => {
-                        source.flush().await.context("flush backing source")?;
-                        0
-                    }
+                    UblkOp::Flush => source.flush().await.map(|_| 0),
                     UblkOp::Discard => {
                         source
                             .discard(req_geom.lba, req_geom.block_count)
                             .await
-                            .context("discard backing source")?;
-                        0
+                            .map(|_| 0)
                     }
                     UblkOp::Unknown(code) => {
                         warn!(
@@ -228,6 +228,25 @@ async fn main() -> anyhow::Result<()> {
                         device
                             .complete_io(req, -libc::EOPNOTSUPP)
                             .context("complete unsupported op")?;
+                        continue;
+                    }
+                };
+                let result_bytes = match op_result {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        let errno = errno_from_blocksource(&err, req.op);
+                        warn!(
+                            queue = req.queue_id,
+                            tag = req.tag,
+                            errno = errno,
+                            ?req.op,
+                            kind = ?err.kind(),
+                            "backing source operation failed: {}",
+                            err
+                        );
+                        device
+                            .complete_io(req, -errno)
+                            .context("complete failed op")?;
                         continue;
                     }
                 };
@@ -301,6 +320,22 @@ fn errno_from_io(err: &io::Error) -> i32 {
         io::ErrorKind::InvalidInput => libc::EINVAL,
         _ => libc::EIO,
     })
+}
+
+fn errno_from_blocksource(err: &BlockSourceError, op: UblkOp) -> i32 {
+    match err.kind() {
+        BlockSourceErrorKind::InvalidInput => libc::EINVAL,
+        BlockSourceErrorKind::OutOfRange => libc::ERANGE,
+        BlockSourceErrorKind::Io => libc::EIO,
+        BlockSourceErrorKind::Unsupported => {
+            if matches!(op, UblkOp::Write) {
+                libc::EROFS
+            } else {
+                libc::EOPNOTSUPP
+            }
+        }
+        BlockSourceErrorKind::Other => libc::EIO,
+    }
 }
 
 struct RequestGeometry {
