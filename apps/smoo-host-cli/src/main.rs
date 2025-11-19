@@ -3,12 +3,11 @@ use clap::Parser;
 use rusb::{Direction, TransferType, UsbContext};
 use smoo_host_blocksources::FileBlockSource;
 use smoo_host_core::{
-    BlockSource, BlockSourceResult, HostError, HostErrorKind, HostExport, HostResult, SmooHost,
-    TransportError, TransportErrorKind,
+    read_ident, send_config_exports_v0, BlockSource, BlockSourceResult, ConfigExportEntry,
+    ConfigExportsV0Payload, HostError, HostErrorKind, HostExport, HostResult, SmooHost,
+    StatusClient, TransportError, TransportErrorKind,
 };
-use smoo_host_rusb::{
-    ConfigExportEntry, ConfigExportsV0Payload, RusbTransport, RusbTransportConfig, StatusClient,
-};
+use smoo_host_rusb::{RusbControlHandle, RusbTransport, RusbTransportConfig};
 use smoo_proto::SmooStatusV0;
 use std::{fmt, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{signal, sync::mpsc, task::JoinHandle, time};
@@ -141,7 +140,8 @@ struct ExportSourceConfig {
 }
 
 type HostTransport = RusbTransport<rusb::Context>;
-type HostStatusClient = StatusClient<rusb::Context>;
+type HostControlHandle = RusbControlHandle<rusb::Context>;
+type HostStatusClient = StatusClient<HostControlHandle>;
 
 #[derive(Clone)]
 struct HostControllerConfig {
@@ -259,13 +259,7 @@ impl SessionRuntime {
                 size_bytes: cfg.size_bytes,
             })
             .collect();
-        let mut host = SmooHost::new(transport, host_exports);
-        let ident = host.setup().await.context("ident handshake")?;
-        info!(
-            major = ident.major,
-            minor = ident.minor,
-            "connected to smoo gadget"
-        );
+        let host = SmooHost::new(transport, host_exports);
         let (heartbeat_tx, heartbeat_rx) = mpsc::unbounded_channel();
         let heartbeat_task = tokio::spawn(async move {
             if let Err(err) = run_heartbeat(
@@ -306,6 +300,7 @@ impl SessionRuntime {
 struct HostController {
     config: HostControllerConfig,
     exports: Vec<ExportSourceConfig>,
+    active_interface: Option<u8>,
     expected_session_id: Option<u64>,
     has_connected: bool,
     state: HostSessionState,
@@ -322,6 +317,7 @@ impl HostController {
         Self {
             config,
             exports,
+            active_interface: None,
             expected_session_id: None,
             has_connected: false,
             state: HostSessionState::Idle,
@@ -432,7 +428,8 @@ impl HostController {
                 };
                 let transport =
                     RusbTransport::new(handle, transport_config).context("init transport")?;
-                self.status_client = Some(transport.status_client());
+                self.status_client = Some(StatusClient::new(transport.control_handle(), interface));
+                self.active_interface = Some(interface);
                 self.transport = Some(transport);
                 self.discovery.reset();
                 self.transition(HostSessionState::UsbReady);
@@ -454,8 +451,14 @@ impl HostController {
             self.transition(HostSessionState::Discovering);
             return Ok(());
         };
-        let ident = transport
-            .ensure_ident()
+        let interface = match self.active_interface {
+            Some(value) => value,
+            None => {
+                self.transition(HostSessionState::Discovering);
+                return Ok(());
+            }
+        };
+        let ident = read_ident(transport, interface)
             .await
             .context("IDENT control transfer")?;
         debug!(
@@ -475,8 +478,14 @@ impl HostController {
             self.transition(HostSessionState::Discovering);
             return Ok(());
         };
-        transport
-            .send_config_exports_v0(&payload)
+        let interface = match self.active_interface {
+            Some(value) => value,
+            None => {
+                self.transition(HostSessionState::Discovering);
+                return Ok(());
+            }
+        };
+        send_config_exports_v0(transport, interface, &payload)
             .await
             .context("CONFIG_EXPORTS control transfer")?;
         info!(count = self.exports.len(), "configured gadget exports");
@@ -494,21 +503,24 @@ impl HostController {
     }
 
     async fn step_wait_status(&mut self) -> Result<()> {
-        let Some(client) = self.status_client.clone() else {
+        let Some(mut client) = self.status_client.clone() else {
             self.transition(HostSessionState::Discovering);
             return Ok(());
         };
-        let status =
-            match fetch_status_with_retry(&client, STATUS_RETRY_ATTEMPTS, STATUS_RETRY_INTERVAL)
-                .await
-            {
-                Ok(status) => status,
-                Err(err) => {
-                    warn!(error = %err, "SMOO_STATUS failed; gadget not ready");
-                    self.transition(HostSessionState::TransportLost);
-                    return Ok(());
-                }
-            };
+        let status = match fetch_status_with_retry(
+            &mut client,
+            STATUS_RETRY_ATTEMPTS,
+            STATUS_RETRY_INTERVAL,
+        )
+        .await
+        {
+            Ok(status) => status,
+            Err(err) => {
+                warn!(error = %err, "SMOO_STATUS failed; gadget not ready");
+                self.transition(HostSessionState::TransportLost);
+                return Ok(());
+            }
+        };
         ensure!(
             status.export_active(),
             "gadget reports no active export after CONFIG_EXPORTS"
@@ -576,6 +588,7 @@ impl HostController {
         self.heartbeat_rx = None;
         self.transport = None;
         self.status_client = None;
+        self.active_interface = None;
         self.discovery.pause_for(RECONNECT_PAUSE);
         self.transition(HostSessionState::Discovering);
         Ok(())
@@ -589,6 +602,7 @@ impl HostController {
         self.heartbeat_rx = None;
         self.transport = None;
         self.status_client = None;
+        self.active_interface = None;
         self.transition(HostSessionState::Shutdown);
         info!("shutdown requested");
         Ok(())
@@ -885,7 +899,7 @@ impl fmt::Display for HeartbeatFailure {
 }
 
 async fn run_heartbeat(
-    client: StatusClient<rusb::Context>,
+    mut client: HostStatusClient,
     initial_session_id: u64,
     interval: Duration,
 ) -> Result<(), HeartbeatFailure> {
@@ -918,7 +932,7 @@ async fn run_heartbeat(
 }
 
 async fn fetch_status_with_retry(
-    client: &StatusClient<rusb::Context>,
+    client: &mut HostStatusClient,
     attempts: usize,
     delay: Duration,
 ) -> Result<SmooStatusV0, TransportError> {

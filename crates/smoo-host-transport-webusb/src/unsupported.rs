@@ -1,6 +1,8 @@
 use async_trait::async_trait;
-use smoo_host_core::{Transport, TransportError, TransportErrorKind, TransportResult};
-use smoo_proto::{Ident, Request, Response};
+use smoo_host_core::{
+    ControlTransport, Transport, TransportError, TransportErrorKind, TransportResult,
+};
+use smoo_proto::{Request, Response};
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct WebUsbTransport;
@@ -16,10 +18,6 @@ impl WebUsbTransport {
 
 #[async_trait]
 impl Transport for WebUsbTransport {
-    async fn setup(&mut self) -> TransportResult<Ident> {
-        Err(Self::unsupported())
-    }
-
     async fn read_request(&mut self) -> TransportResult<Request> {
         Err(Self::unsupported())
     }
@@ -33,6 +31,31 @@ impl Transport for WebUsbTransport {
     }
 
     async fn write_bulk(&mut self, _buf: &[u8]) -> TransportResult<()> {
+        Err(Self::unsupported())
+    }
+}
+
+#[async_trait]
+impl ControlTransport for WebUsbTransport {
+    async fn control_in(
+        &mut self,
+        _request_type: u8,
+        _request: u8,
+        _value: u16,
+        _index: u16,
+        _buf: &mut [u8],
+    ) -> TransportResult<usize> {
+        Err(Self::unsupported())
+    }
+
+    async fn control_out(
+        &mut self,
+        _request_type: u8,
+        _request: u8,
+        _value: u16,
+        _index: u16,
+        _data: &[u8],
+    ) -> TransportResult<()> {
         Err(Self::unsupported())
     }
 }

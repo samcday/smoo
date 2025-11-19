@@ -1,7 +1,7 @@
 use alloc::string::String;
 use async_trait::async_trait;
 use core::fmt;
-use smoo_proto::{Ident, Request, Response};
+use smoo_proto::{Request, Response};
 
 pub type TransportResult<T> = core::result::Result<T, TransportError>;
 
@@ -59,13 +59,34 @@ impl fmt::Display for TransportError {
 #[cfg(feature = "std")]
 impl std::error::Error for TransportError {}
 
+/// Issues vendor control transfers on the smoo interface.
+#[async_trait]
+pub trait ControlTransport: Send {
+    /// Execute a control IN transfer and write the received bytes into `buf`.
+    async fn control_in(
+        &mut self,
+        request_type: u8,
+        request: u8,
+        value: u16,
+        index: u16,
+        buf: &mut [u8],
+    ) -> TransportResult<usize>;
+
+    /// Execute a control OUT transfer with the provided payload.
+    async fn control_out(
+        &mut self,
+        request_type: u8,
+        request: u8,
+        value: u16,
+        index: u16,
+        data: &[u8],
+    ) -> TransportResult<()>;
+}
+
 /// Abstracts the USB transport that carries control-plane messages between the
 /// host and gadget.
 #[async_trait]
-pub trait Transport: Send {
-    /// Execute the FunctionFS Ident handshake and return the gadget's reported Ident.
-    async fn setup(&mut self) -> TransportResult<Ident>;
-
+pub trait Transport: ControlTransport {
     /// Receive the next Request from the gadget (interrupt IN).
     async fn read_request(&mut self) -> TransportResult<Request>;
 

@@ -8,7 +8,7 @@ use alloc::{
     vec::Vec,
 };
 use core::fmt;
-use smoo_proto::{Ident, OpCode, Request, Response};
+use smoo_proto::{OpCode, Request, Response};
 
 /// Host error categories.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,7 +81,6 @@ pub type HostResult<T> = core::result::Result<T, HostError>;
 pub struct SmooHost<T, S> {
     transport: T,
     exports: BTreeMap<u32, ExportHandle<S>>,
-    ident: Option<Ident>,
 }
 
 /// Descriptor for a host-side export.
@@ -120,24 +119,10 @@ where
         Self {
             transport,
             exports: map,
-            ident: None,
         }
-    }
-
-    pub fn ident(&self) -> Option<Ident> {
-        self.ident
-    }
-
-    pub async fn setup(&mut self) -> HostResult<Ident> {
-        let ident = self.transport.setup().await?;
-        self.ident = Some(ident);
-        Ok(ident)
     }
 
     pub async fn run_once(&mut self) -> HostResult<()> {
-        if self.ident.is_none() {
-            self.setup().await?;
-        }
         let request = match self.transport.read_request().await {
             Ok(req) => req,
             Err(err) if err.kind() == TransportErrorKind::Timeout => {
