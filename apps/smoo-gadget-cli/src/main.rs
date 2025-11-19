@@ -339,13 +339,6 @@ impl ExportSlot {
             Some(self.size_bytes / self.block_size as u64)
         }
     }
-
-    async fn wait_for_start(&mut self) -> Result<()> {
-        self.device
-            .await_start()
-            .await
-            .context("wait for start_dev")
-    }
 }
 
 struct ExportsRuntime {
@@ -1040,7 +1033,6 @@ async fn apply_config(
                         .await
                         .context("complete ublk recovery")?;
                     slot.start_request_task(runtime.pending_tx())?;
-                    slot.wait_for_start().await?;
                 } else {
                     info!(
                         export_id = entry.export_id,
@@ -1049,7 +1041,6 @@ async fn apply_config(
                     exports.remove(entry.export_id, ublk).await?;
                     let mut slot = new_export_slot(ublk, runtime, entry).await?;
                     slot.start_request_task(runtime.pending_tx())?;
-                    slot.wait_for_start().await?;
                     exports.insert(slot);
                 }
             }
@@ -1060,7 +1051,6 @@ async fn apply_config(
                 );
                 let mut slot = new_export_slot(ublk, runtime, entry).await?;
                 slot.start_request_task(runtime.pending_tx())?;
-                slot.wait_for_start().await?;
                 exports.insert(slot);
             }
         }
