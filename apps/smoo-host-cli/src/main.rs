@@ -509,16 +509,20 @@ impl HostController {
                     return Ok(());
                 }
             };
-        ensure!(
-            status.export_active(),
-            "gadget reports no active export after CONFIG_EXPORTS"
-        );
-        ensure!(
-            status.export_count as usize == self.exports.len(),
-            "gadget export count mismatch (expected {}, got {})",
-            self.exports.len(),
-            status.export_count
-        );
+        if !status.export_active() {
+            warn!(
+                expected = self.exports.len(),
+                actual = status.export_count,
+                "gadget reports no active export after CONFIG_EXPORTS"
+            );
+        }
+        if status.export_count as usize != self.exports.len() {
+            warn!(
+                expected = self.exports.len(),
+                actual = status.export_count,
+                "gadget export count mismatch after CONFIG_EXPORTS"
+            );
+        }
         match self.expected_session_id {
             Some(expected) => ensure!(
                 expected == status.session_id,
