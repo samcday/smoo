@@ -23,7 +23,7 @@ use std::{
 use tokio::{
     signal,
     sync::{mpsc, oneshot, RwLock},
-    task::JoinHandle,
+    task::{self, JoinHandle},
 };
 use tracing::{debug, info, warn};
 use tracing_subscriber::prelude::*;
@@ -338,6 +338,19 @@ impl ExportSlot {
         } else {
             Some(self.size_bytes / self.block_size as u64)
         }
+    }
+
+    async fn wait_for_start(&mut self) -> Result<()> {
+        if let Some(handle) = self.device.take_start_handle() {
+            task::spawn_blocking(move || {
+                handle
+                    .join()
+                    .map_err(|err| anyhow!("start_dev thread failed: {:?}", err))
+            })
+            .await
+            .context("join start_dev thread task")??;
+        }
+        Ok(())
     }
 }
 
@@ -1033,6 +1046,7 @@ async fn apply_config(
                         .await
                         .context("complete ublk recovery")?;
                     slot.start_request_task(runtime.pending_tx())?;
+                    slot.wait_for_start().await?;
                 } else {
                     info!(
                         export_id = entry.export_id,
@@ -1041,6 +1055,7 @@ async fn apply_config(
                     exports.remove(entry.export_id, ublk).await?;
                     let mut slot = new_export_slot(ublk, runtime, entry).await?;
                     slot.start_request_task(runtime.pending_tx())?;
+                    slot.wait_for_start().await?;
                     exports.insert(slot);
                 }
             }
@@ -1051,6 +1066,7 @@ async fn apply_config(
                 );
                 let mut slot = new_export_slot(ublk, runtime, entry).await?;
                 slot.start_request_task(runtime.pending_tx())?;
+                slot.wait_for_start().await?;
                 exports.insert(slot);
             }
         }

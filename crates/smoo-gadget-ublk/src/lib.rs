@@ -818,6 +818,10 @@ impl SmooUblkDevice {
             .context("checkout ublk buffer")
     }
 
+    pub fn take_start_handle(&mut self) -> Option<JoinHandle<()>> {
+        self.start_handle.take()
+    }
+
     pub fn take_request_receiver(&mut self) -> anyhow::Result<Receiver<UblkIoRequest>> {
         self.request_rx
             .take()
@@ -882,7 +886,7 @@ impl SmooUblkDevice {
                 error!("queue worker join failed: {:?}", e);
             }
         }
-        if let Some(handle) = self.start_handle.take() {
+        if let Some(handle) = self.take_start_handle() {
             if let Err(err) = handle.join() {
                 error!("start_dev thread join failed: {:?}", err);
             }
