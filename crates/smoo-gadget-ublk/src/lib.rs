@@ -51,6 +51,9 @@ mod sys {
 /// `Documentation/block/ublk.rst`.
 ///
 /// Top level interface to ublk. Creates SmooUblkDevices
+const CTRL_CMD_TIMEOUT: Duration = Duration::from_secs(5);
+const START_DEV_CTRL_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub struct SmooUblk {
     handle: Option<JoinHandle<()>>,
     sender: Sender<CtrlCommand>,
@@ -518,7 +521,14 @@ impl SmooUblk {
         // We begin the process by sending ublksrv_ctrl_dev_info along in a UBLK_CMD_ADD_DEV op
         cmd.len = ctrl_cmd_len::<sys::ublksrv_ctrl_dev_info>();
         cmd.addr = &raw mut info as _;
-        submit_ctrl_command(&self.sender, UBLK_CMD_ADD_DEV, cmd, "add device", None).await?;
+        submit_ctrl_command(
+            &self.sender,
+            UBLK_CMD_ADD_DEV,
+            cmd,
+            "add device",
+            Some(CTRL_CMD_TIMEOUT),
+        )
+        .await?;
         debug!(dev_id = info.dev_id, "add_dev completed");
 
         // Whilst completing our UBLK_CMD_ADD_DEV op, the kernel wrote our true dev_id into the
@@ -530,7 +540,14 @@ impl SmooUblk {
         // Now we pass the ublk_params in a UBLK_CMD_SET_PARAMS to inform ublk of geometry/capacity.
         cmd.len = params.len as _;
         cmd.addr = &raw mut params as _;
-        submit_ctrl_command(&self.sender, UBLK_CMD_SET_PARAMS, cmd, "set params", None).await?;
+        submit_ctrl_command(
+            &self.sender,
+            UBLK_CMD_SET_PARAMS,
+            cmd,
+            "set params",
+            Some(CTRL_CMD_TIMEOUT),
+        )
+        .await?;
 
         let ioctl_encode = (info.flags & (sys::UBLK_F_CMD_IOCTL_ENCODE as u64)) != 0;
         let cdev_path = format!("/dev/ublkc{}", dev_id);
@@ -623,6 +640,7 @@ impl SmooUblk {
                     UBLK_CMD_START_DEV,
                     start_cmd,
                     "start device",
+                    Some(START_DEV_CTRL_TIMEOUT),
                 );
                 match &res {
                     Ok(()) => {
@@ -806,7 +824,7 @@ impl SmooUblk {
             UBLK_CMD_END_USER_RECOVERY,
             cmd,
             "end user recovery",
-            None,
+            Some(CTRL_CMD_TIMEOUT),
         )
         .await?;
         device.mark_recovery_complete();
@@ -827,7 +845,7 @@ impl SmooUblk {
             UBLK_CMD_START_USER_RECOVERY,
             cmd,
             "start user recovery",
-            None,
+            Some(CTRL_CMD_TIMEOUT),
         )
         .await
     }
@@ -855,7 +873,14 @@ impl SmooUblk {
             queue_id: u16::MAX,
             ..Default::default()
         };
-        submit_ctrl_command(&self.sender, UBLK_CMD_STOP_DEV, cmd, "stop device", None).await?;
+        submit_ctrl_command(
+            &self.sender,
+            UBLK_CMD_STOP_DEV,
+            cmd,
+            "stop device",
+            Some(CTRL_CMD_TIMEOUT),
+        )
+        .await?;
 
         if delete_ctrl {
             let del_cmd = ublksrv_ctrl_cmd {
@@ -868,7 +893,7 @@ impl SmooUblk {
                 UBLK_CMD_DEL_DEV,
                 del_cmd,
                 "delete device",
-                None,
+                Some(CTRL_CMD_TIMEOUT),
             )
             .await?;
         }
@@ -883,8 +908,14 @@ impl SmooUblk {
             queue_id: u16::MAX,
             ..Default::default()
         };
-        if let Err(err) =
-            submit_ctrl_command(&self.sender, UBLK_CMD_STOP_DEV, cmd, "stop device", None).await
+        if let Err(err) = submit_ctrl_command(
+            &self.sender,
+            UBLK_CMD_STOP_DEV,
+            cmd,
+            "stop device",
+            Some(CTRL_CMD_TIMEOUT),
+        )
+        .await
         {
             warn!(dev_id, error = ?err, "force stop failed");
         }
@@ -893,8 +924,14 @@ impl SmooUblk {
             queue_id: u16::MAX,
             ..Default::default()
         };
-        if let Err(err) =
-            submit_ctrl_command(&self.sender, UBLK_CMD_DEL_DEV, cmd, "delete device", None).await
+        if let Err(err) = submit_ctrl_command(
+            &self.sender,
+            UBLK_CMD_DEL_DEV,
+            cmd,
+            "delete device",
+            Some(CTRL_CMD_TIMEOUT),
+        )
+        .await
         {
             warn!(dev_id, error = ?err, "force delete failed");
         }
@@ -1676,10 +1713,11 @@ fn submit_ctrl_command_blocking(
     opcode: u32,
     cmd: ublksrv_ctrl_cmd,
     label: &'static str,
+    timeout: Option<Duration>,
 ) -> anyhow::Result<()> {
     let (reply_tx, reply_rx) = async_channel::bounded::<Result<(), io::Error>>(1);
     sender
-        .send_blocking((opcode, cmd, reply_tx, None))
+        .send_blocking((opcode, cmd, reply_tx, timeout))
         .context("send ctrl command blocking")?;
     reply_rx
         .recv_blocking()

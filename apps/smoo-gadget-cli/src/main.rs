@@ -1001,16 +1001,27 @@ async fn control_loop(
     status: GadgetStatusShared,
     mut tx: mpsc::Sender<ControlMessage>,
 ) -> Result<()> {
+    let mut shutdown = signal::ctrl_c();
+    tokio::pin!(shutdown);
+
     loop {
-        let event = match ep0
-            .next_event()
-            .await
-            .context("poll FunctionFS control event")?
-        {
-            Some(event) => event,
-            None => {
-                debug!("FunctionFS control event poll timed out, continuing");
-                continue;
+        let event = tokio::select! {
+            _ = &mut shutdown => {
+                info!("control loop shutdown signal received");
+                break;
+            }
+            _ = tx.closed() => {
+                info!("control loop shutting down (control channel closed)");
+                break;
+            }
+            event = ep0.next_event() => {
+                match event.context("poll FunctionFS control event")? {
+                    Some(event) => event,
+                    None => {
+                        debug!("FunctionFS control event poll timed out, continuing");
+                        continue;
+                    }
+                }
             }
         };
         match event {
@@ -1056,6 +1067,8 @@ async fn control_loop(
             }
         }
     }
+
+    Ok(())
 }
 
 async fn respond_ident(ep0: &mut Ep0Controller, ident: Ident, setup: SetupPacket) -> Result<()> {
