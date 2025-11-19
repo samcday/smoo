@@ -11,5 +11,5 @@ libc = "0.2.177"
 mmap = "0.1.1"
 nix = { version = "0.30.1", features = ["ioctl", "poll"] }
 smoo-proto = { path = "../smoo-proto" }
-tokio = { version = "1.48.0", features = ["fs", "io-util", "rt"] }
+tokio = { version = "1.48.0", features = ["fs", "io-util", "rt", "time"] }
 tracing = "0.1.41"

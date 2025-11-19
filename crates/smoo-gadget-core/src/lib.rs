@@ -9,11 +9,12 @@ use std::{
     fs::File as StdFile,
     io,
     os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd},
+    time::Duration,
 };
 use tokio::{
     fs::File,
     io::{AsyncReadExt, AsyncWriteExt},
-    task,
+    task, time,
 };
 use tracing::{debug, trace, warn};
 
@@ -25,6 +26,7 @@ const SMOO_REQ_TYPE: u8 = USB_DIR_IN | USB_TYPE_VENDOR | USB_RECIP_INTERFACE;
 pub const SMOO_CONFIG_REQ_TYPE: u8 = USB_TYPE_VENDOR | USB_RECIP_INTERFACE;
 /// Vendor control bRequest for CONFIG_EXPORTS.
 pub const CONFIG_EXPORTS_REQUEST: u8 = 0x02;
+const EP0_IO_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Parsed representation of the v0 CONFIG_EXPORTS payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -238,9 +240,13 @@ impl Ep0Controller {
 
     /// Send an IN data stage (device → host) for the current control transfer.
     pub async fn write_in(&mut self, data: &[u8]) -> Result<()> {
-        self.ep0.write_all(data).await.context("write ep0 data")?;
-        self.ep0.flush().await.context("flush ep0")?;
-        Ok(())
+        time::timeout(EP0_IO_TIMEOUT, async {
+            self.ep0.write_all(data).await.context("write ep0 data")?;
+            self.ep0.flush().await.context("flush ep0")?;
+            Ok(())
+        })
+        .await
+        .map_err(|_| anyhow!("timeout waiting to write ep0 data stage"))?
     }
 
     /// Read an OUT data stage (host → device) for the current control transfer.
@@ -248,19 +254,29 @@ impl Ep0Controller {
         if buf.is_empty() {
             return Ok(());
         }
-        self.ep0.read_exact(buf).await.context("read ep0 payload")?;
-        Ok(())
+        time::timeout(EP0_IO_TIMEOUT, async {
+            self.ep0
+                .read_exact(buf)
+                .await
+                .map(|_| ())
+                .context("read ep0 payload")
+        })
+        .await
+        .map_err(|_| anyhow!("timeout waiting to read ep0 payload"))?
     }
 
     /// Stall the current control transfer.
     pub async fn stall(&mut self) -> Result<()> {
-        // Writing a single zero byte signals a halt condition to FunctionFS.
-        self.ep0
-            .write_all(&[0u8])
-            .await
-            .context("stall ep0 control")?;
-        self.ep0.flush().await.context("flush ep0 after stall")?;
-        Ok(())
+        time::timeout(EP0_IO_TIMEOUT, async {
+            // Writing a single zero byte signals a halt condition to FunctionFS.
+            self.ep0
+                .write_all(&[0u8])
+                .await
+                .context("stall ep0 control")?;
+            self.ep0.flush().await.context("flush ep0 after stall")
+        })
+        .await
+        .map_err(|_| anyhow!("timeout waiting to stall ep0 control"))?
     }
 }
 
