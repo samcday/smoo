@@ -38,6 +38,7 @@ const SMOO_SUBCLASS: u8 = 0x53;
 const SMOO_PROTOCOL: u8 = 0x4D;
 const SMOO_IDENT_REQ_TYPE: u8 = 0xC1;
 const DEFAULT_MAX_IO_BYTES: usize = 4 * 1024 * 1024;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 use state::{ExportState, StateFile, StateSnapshot};
 
@@ -872,71 +873,126 @@ async fn handle_request(
     };
 
     let mut payload: Option<UblkBuffer<'_>> = None;
-    let result = async {
-        if matches!(opcode, OpCode::Read | OpCode::Write) && req_len > 0 {
-            let capacity = slot.device().buffer_len();
-            if req_len > capacity {
-                warn!(
-                    queue = req.queue_id,
-                    tag = req.tag,
-                    req_bytes = req_len,
-                    buf_cap = capacity,
-                    "request exceeds buffer capacity"
-                );
-                slot.device()
-                    .complete_io(req, -libc::EINVAL)
-                    .context("complete oversized request")?;
-                return Ok(());
-            }
-            payload = Some(
-                slot.device()
-                    .checkout_buffer(req.queue_id, req.tag)
-                    .context("checkout bulk buffer")?,
-            );
-        }
-
-        let proto_req = Request::new(export_id, opcode, req.sector, num_blocks, 0);
-        gadget
-            .send_request(proto_req)
-            .await
-            .context("send smoo request")?;
-
-        if opcode == OpCode::Read && req_len > 0 {
-            if let Some(buf) = payload.as_mut() {
-                gadget
-                    .read_bulk_buffer(&mut buf.as_mut_slice()[..req_len])
-                    .await
-                    .context("read bulk payload")?;
-            }
-        } else if opcode == OpCode::Write && req_len > 0 {
-            if let Some(buf) = payload.as_mut() {
-                gadget
-                    .write_bulk_buffer(&mut buf.as_mut_slice()[..req_len])
-                    .await
-                    .context("write bulk payload")?;
-            }
-        }
-
-        let response = gadget.read_response().await.context("read smoo response")?;
-
-        let status = response_status(&response, req_len)?;
-        if status >= 0 && response.num_blocks as usize != num_blocks as usize {
+    if matches!(opcode, OpCode::Read | OpCode::Write) && req_len > 0 {
+        let capacity = slot.device().buffer_len();
+        if req_len > capacity {
             warn!(
                 queue = req.queue_id,
                 tag = req.tag,
-                expected_blocks = num_blocks,
-                reported_blocks = response.num_blocks,
-                "response block count mismatch"
+                req_bytes = req_len,
+                buf_cap = capacity,
+                "request exceeds buffer capacity"
             );
+            slot.device()
+                .complete_io(req, -libc::EINVAL)
+                .context("complete oversized request")?;
+            return Ok(());
         }
-        slot.device()
-            .complete_io(req, status)
-            .context("complete ublk request")?;
-        Ok(())
+        payload = Some(
+            slot.device()
+                .checkout_buffer(req.queue_id, req.tag)
+                .context("checkout bulk buffer")?,
+        );
     }
-    .await;
 
-    result
+    let proto_req = Request::new(export_id, opcode, req.sector, num_blocks, 0);
+    let send_res = time::timeout(REQUEST_TIMEOUT, gadget.send_request(proto_req)).await;
+    match send_res {
+        Ok(result) => result.context("send smoo request")?,
+        Err(_) => {
+            warn!(
+                export_id,
+                queue = req.queue_id,
+                tag = req.tag,
+                "timed out waiting for host to accept request"
+            );
+            slot.device()
+                .complete_io(req, -libc::ETIMEDOUT)
+                .context("complete timed out request (control)")?;
+            return Ok(());
+        }
+    }
+
+    if opcode == OpCode::Read && req_len > 0 {
+        if let Some(buf) = payload.as_mut() {
+            let read_res = time::timeout(
+                REQUEST_TIMEOUT,
+                gadget.read_bulk_buffer(&mut buf.as_mut_slice()[..req_len]),
+            )
+            .await;
+            match read_res {
+                Ok(result) => result.context("read bulk payload")?,
+                Err(_) => {
+                    warn!(
+                        export_id,
+                        queue = req.queue_id,
+                        tag = req.tag,
+                        len = req_len,
+                        "timed out reading bulk payload from host"
+                    );
+                    slot.device()
+                        .complete_io(req, -libc::ETIMEDOUT)
+                        .context("complete timed out request (bulk read)")?;
+                    return Ok(());
+                }
+            }
+        }
+    } else if opcode == OpCode::Write && req_len > 0 {
+        if let Some(buf) = payload.as_mut() {
+            let write_res = time::timeout(
+                REQUEST_TIMEOUT,
+                gadget.write_bulk_buffer(&mut buf.as_mut_slice()[..req_len]),
+            )
+            .await;
+            match write_res {
+                Ok(result) => result.context("write bulk payload")?,
+                Err(_) => {
+                    warn!(
+                        export_id,
+                        queue = req.queue_id,
+                        tag = req.tag,
+                        len = req_len,
+                        "timed out writing bulk payload to host"
+                    );
+                    slot.device()
+                        .complete_io(req, -libc::ETIMEDOUT)
+                        .context("complete timed out request (bulk write)")?;
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    let response = match time::timeout(REQUEST_TIMEOUT, gadget.read_response()).await {
+        Ok(result) => result.context("read smoo response")?,
+        Err(_) => {
+            warn!(
+                export_id,
+                queue = req.queue_id,
+                tag = req.tag,
+                "timed out waiting for host response"
+            );
+            slot.device()
+                .complete_io(req, -libc::ETIMEDOUT)
+                .context("complete timed out request (response)")?;
+            return Ok(());
+        }
+    };
+
+    let status = response_status(&response, req_len)?;
+    if status >= 0 && response.num_blocks as usize != num_blocks as usize {
+        warn!(
+            queue = req.queue_id,
+            tag = req.tag,
+            expected_blocks = num_blocks,
+            reported_blocks = response.num_blocks,
+            "response block count mismatch"
+        );
+    }
+    slot.device()
+        .complete_io(req, status)
+        .context("complete ublk request")?;
+    Ok(())
 }
 
 async fn control_loop(
