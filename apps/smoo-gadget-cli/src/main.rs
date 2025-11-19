@@ -266,23 +266,70 @@ struct PendingRequest {
     request: UblkIoRequest,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExportLifecycle {
+    New,
+    Recovering,
+    QueuesReady,
+    Starting,
+    Online,
+    ShuttingDown,
+    Failed,
+}
+
+impl ExportLifecycle {
+    fn as_str(&self) -> &'static str {
+        match self {
+            ExportLifecycle::New => "new",
+            ExportLifecycle::Recovering => "recovering",
+            ExportLifecycle::QueuesReady => "queues_ready",
+            ExportLifecycle::Starting => "starting",
+            ExportLifecycle::Online => "online",
+            ExportLifecycle::ShuttingDown => "shutting_down",
+            ExportLifecycle::Failed => "failed",
+        }
+    }
+}
+
 struct ExportSlot {
     export_id: u32,
     block_size: u32,
     size_bytes: u64,
     device: SmooUblkDevice,
     request_task: Option<JoinHandle<()>>,
+    lifecycle: ExportLifecycle,
 }
 
 impl ExportSlot {
     fn new(export_id: u32, block_size: u32, size_bytes: u64, device: SmooUblkDevice) -> Self {
+        let lifecycle = if device.recovery_pending() {
+            ExportLifecycle::Recovering
+        } else {
+            ExportLifecycle::New
+        };
+        device.set_export_id(export_id);
         Self {
             export_id,
             block_size,
             size_bytes,
             device,
             request_task: None,
+            lifecycle,
         }
+    }
+
+    fn transition(&mut self, next: ExportLifecycle) {
+        if self.lifecycle == next {
+            return;
+        }
+        info!(
+            export_id = self.export_id,
+            dev_id = self.device.dev_id(),
+            from = self.lifecycle.as_str(),
+            to = next.as_str(),
+            "export lifecycle transition"
+        );
+        self.lifecycle = next;
     }
 
     fn start_request_task(&mut self, tx: mpsc::Sender<PendingRequest>) -> Result<()> {
@@ -313,6 +360,18 @@ impl ExportSlot {
         if let Some(handle) = self.request_task.take() {
             handle.abort();
         }
+    }
+
+    async fn wait_until_online(&mut self) -> Result<()> {
+        self.device
+            .wait_until_online()
+            .await
+            .with_context(|| format!("export {} START_DEV", self.export_id))
+    }
+
+    fn into_device(mut self) -> SmooUblkDevice {
+        self.stop_request_task();
+        self.device
     }
 
     fn device(&self) -> &SmooUblkDevice {
@@ -374,8 +433,9 @@ impl ExportsRuntime {
 
     async fn remove(&mut self, export_id: u32, ublk: &mut SmooUblk) -> Result<()> {
         if let Some(mut slot) = self.entries.remove(&export_id) {
-            slot.stop_request_task();
-            ublk.stop_dev(slot.device, true)
+            slot.transition(ExportLifecycle::ShuttingDown);
+            let device = slot.into_device();
+            ublk.stop_dev(device, true)
                 .await
                 .with_context(|| format!("stop ublk device for export {export_id}"))?;
         }
@@ -961,7 +1021,8 @@ async fn recover_exports(
                     }
                 }
                 for slot in slots.drain(..) {
-                    if let Err(stop_err) = ublk.stop_dev(slot.device, true).await {
+                    let device = slot.into_device();
+                    if let Err(stop_err) = ublk.stop_dev(device, true).await {
                         warn!(error = ?stop_err, "failed to stop recovered device during cleanup");
                     }
                 }
@@ -1032,15 +1093,21 @@ async fn apply_config(
                     ublk.finalize_recovery(slot.device_mut())
                         .await
                         .context("complete ublk recovery")?;
-                    slot.start_request_task(runtime.pending_tx())?;
+                    slot.start_request_task(runtime.pending_tx())
+                        .with_context(|| {
+                            format!(
+                                "spawn recovered request loop for export {}",
+                                entry.export_id
+                            )
+                        })?;
+                    slot.transition(ExportLifecycle::Online);
                 } else {
                     info!(
                         export_id = entry.export_id,
                         "CONFIG_EXPORTS replacing active export"
                     );
                     exports.remove(entry.export_id, ublk).await?;
-                    let mut slot = new_export_slot(ublk, runtime, entry).await?;
-                    slot.start_request_task(runtime.pending_tx())?;
+                    let slot = provision_export_slot(ublk, runtime, entry).await?;
                     exports.insert(slot);
                 }
             }
@@ -1049,8 +1116,7 @@ async fn apply_config(
                     export_id = entry.export_id,
                     "CONFIG_EXPORTS creating export"
                 );
-                let mut slot = new_export_slot(ublk, runtime, entry).await?;
-                slot.start_request_task(runtime.pending_tx())?;
+                let slot = provision_export_slot(ublk, runtime, entry).await?;
                 exports.insert(slot);
             }
         }
@@ -1108,6 +1174,42 @@ async fn new_export_slot(
         entry.size_bytes,
         device,
     ))
+}
+
+async fn provision_export_slot(
+    ublk: &mut SmooUblk,
+    runtime: &RuntimeConfig,
+    entry: &ExportConfig,
+) -> Result<ExportSlot> {
+    let mut slot = new_export_slot(ublk, runtime, entry).await?;
+    // `UBLK_CMD_START_DEV` runs `device_add_disk()` which synchronously probes partitions and
+    // issues I/O through our queues. We therefore start the per-export request task before
+    // waiting on START_DEV so the kernel never hits a dead queue and wedges the control mutex.
+    slot.transition(ExportLifecycle::QueuesReady);
+    slot.start_request_task(runtime.pending_tx())
+        .with_context(|| format!("spawn request loop for export {}", entry.export_id))?;
+    slot.transition(ExportLifecycle::Starting);
+    if let Err(err) = slot.wait_until_online().await {
+        slot.transition(ExportLifecycle::Failed);
+        warn!(
+            export_id = entry.export_id,
+            dev_id = slot.device().dev_id(),
+            state = %slot.device().state(),
+            error = ?err,
+            "START_DEV failed; cleaning up export"
+        );
+        let device = slot.into_device();
+        if let Err(stop_err) = ublk.stop_dev(device, true).await {
+            warn!(
+                export_id = entry.export_id,
+                error = ?stop_err,
+                "failed to remove ublk device after START_DEV failure"
+            );
+        }
+        return Err(err);
+    }
+    slot.transition(ExportLifecycle::Online);
+    Ok(slot)
 }
 
 struct GadgetGuard {
