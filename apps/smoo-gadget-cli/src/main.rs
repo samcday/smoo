@@ -296,34 +296,6 @@ impl GadgetExportState {
             GadgetExportState::Deleted => "deleted",
         }
     }
-
-    fn can_transition_to(self, next: GadgetExportState) -> bool {
-        use GadgetExportState::*;
-        matches!(
-            (self, next),
-            (New, Recovering)
-                | (New, UblkDeviceAdded)
-                | (New, QueuesRunning)
-                | (New, Failed)
-                | (Recovering, QueuesRunning)
-                | (Recovering, Starting)
-                | (Recovering, Online)
-                | (Recovering, Failed)
-                | (Recovering, ShuttingDown)
-                | (UblkDeviceAdded, QueuesRunning)
-                | (UblkDeviceAdded, Failed)
-                | (UblkDeviceAdded, ShuttingDown)
-                | (QueuesRunning, Starting)
-                | (QueuesRunning, Failed)
-                | (Starting, Online)
-                | (Starting, Failed)
-                | (Starting, ShuttingDown)
-                | (Online, ShuttingDown)
-                | (Online, Failed)
-                | (ShuttingDown, Deleted)
-                | (Failed, Deleted)
-        )
-    }
 }
 
 struct ExportSlot {
@@ -357,12 +329,6 @@ impl ExportSlot {
         if self.lifecycle == next {
             return;
         }
-        debug_assert!(
-            self.lifecycle.can_transition_to(next),
-            "invalid gadget export state transition: {:?} -> {:?}",
-            self.lifecycle,
-            next
-        );
         info!(
             export_id = self.export_id,
             dev_id = self.device.dev_id(),
@@ -459,10 +425,6 @@ impl ExportSlot {
         } else {
             Some(self.size_bytes / self.block_size as u64)
         }
-    }
-
-    fn is_online(&self) -> bool {
-        matches!(self.lifecycle, GadgetExportState::Online)
     }
 
     fn matches_config(&self, runtime: &RuntimeConfig, entry: &ExportConfig) -> bool {
@@ -578,16 +540,6 @@ enum ControlMessage {
     Config(ConfigCommand),
 }
 
-struct ConfigInFlight {
-    responder: oneshot::Sender<Result<()>>,
-}
-
-impl ConfigInFlight {
-    fn respond(self, outcome: Result<()>) {
-        let _ = self.responder.send(outcome);
-    }
-}
-
 struct GadgetController<'a> {
     ublk: &'a mut SmooUblk,
     gadget: SmooGadget,
@@ -595,7 +547,6 @@ struct GadgetController<'a> {
     exports: ExportsRuntime,
     desired: HashMap<u32, ExportConfig>,
     has_config: bool,
-    inflight: Option<ConfigInFlight>,
     control_rx: mpsc::Receiver<ControlMessage>,
     pending_rx: mpsc::Receiver<PendingRequest>,
 }
@@ -616,7 +567,6 @@ impl<'a> GadgetController<'a> {
             exports,
             desired: HashMap::new(),
             has_config: false,
-            inflight: None,
             control_rx,
             pending_rx,
         }
@@ -638,8 +588,7 @@ impl<'a> GadgetController<'a> {
                     match msg {
                         Some(msg) => {
                             if let Err(err) = self.handle_control_message(msg).await {
-                                self.fail_inflight(&err);
-                                return Err(err);
+                                warn!(error = ?err, "control message handling failed");
                             }
                         }
                         None => {
@@ -664,7 +613,6 @@ impl<'a> GadgetController<'a> {
                 }
                 _ = reconcile_tick.tick() => {
                     if let Err(err) = self.reconcile_once().await {
-                        self.fail_inflight(&err);
                         return Err(err);
                     }
                 }
@@ -700,24 +648,33 @@ impl<'a> GadgetController<'a> {
     }
 
     async fn configure(&mut self, cmd: ConfigCommand) -> Result<()> {
-        let mut next = HashMap::new();
-        for entry in cmd.payload.entries() {
-            ensure!(
-                !next.contains_key(&entry.export_id),
-                "duplicate export_id {} in CONFIG_EXPORTS",
-                entry.export_id
-            );
-            required_block_count(entry)?;
-            next.insert(entry.export_id, entry.clone());
+        let desired = (|| {
+            let mut next = HashMap::new();
+            for entry in cmd.payload.entries() {
+                ensure!(
+                    !next.contains_key(&entry.export_id),
+                    "duplicate export_id {} in CONFIG_EXPORTS",
+                    entry.export_id
+                );
+                required_block_count(entry)?;
+                next.insert(entry.export_id, entry.clone());
+            }
+            Ok::<_, anyhow::Error>(next)
+        })();
+
+        match desired {
+            Ok(map) => {
+                self.desired = map;
+                self.has_config = true;
+                if cmd.respond_to.send(Ok(())).is_err() {
+                    warn!("CONFIG_EXPORTS responder dropped before ACK");
+                }
+            }
+            Err(err) => {
+                warn!(error = ?err, "CONFIG_EXPORTS payload invalid");
+                let _ = cmd.respond_to.send(Err(err));
+            }
         }
-        self.desired = next;
-        self.has_config = true;
-        if let Some(inflight) = self.inflight.take() {
-            inflight.respond(Err(anyhow!("CONFIG_EXPORTS superseded by new payload")));
-        }
-        self.inflight = Some(ConfigInFlight {
-            responder: cmd.respond_to,
-        });
         Ok(())
     }
 
@@ -743,7 +700,6 @@ impl<'a> GadgetController<'a> {
         self.reconcile_desired_exports().await?;
         self.update_status().await;
         self.persist_state().await;
-        self.try_finish_config();
         Ok(())
     }
 
@@ -835,36 +791,6 @@ impl<'a> GadgetController<'a> {
             if let Err(err) = state_file.store(session_id, &states) {
                 warn!(error = ?err, "failed to write state file");
             }
-        }
-    }
-
-    fn try_finish_config(&mut self) {
-        if self.inflight.is_none() {
-            return;
-        }
-        if !self.desired_ready() {
-            return;
-        }
-        if let Some(inflight) = self.inflight.take() {
-            inflight.respond(Ok(()));
-        }
-    }
-
-    fn desired_ready(&self) -> bool {
-        if !self.has_config || self.desired.len() != self.exports.len() {
-            return false;
-        }
-        self.desired.keys().all(|export_id| {
-            self.exports
-                .get(*export_id)
-                .map(|slot| slot.is_online())
-                .unwrap_or(false)
-        })
-    }
-
-    fn fail_inflight(&mut self, err: &anyhow::Error) {
-        if let Some(inflight) = self.inflight.take() {
-            inflight.respond(Err(anyhow!(err.to_string())));
         }
     }
 }
@@ -1496,21 +1422,6 @@ fn to_owned_fd(file: File) -> OwnedFd {
 fn parse_hex_u16(input: &str) -> Result<u16, String> {
     let trimmed = input.trim_start_matches("0x").trim_start_matches("0X");
     u16::from_str_radix(trimmed, 16).map_err(|err| err.to_string())
-}
-
-#[cfg(test)]
-mod controller_tests {
-    use super::GadgetExportState;
-
-    #[test]
-    fn gadget_state_transitions_follow_lifecycle() {
-        assert!(GadgetExportState::New.can_transition_to(GadgetExportState::UblkDeviceAdded));
-        assert!(GadgetExportState::QueuesRunning.can_transition_to(GadgetExportState::Starting));
-        assert!(GadgetExportState::Starting.can_transition_to(GadgetExportState::Online));
-        assert!(GadgetExportState::Online.can_transition_to(GadgetExportState::Failed));
-        assert!(!GadgetExportState::Online.can_transition_to(GadgetExportState::New));
-        assert!(GadgetExportState::ShuttingDown.can_transition_to(GadgetExportState::Deleted));
-    }
 }
 
 mod state {

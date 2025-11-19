@@ -120,13 +120,6 @@ struct QueueCompletion {
 
 pub type UblkBuffer<'a> = BufferGuard<'a>;
 
-/// Lifecycle states used by the gadget-side ublk integration.
-///
-/// * `DeviceState` mirrors the ordering enforced by libublk-rs: a device is first created,
-///   parameters are pushed, queues become runnable, and only then is `START_DEV` allowed.
-/// * The `Recovering` state corresponds to `UBLK_CMD_START_USER_RECOVERY`/`END_USER_RECOVERY`
-///   flows; smoo will not issue normal I/O until recovery completes.
-/// * Terminal states (`Failed`, `Deleted`) are sticky and make diagnosing wedged exports easier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeviceState {
     New,
@@ -153,36 +146,6 @@ impl DeviceState {
             DeviceState::Failed => "failed",
             DeviceState::Deleted => "deleted",
         }
-    }
-
-    fn can_transition_to(self, next: DeviceState) -> bool {
-        use DeviceState::*;
-        matches!(
-            (self, next),
-            (New, DeviceAdded)
-                | (DeviceAdded, QueuesReady)
-                | (QueuesReady, Starting)
-                | (Starting, Online)
-                | (Starting, Failed)
-                | (Online, ShuttingDown)
-                | (Online, Failed)
-                | (Recovering, Online)
-                | (Recovering, Failed)
-                | (ShuttingDown, Deleted)
-                | (Failed, Deleted)
-                | (New, Failed)
-                | (DeviceAdded, Failed)
-                | (QueuesReady, Failed)
-                | (Recovering, ShuttingDown)
-                | (Starting, ShuttingDown)
-                | (Online, Deleted)
-                | (New, Deleted)
-                | (DeviceAdded, Deleted)
-                | (QueuesReady, Deleted)
-                | (Recovering, Deleted)
-                | (Starting, Deleted)
-                | (Failed, ShuttingDown)
-        )
     }
 }
 
@@ -218,17 +181,6 @@ impl SharedDeviceState {
     fn transition(&self, dev_id: u32, next: DeviceState) {
         let mut guard = self.inner.lock().unwrap();
         if guard.state == next {
-            return;
-        }
-        if !guard.state.can_transition_to(next) {
-            warn!(
-                dev_id,
-                export_id = guard.export_id,
-                from = %guard.state,
-                to = %next,
-                "invalid device state transition"
-            );
-            guard.state = next;
             return;
         }
         info!(

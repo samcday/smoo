@@ -14,10 +14,10 @@ ticks forward using idempotent reconcile steps.
   plus `Recovering`/`Failed`
 * **Loop:** `tokio::select!` keeps pumping pending I/O, control messages, and a periodic
   reconcile tick. Each tick refreshes ublk device state, drives creations/removals, and
-  persists status/state-file snapshots when the topology changes.
-* **Invariants:** Config ACKs are deferred until every desired export reports `Online`;
-  failed exports are torn down before recreating; recovery finalization only proceeds after
-  the desired spec confirms geometry.
+  persists status/state-file snapshots when the topology changes. Config control messages are
+  ACKed immediately; reconciliation continues in the background.
+* **Invariants:** failed exports are torn down before recreating; recovery finalization only
+  proceeds after the desired spec confirms geometry.
 
 ## Host Controller
 
