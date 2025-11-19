@@ -3,15 +3,15 @@ use clap::Parser;
 use rusb::{Direction, TransferType, UsbContext};
 use smoo_host_blocksources::FileBlockSource;
 use smoo_host_core::{
-    BlockSource, BlockSourceResult, HostErrorKind, HostExport, SmooHost, TransportError,
-    TransportErrorKind,
+    BlockSource, BlockSourceResult, HostError, HostErrorKind, HostExport, HostResult, SmooHost,
+    TransportError, TransportErrorKind,
 };
 use smoo_host_rusb::{
     ConfigExportEntry, ConfigExportsV0Payload, RusbTransport, RusbTransportConfig, StatusClient,
 };
 use smoo_proto::SmooStatusV0;
 use std::{fmt, path::PathBuf, sync::Arc, time::Duration};
-use tokio::{signal, sync::mpsc, time};
+use tokio::{signal, sync::mpsc, task::JoinHandle, time};
 use tracing::{debug, info, warn};
 
 const SMOO_INTERFACE_CLASS: u8 = 0xFF;
@@ -140,6 +140,486 @@ struct ExportSourceConfig {
     path: PathBuf,
 }
 
+type HostTransport = RusbTransport<rusb::Context>;
+type HostStatusClient = StatusClient<rusb::Context>;
+
+#[derive(Clone)]
+struct HostControllerConfig {
+    vendor_id: Option<u16>,
+    product_id: Option<u16>,
+    timeout: Duration,
+}
+
+impl From<&Args> for HostControllerConfig {
+    fn from(args: &Args) -> Self {
+        Self {
+            vendor_id: args.vendor_id,
+            product_id: args.product_id,
+            timeout: Duration::from_millis(args.timeout_ms),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostSessionState {
+    Idle,
+    Discovering,
+    UsbReady,
+    Configuring,
+    WaitingStatus,
+    Serving,
+    TransportLost,
+    Shutdown,
+}
+
+impl HostSessionState {
+    fn as_str(&self) -> &'static str {
+        match self {
+            HostSessionState::Idle => "idle",
+            HostSessionState::Discovering => "discovering",
+            HostSessionState::UsbReady => "usb_ready",
+            HostSessionState::Configuring => "configuring",
+            HostSessionState::WaitingStatus => "waiting_status",
+            HostSessionState::Serving => "serving",
+            HostSessionState::TransportLost => "transport_lost",
+            HostSessionState::Shutdown => "shutdown",
+        }
+    }
+
+    fn is_serving(&self) -> bool {
+        matches!(self, HostSessionState::Serving)
+    }
+}
+
+struct DiscoveryBackoff {
+    delay: Duration,
+    next_attempt: time::Instant,
+    attempts: usize,
+}
+
+impl DiscoveryBackoff {
+    fn new() -> Self {
+        Self {
+            delay: DISCOVERY_DELAY_INITIAL,
+            next_attempt: time::Instant::now(),
+            attempts: 0,
+        }
+    }
+
+    fn ready(&self) -> bool {
+        self.ready_at(time::Instant::now())
+    }
+
+    fn ready_at(&self, now: time::Instant) -> bool {
+        now >= self.next_attempt
+    }
+
+    fn reset(&mut self) {
+        self.delay = DISCOVERY_DELAY_INITIAL;
+        self.next_attempt = time::Instant::now();
+        self.attempts = 0;
+    }
+
+    fn fail(&mut self) {
+        self.next_attempt = time::Instant::now() + self.delay;
+        self.delay = (self.delay.saturating_mul(2)).min(DISCOVERY_DELAY_MAX);
+        self.attempts = self.attempts.saturating_add(1);
+    }
+
+    fn attempts(&self) -> usize {
+        self.attempts
+    }
+
+    fn pause_for(&mut self, duration: Duration) {
+        self.next_attempt = time::Instant::now() + duration;
+        self.delay = DISCOVERY_DELAY_INITIAL;
+        self.attempts = 0;
+    }
+}
+
+struct SessionRuntime {
+    host: SmooHost<HostTransport, SharedSource>,
+    heartbeat_task: Option<JoinHandle<()>>,
+    session_id: u64,
+}
+
+impl SessionRuntime {
+    async fn new(
+        transport: HostTransport,
+        exports: &[ExportSourceConfig],
+        heartbeat_client: HostStatusClient,
+        session_id: u64,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<HeartbeatFailure>)> {
+        let host_exports = exports
+            .iter()
+            .map(|cfg| HostExport {
+                export_id: cfg.export_id,
+                source: cfg.source.clone(),
+                block_size: cfg.block_size,
+                size_bytes: cfg.size_bytes,
+            })
+            .collect();
+        let mut host = SmooHost::new(transport, host_exports);
+        let ident = host.setup().await.context("ident handshake")?;
+        info!(
+            major = ident.major,
+            minor = ident.minor,
+            "connected to smoo gadget"
+        );
+        let (heartbeat_tx, heartbeat_rx) = mpsc::unbounded_channel();
+        let heartbeat_task = tokio::spawn(async move {
+            if let Err(err) = run_heartbeat(
+                heartbeat_client,
+                session_id,
+                Duration::from_secs(HEARTBEAT_INTERVAL_SECS),
+            )
+            .await
+            {
+                let _ = heartbeat_tx.send(err);
+            }
+        });
+        Ok((
+            Self {
+                host,
+                heartbeat_task: Some(heartbeat_task),
+                session_id,
+            },
+            heartbeat_rx,
+        ))
+    }
+
+    async fn drive_io(&mut self) -> HostResult<()> {
+        self.host.run_once().await
+    }
+
+    async fn shutdown(&mut self) {
+        if let Some(task) = self.heartbeat_task.take() {
+            if !task.is_finished() {
+                task.abort();
+            }
+            let _ = task.await;
+        }
+        debug!(session_id = self.session_id, "host session runtime drained");
+    }
+}
+
+struct HostController {
+    config: HostControllerConfig,
+    exports: Vec<ExportSourceConfig>,
+    expected_session_id: Option<u64>,
+    has_connected: bool,
+    state: HostSessionState,
+    transport: Option<HostTransport>,
+    status_client: Option<HostStatusClient>,
+    session_runtime: Option<SessionRuntime>,
+    heartbeat_rx: Option<mpsc::UnboundedReceiver<HeartbeatFailure>>,
+    discovery: DiscoveryBackoff,
+    shutdown_requested: bool,
+}
+
+impl HostController {
+    fn new(config: HostControllerConfig, exports: Vec<ExportSourceConfig>) -> Self {
+        Self {
+            config,
+            exports,
+            expected_session_id: None,
+            has_connected: false,
+            state: HostSessionState::Idle,
+            transport: None,
+            status_client: None,
+            session_runtime: None,
+            heartbeat_rx: None,
+            discovery: DiscoveryBackoff::new(),
+            shutdown_requested: false,
+        }
+    }
+
+    async fn run(mut self) -> Result<()> {
+        let shutdown = signal::ctrl_c();
+        tokio::pin!(shutdown);
+        let mut reconcile_tick = time::interval(Duration::from_millis(200));
+        loop {
+            if self.state.is_serving() {
+                let runtime = self
+                    .session_runtime
+                    .as_mut()
+                    .expect("serving state requires session runtime");
+                let heartbeat_rx = self
+                    .heartbeat_rx
+                    .as_mut()
+                    .expect("serving state requires heartbeat channel");
+                tokio::select! {
+                    _ = &mut shutdown => {
+                        self.shutdown_requested = true;
+                    }
+                    res = runtime.drive_io() => {
+                        if let Err(err) = res {
+                            self.handle_host_error(err).await?;
+                        }
+                    }
+                    event = heartbeat_rx.recv() => {
+                        match event {
+                            Some(HeartbeatFailure::TransferFailed(reason)) => {
+                                warn!(reason = %reason, "heartbeat transfer failed");
+                                self.transition(HostSessionState::TransportLost);
+                            }
+                            Some(other) => {
+                                warn!(error = %other, "heartbeat reported failure");
+                                self.transition(HostSessionState::TransportLost);
+                            }
+                            None => {
+                                self.transition(HostSessionState::TransportLost);
+                            }
+                        }
+                    }
+                    _ = reconcile_tick.tick() => {
+                        self.reconcile_once().await?;
+                    }
+                }
+            } else {
+                tokio::select! {
+                    _ = &mut shutdown => {
+                        self.shutdown_requested = true;
+                    }
+                    _ = reconcile_tick.tick() => {
+                        self.reconcile_once().await?;
+                    }
+                }
+            }
+            if matches!(self.state, HostSessionState::Shutdown) {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    async fn reconcile_once(&mut self) -> Result<()> {
+        if self.shutdown_requested && !matches!(self.state, HostSessionState::Shutdown) {
+            self.begin_shutdown().await?;
+            return Ok(());
+        }
+        match self.state {
+            HostSessionState::Idle => self.transition(HostSessionState::Discovering),
+            HostSessionState::Discovering => self.step_discovering().await?,
+            HostSessionState::UsbReady => self.step_ident().await?,
+            HostSessionState::Configuring => self.step_configure().await?,
+            HostSessionState::WaitingStatus => self.step_wait_status().await?,
+            HostSessionState::Serving => {}
+            HostSessionState::TransportLost => self.reset_after_transport_loss().await?,
+            HostSessionState::Shutdown => {}
+        }
+        Ok(())
+    }
+
+    async fn step_discovering(&mut self) -> Result<()> {
+        if !self.discovery.ready() {
+            return Ok(());
+        }
+        match discover_device(
+            &self.config,
+            self.discovery.attempts() == 0 && !self.has_connected,
+        ) {
+            Ok((handle, interface)) => {
+                let endpoints =
+                    infer_interface_endpoints(&handle, interface).context("discover endpoints")?;
+                let transport_config = RusbTransportConfig {
+                    interface,
+                    interrupt_in: endpoints.interrupt_in,
+                    interrupt_out: endpoints.interrupt_out,
+                    bulk_in: endpoints.bulk_in,
+                    bulk_out: endpoints.bulk_out,
+                    timeout: self.config.timeout,
+                };
+                let transport =
+                    RusbTransport::new(handle, transport_config).context("init transport")?;
+                self.status_client = Some(transport.status_client());
+                self.transport = Some(transport);
+                self.discovery.reset();
+                self.transition(HostSessionState::UsbReady);
+            }
+            Err(err) => {
+                if !self.has_connected && self.discovery.attempts() == 0 {
+                    warn!(error = %err, "no smoo gadget found; waiting for connection");
+                } else {
+                    debug!(error = %err, "gadget not present; retrying discovery");
+                }
+                self.discovery.fail();
+            }
+        }
+        Ok(())
+    }
+
+    async fn step_ident(&mut self) -> Result<()> {
+        let Some(transport) = self.transport.as_mut() else {
+            self.transition(HostSessionState::Discovering);
+            return Ok(());
+        };
+        let ident = transport
+            .ensure_ident()
+            .await
+            .context("IDENT control transfer")?;
+        debug!(
+            major = ident.major,
+            minor = ident.minor,
+            "gadget IDENT response"
+        );
+        self.transition(HostSessionState::Configuring);
+        Ok(())
+    }
+
+    async fn step_configure(&mut self) -> Result<()> {
+        let payload = self
+            .build_config_payload()
+            .context("build CONFIG_EXPORTS payload")?;
+        let Some(transport) = self.transport.as_mut() else {
+            self.transition(HostSessionState::Discovering);
+            return Ok(());
+        };
+        transport
+            .send_config_exports_v0(&payload)
+            .await
+            .context("CONFIG_EXPORTS control transfer")?;
+        info!(count = self.exports.len(), "configured gadget exports");
+        for cfg in &self.exports {
+            info!(
+                export_id = cfg.export_id,
+                path = %cfg.path.display(),
+                block_size = cfg.block_size,
+                size_bytes = cfg.size_bytes,
+                "export ready"
+            );
+        }
+        self.transition(HostSessionState::WaitingStatus);
+        Ok(())
+    }
+
+    async fn step_wait_status(&mut self) -> Result<()> {
+        let Some(client) = self.status_client.clone() else {
+            self.transition(HostSessionState::Discovering);
+            return Ok(());
+        };
+        let status =
+            match fetch_status_with_retry(&client, STATUS_RETRY_ATTEMPTS, STATUS_RETRY_INTERVAL)
+                .await
+            {
+                Ok(status) => status,
+                Err(err) => {
+                    warn!(error = %err, "SMOO_STATUS failed; gadget not ready");
+                    self.transition(HostSessionState::TransportLost);
+                    return Ok(());
+                }
+            };
+        ensure!(
+            status.export_active(),
+            "gadget reports no active export after CONFIG_EXPORTS"
+        );
+        ensure!(
+            status.export_count as usize == self.exports.len(),
+            "gadget export count mismatch (expected {}, got {})",
+            self.exports.len(),
+            status.export_count
+        );
+        match self.expected_session_id {
+            Some(expected) => ensure!(
+                expected == status.session_id,
+                "gadget session changed (expected 0x{expected:016x}, got 0x{:016x})",
+                status.session_id
+            ),
+            None => {
+                self.expected_session_id = Some(status.session_id);
+            }
+        }
+        let Some(transport) = self.transport.take() else {
+            self.transition(HostSessionState::Discovering);
+            return Ok(());
+        };
+        let heartbeat_client = client.clone();
+        let (runtime, heartbeat_rx) = SessionRuntime::new(
+            transport,
+            &self.exports,
+            heartbeat_client,
+            status.session_id,
+        )
+        .await?;
+        self.session_runtime = Some(runtime);
+        self.heartbeat_rx = Some(heartbeat_rx);
+        self.has_connected = true;
+        self.transition(HostSessionState::Serving);
+        Ok(())
+    }
+
+    async fn handle_host_error(&mut self, err: HostError) -> Result<()> {
+        match err.kind() {
+            HostErrorKind::Unsupported | HostErrorKind::InvalidRequest => {
+                warn!(error = %err, "request handling failed");
+            }
+            HostErrorKind::Transport => {
+                warn!(error = %err, "transport failure");
+                self.transition(HostSessionState::TransportLost);
+            }
+            HostErrorKind::BlockSource => {
+                warn!(error = %err, "block source error");
+            }
+            HostErrorKind::NotReady => {
+                debug!(error = %err, "host not ready for IO");
+            }
+        }
+        Ok(())
+    }
+
+    async fn reset_after_transport_loss(&mut self) -> Result<()> {
+        info!("gadget disconnected; waiting for reconnection");
+        if let Some(runtime) = self.session_runtime.as_mut() {
+            runtime.shutdown().await;
+        }
+        self.session_runtime = None;
+        self.heartbeat_rx = None;
+        self.transport = None;
+        self.status_client = None;
+        self.discovery.pause_for(RECONNECT_PAUSE);
+        self.transition(HostSessionState::Discovering);
+        Ok(())
+    }
+
+    async fn begin_shutdown(&mut self) -> Result<()> {
+        if let Some(runtime) = self.session_runtime.as_mut() {
+            runtime.shutdown().await;
+        }
+        self.session_runtime = None;
+        self.heartbeat_rx = None;
+        self.transport = None;
+        self.status_client = None;
+        self.transition(HostSessionState::Shutdown);
+        info!("shutdown requested");
+        Ok(())
+    }
+
+    fn build_config_payload(&self) -> Result<ConfigExportsV0Payload> {
+        let entries: Vec<ConfigExportEntry> = self
+            .exports
+            .iter()
+            .map(|cfg| ConfigExportEntry {
+                export_id: cfg.export_id,
+                block_size: cfg.block_size,
+                size_bytes: cfg.size_bytes,
+            })
+            .collect();
+        ConfigExportsV0Payload::new(entries).map_err(|err| anyhow!(err.to_string()))
+    }
+
+    fn transition(&mut self, next: HostSessionState) {
+        if self.state == next {
+            return;
+        }
+        info!(
+            from = self.state.as_str(),
+            to = next.as_str(),
+            "host controller state transition"
+        );
+        self.state = next;
+    }
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -150,214 +630,8 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     let exports = open_sources(&args).await.context("open export sources")?;
-    let mut expected_session_id = None;
-    let mut has_connected = false;
-    loop {
-        match run_session(&args, &exports, &mut expected_session_id, has_connected).await? {
-            SessionEnd::Shutdown => break,
-            SessionEnd::TransportLost => {
-                info!("gadget disconnected; waiting for reconnection");
-                has_connected = true;
-                time::sleep(RECONNECT_PAUSE).await;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-enum SessionEnd {
-    Shutdown,
-    TransportLost,
-}
-
-async fn run_session(
-    args: &Args,
-    exports: &[ExportSourceConfig],
-    expected_session_id: &mut Option<u64>,
-    has_connected: bool,
-) -> Result<SessionEnd> {
-    let shutdown = signal::ctrl_c();
-    tokio::pin!(shutdown);
-
-    let mut attempts = 0usize;
-    let mut delay = DISCOVERY_DELAY_INITIAL;
-    let (handle, interface) = loop {
-        match discover_device(args, attempts == 0 && !has_connected) {
-            Ok(found) => break found,
-            Err(err) => {
-                if !has_connected && attempts == 0 {
-                    warn!(error = %err, "no smoo gadget found; waiting for connection");
-                } else {
-                    debug!(error = %err, "gadget not present; retrying discovery");
-                }
-                tokio::select! {
-                    _ = &mut shutdown => {
-                        info!("shutdown requested");
-                        return Ok(SessionEnd::Shutdown);
-                    }
-                    _ = time::sleep(delay) => {}
-                }
-                delay = delay.saturating_mul(2).min(DISCOVERY_DELAY_MAX);
-                attempts += 1;
-            }
-        }
-    };
-    let endpoints = infer_interface_endpoints(&handle, interface).context("discover endpoints")?;
-    let transport_config = RusbTransportConfig {
-        interface,
-        interrupt_in: endpoints.interrupt_in,
-        interrupt_out: endpoints.interrupt_out,
-        bulk_in: endpoints.bulk_in,
-        bulk_out: endpoints.bulk_out,
-        timeout: Duration::from_millis(args.timeout_ms),
-    };
-    let mut transport = RusbTransport::new(handle, transport_config).context("init transport")?;
-    let ident = transport
-        .ensure_ident()
-        .await
-        .context("IDENT control transfer")?;
-    debug!(
-        major = ident.major,
-        minor = ident.minor,
-        "gadget IDENT response"
-    );
-    let config_entries: Vec<ConfigExportEntry> = exports
-        .iter()
-        .map(|cfg| ConfigExportEntry {
-            export_id: cfg.export_id,
-            block_size: cfg.block_size,
-            size_bytes: cfg.size_bytes,
-        })
-        .collect();
-    let config_payload = ConfigExportsV0Payload::new(config_entries)
-        .map_err(|err| anyhow!(err.to_string()))
-        .context("build CONFIG_EXPORTS payload")?;
-    transport
-        .send_config_exports_v0(&config_payload)
-        .await
-        .context("CONFIG_EXPORTS control transfer")?;
-    info!(count = exports.len(), "configured gadget exports");
-    for cfg in exports {
-        info!(
-            export_id = cfg.export_id,
-            path = %cfg.path.display(),
-            block_size = cfg.block_size,
-            size_bytes = cfg.size_bytes,
-            "export ready"
-        );
-    }
-    let status_client = transport.status_client();
-    let initial_status =
-        match fetch_status_with_retry(&status_client, STATUS_RETRY_ATTEMPTS, STATUS_RETRY_INTERVAL)
-            .await
-        {
-            Ok(status) => status,
-            Err(err) => {
-                warn!(error = %err, "SMOO_STATUS failed after reconnect; gadget not ready");
-                return Ok(SessionEnd::TransportLost);
-            }
-        };
-    ensure!(
-        initial_status.export_active(),
-        "gadget reports no active export after CONFIG_EXPORTS"
-    );
-    ensure!(
-        initial_status.export_count as usize == exports.len(),
-        "gadget export count mismatch (expected {}, got {})",
-        exports.len(),
-        initial_status.export_count
-    );
-    match expected_session_id {
-        Some(expected) => {
-            let recorded = *expected;
-            ensure!(
-                recorded == initial_status.session_id,
-                "gadget session changed (expected 0x{recorded:016x}, got 0x{:016x})",
-                initial_status.session_id
-            );
-        }
-        None => {
-            *expected_session_id = Some(initial_status.session_id);
-        }
-    }
-    debug!(
-        session_id = initial_status.session_id,
-        export_count = initial_status.export_count,
-        "initial gadget status"
-    );
-    let heartbeat_interval = Duration::from_secs(HEARTBEAT_INTERVAL_SECS);
-    let (heartbeat_tx, mut heartbeat_rx) = mpsc::unbounded_channel();
-    let heartbeat_client = status_client.clone();
-    let session_id = initial_status.session_id;
-    let heartbeat_task = tokio::spawn(async move {
-        if let Err(err) = run_heartbeat(heartbeat_client, session_id, heartbeat_interval).await {
-            let _ = heartbeat_tx.send(err);
-        }
-    });
-    let host_exports = exports
-        .iter()
-        .map(|cfg| HostExport {
-            export_id: cfg.export_id,
-            source: cfg.source.clone(),
-            block_size: cfg.block_size,
-            size_bytes: cfg.size_bytes,
-        })
-        .collect();
-    let mut host = SmooHost::new(transport, host_exports);
-    let ident = host.setup().await.context("ident handshake")?;
-    info!(
-        major = ident.major,
-        minor = ident.minor,
-        "connected to smoo gadget"
-    );
-
-    let outcome = loop {
-        tokio::select! {
-            res = host.run_once() => {
-                match res {
-                    Ok(()) => {}
-                    Err(err) => match err.kind() {
-                        HostErrorKind::Unsupported | HostErrorKind::InvalidRequest => {
-                            warn!(error = %err, "request handling failed");
-                        }
-                        HostErrorKind::Transport => {
-                            warn!(error = %err, "transport failure");
-                            break SessionEnd::TransportLost;
-                        }
-                        _ => {
-                            return Err(anyhow!(err.to_string()));
-                        }
-                    },
-                }
-            }
-            event = heartbeat_rx.recv() => {
-                match event {
-                    Some(HeartbeatFailure::TransferFailed(reason)) => {
-                        warn!(reason = %reason, "heartbeat transfer failed");
-                        break SessionEnd::TransportLost;
-                    }
-                    Some(other) => {
-                        return Err(anyhow!(other.to_string()));
-                    }
-                    None => {
-                        break SessionEnd::TransportLost;
-                    }
-                }
-            }
-            _ = &mut shutdown => {
-                info!("shutdown requested");
-                break SessionEnd::Shutdown;
-            }
-        }
-    };
-
-    if !heartbeat_task.is_finished() {
-        heartbeat_task.abort();
-    }
-    let _ = heartbeat_task.await;
-
-    Ok(outcome)
+    let controller = HostController::new(HostControllerConfig::from(&args), exports);
+    controller.run().await
 }
 
 async fn open_sources(args: &Args) -> Result<Vec<ExportSourceConfig>> {
@@ -391,19 +665,41 @@ async fn open_sources(args: &Args) -> Result<Vec<ExportSourceConfig>> {
     Ok(exports)
 }
 
-fn discover_device(args: &Args, log_scan: bool) -> Result<(rusb::DeviceHandle<rusb::Context>, u8)> {
+#[cfg(test)]
+mod host_controller_tests {
+    use super::{DiscoveryBackoff, DISCOVERY_DELAY_INITIAL, RECONNECT_PAUSE};
+    use tokio::time::Instant;
+
+    #[test]
+    fn discovery_backoff_waits_for_next_attempt() {
+        let mut backoff = DiscoveryBackoff::new();
+        let now = Instant::now();
+        assert!(backoff.ready_at(now));
+        backoff.fail();
+        assert!(!backoff.ready_at(now));
+        assert!(backoff.ready_at(now + DISCOVERY_DELAY_INITIAL));
+        backoff.pause_for(RECONNECT_PAUSE);
+        assert!(!backoff.ready_at(now));
+        assert!(backoff.ready_at(now + RECONNECT_PAUSE));
+    }
+}
+
+fn discover_device(
+    config: &HostControllerConfig,
+    log_scan: bool,
+) -> Result<(rusb::DeviceHandle<rusb::Context>, u8)> {
     let context = rusb::Context::new().context("init libusb context")?;
     let devices = context.devices().context("enumerate usb devices")?;
     if log_scan {
         info!(
-            vendor_filter = args.vendor_id.map(|v| format!("{:#06x}", v)),
-            product_filter = args.product_id.map(|p| format!("{:#06x}", p)),
+            vendor_filter = config.vendor_id.map(|v| format!("{:#06x}", v)),
+            product_filter = config.product_id.map(|p| format!("{:#06x}", p)),
             "scanning USB devices for smoo gadget"
         );
     } else {
         debug!(
-            vendor_filter = args.vendor_id.map(|v| format!("{:#06x}", v)),
-            product_filter = args.product_id.map(|p| format!("{:#06x}", p)),
+            vendor_filter = config.vendor_id.map(|v| format!("{:#06x}", v)),
+            product_filter = config.product_id.map(|p| format!("{:#06x}", p)),
             "probing USB devices for smoo gadget"
         );
     }
@@ -415,7 +711,7 @@ fn discover_device(args: &Args, log_scan: bool) -> Result<(rusb::DeviceHandle<ru
                 continue;
             }
         };
-        if let Some(vendor) = args.vendor_id {
+        if let Some(vendor) = config.vendor_id {
             if device_desc.vendor_id() != vendor {
                 debug!(
                     vid = format_args!("{:#06x}", device_desc.vendor_id()),
@@ -431,7 +727,7 @@ fn discover_device(args: &Args, log_scan: bool) -> Result<(rusb::DeviceHandle<ru
                 "examining usb device"
             );
         }
-        if let Some(product) = args.product_id {
+        if let Some(product) = config.product_id {
             if device_desc.product_id() != product {
                 if log_scan {
                     debug!("skipping device due to product filter");
@@ -478,7 +774,7 @@ fn discover_device(args: &Args, log_scan: bool) -> Result<(rusb::DeviceHandle<ru
     }
     Err(anyhow!(
         "No smoo-compatible USB devices found{}.",
-        if args.vendor_id.is_some() || args.product_id.is_some() {
+        if config.vendor_id.is_some() || config.product_id.is_some() {
             " (after applying filters)"
         } else {
             ""

@@ -24,6 +24,7 @@ use tokio::{
     signal,
     sync::{mpsc, oneshot, RwLock},
     task::JoinHandle,
+    time::{self, Duration},
 };
 use tracing::{debug, info, warn};
 use tracing_subscriber::prelude::*;
@@ -267,27 +268,61 @@ struct PendingRequest {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ExportLifecycle {
+enum GadgetExportState {
+    #[allow(dead_code)]
     New,
     Recovering,
-    QueuesReady,
+    UblkDeviceAdded,
+    QueuesRunning,
     Starting,
     Online,
     ShuttingDown,
     Failed,
+    #[allow(dead_code)]
+    Deleted,
 }
 
-impl ExportLifecycle {
+impl GadgetExportState {
     fn as_str(&self) -> &'static str {
         match self {
-            ExportLifecycle::New => "new",
-            ExportLifecycle::Recovering => "recovering",
-            ExportLifecycle::QueuesReady => "queues_ready",
-            ExportLifecycle::Starting => "starting",
-            ExportLifecycle::Online => "online",
-            ExportLifecycle::ShuttingDown => "shutting_down",
-            ExportLifecycle::Failed => "failed",
+            GadgetExportState::New => "new",
+            GadgetExportState::Recovering => "recovering",
+            GadgetExportState::UblkDeviceAdded => "ublk_device_added",
+            GadgetExportState::QueuesRunning => "queues_running",
+            GadgetExportState::Starting => "starting",
+            GadgetExportState::Online => "online",
+            GadgetExportState::ShuttingDown => "shutting_down",
+            GadgetExportState::Failed => "failed",
+            GadgetExportState::Deleted => "deleted",
         }
+    }
+
+    fn can_transition_to(self, next: GadgetExportState) -> bool {
+        use GadgetExportState::*;
+        matches!(
+            (self, next),
+            (New, Recovering)
+                | (New, UblkDeviceAdded)
+                | (New, QueuesRunning)
+                | (New, Failed)
+                | (Recovering, QueuesRunning)
+                | (Recovering, Starting)
+                | (Recovering, Online)
+                | (Recovering, Failed)
+                | (Recovering, ShuttingDown)
+                | (UblkDeviceAdded, QueuesRunning)
+                | (UblkDeviceAdded, Failed)
+                | (UblkDeviceAdded, ShuttingDown)
+                | (QueuesRunning, Starting)
+                | (QueuesRunning, Failed)
+                | (Starting, Online)
+                | (Starting, Failed)
+                | (Starting, ShuttingDown)
+                | (Online, ShuttingDown)
+                | (Online, Failed)
+                | (ShuttingDown, Deleted)
+                | (Failed, Deleted)
+        )
     }
 }
 
@@ -297,15 +332,15 @@ struct ExportSlot {
     size_bytes: u64,
     device: SmooUblkDevice,
     request_task: Option<JoinHandle<()>>,
-    lifecycle: ExportLifecycle,
+    lifecycle: GadgetExportState,
 }
 
 impl ExportSlot {
     fn new(export_id: u32, block_size: u32, size_bytes: u64, device: SmooUblkDevice) -> Self {
         let lifecycle = if device.recovery_pending() {
-            ExportLifecycle::Recovering
+            GadgetExportState::Recovering
         } else {
-            ExportLifecycle::New
+            GadgetExportState::UblkDeviceAdded
         };
         device.set_export_id(export_id);
         Self {
@@ -318,10 +353,16 @@ impl ExportSlot {
         }
     }
 
-    fn transition(&mut self, next: ExportLifecycle) {
+    fn transition(&mut self, next: GadgetExportState) {
         if self.lifecycle == next {
             return;
         }
+        debug_assert!(
+            self.lifecycle.can_transition_to(next),
+            "invalid gadget export state transition: {:?} -> {:?}",
+            self.lifecycle,
+            next
+        );
         info!(
             export_id = self.export_id,
             dev_id = self.device.dev_id(),
@@ -369,11 +410,11 @@ impl ExportSlot {
 
     fn reconcile_device_state(&mut self) -> Option<DeviceState> {
         match self.device.state() {
-            DeviceState::Online if self.lifecycle == ExportLifecycle::Starting => {
-                self.transition(ExportLifecycle::Online);
+            DeviceState::Online if self.lifecycle == GadgetExportState::Starting => {
+                self.transition(GadgetExportState::Online);
                 Some(DeviceState::Online)
             }
-            DeviceState::Failed if self.lifecycle != ExportLifecycle::Failed => {
+            DeviceState::Failed if self.lifecycle != GadgetExportState::Failed => {
                 if let Some(err) = self.device.last_error() {
                     warn!(
                         export_id = self.export_id,
@@ -388,7 +429,7 @@ impl ExportSlot {
                         "ublk device failed during startup"
                     );
                 }
-                self.transition(ExportLifecycle::Failed);
+                self.transition(GadgetExportState::Failed);
                 Some(DeviceState::Failed)
             }
             _ => None,
@@ -419,16 +460,37 @@ impl ExportSlot {
             Some(self.size_bytes / self.block_size as u64)
         }
     }
+
+    fn is_online(&self) -> bool {
+        matches!(self.lifecycle, GadgetExportState::Online)
+    }
+
+    fn matches_config(&self, runtime: &RuntimeConfig, entry: &ExportConfig) -> bool {
+        if self.block_size != entry.block_size || self.size_bytes != entry.size_bytes {
+            return false;
+        }
+        if self.device.queue_count() != runtime.queue_count
+            || self.device.queue_depth() != runtime.queue_depth
+        {
+            return false;
+        }
+        match required_block_count(entry) {
+            Ok(required_blocks) => self.device.block_count() == required_blocks,
+            Err(_) => false,
+        }
+    }
 }
 
 struct ExportsRuntime {
     entries: HashMap<u32, ExportSlot>,
+    dirty: bool,
 }
 
 impl ExportsRuntime {
     fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            dirty: false,
         }
     }
 
@@ -442,6 +504,7 @@ impl ExportsRuntime {
 
     fn insert(&mut self, slot: ExportSlot) {
         self.entries.insert(slot.export_id, slot);
+        self.dirty = true;
     }
 
     fn get(&self, export_id: u32) -> Option<&ExportSlot> {
@@ -464,11 +527,12 @@ impl ExportsRuntime {
 
     async fn remove(&mut self, export_id: u32, ublk: &mut SmooUblk) -> Result<()> {
         if let Some(mut slot) = self.entries.remove(&export_id) {
-            slot.transition(ExportLifecycle::ShuttingDown);
+            slot.transition(GadgetExportState::ShuttingDown);
             let device = slot.into_device();
             ublk.stop_dev(device, true)
                 .await
                 .with_context(|| format!("stop ublk device for export {export_id}"))?;
+            self.dirty = true;
         }
         Ok(())
     }
@@ -478,6 +542,7 @@ impl ExportsRuntime {
         for id in ids {
             self.remove(id, ublk).await?;
         }
+        self.dirty = true;
         Ok(())
     }
 
@@ -486,6 +551,12 @@ impl ExportsRuntime {
             .values()
             .map(|slot| slot.export_state())
             .collect()
+    }
+
+    fn take_dirty(&mut self) -> bool {
+        let dirty = self.dirty;
+        self.dirty = false;
+        dirty
     }
 }
 
@@ -507,83 +578,80 @@ enum ControlMessage {
     Config(ConfigCommand),
 }
 
-async fn run_event_loop(
-    ublk: &mut SmooUblk,
-    mut gadget: SmooGadget,
-    runtime: RuntimeConfig,
-    mut exports: ExportsRuntime,
-    mut control_rx: mpsc::Receiver<ControlMessage>,
-    mut pending_rx: mpsc::Receiver<PendingRequest>,
-) -> Result<()> {
-    let shutdown = signal::ctrl_c();
-    tokio::pin!(shutdown);
+struct ConfigInFlight {
+    responder: oneshot::Sender<Result<()>>,
+}
 
-    let mut io_error = None;
-    loop {
-        let failed_exports = exports.refresh_lifecycles();
-        for export_id in failed_exports {
-            warn!(export_id, "removing failed export");
-            if let Err(err) = exports.remove(export_id, ublk).await {
-                warn!(export_id, error = ?err, "failed to remove failed export");
-            }
+impl ConfigInFlight {
+    fn respond(self, outcome: Result<()>) {
+        let _ = self.responder.send(outcome);
+    }
+}
+
+struct GadgetController<'a> {
+    ublk: &'a mut SmooUblk,
+    gadget: SmooGadget,
+    runtime: RuntimeConfig,
+    exports: ExportsRuntime,
+    desired: HashMap<u32, ExportConfig>,
+    has_config: bool,
+    inflight: Option<ConfigInFlight>,
+    control_rx: mpsc::Receiver<ControlMessage>,
+    pending_rx: mpsc::Receiver<PendingRequest>,
+}
+
+impl<'a> GadgetController<'a> {
+    fn new(
+        ublk: &'a mut SmooUblk,
+        gadget: SmooGadget,
+        runtime: RuntimeConfig,
+        exports: ExportsRuntime,
+        control_rx: mpsc::Receiver<ControlMessage>,
+        pending_rx: mpsc::Receiver<PendingRequest>,
+    ) -> Self {
+        Self {
+            ublk,
+            gadget,
+            runtime,
+            exports,
+            desired: HashMap::new(),
+            has_config: false,
+            inflight: None,
+            control_rx,
+            pending_rx,
         }
-        if exports.is_empty() {
+    }
+
+    async fn run(mut self) -> Result<()> {
+        let shutdown = signal::ctrl_c();
+        tokio::pin!(shutdown);
+        let mut reconcile_tick = time::interval(Duration::from_millis(50));
+        let mut io_error: Option<anyhow::Error> = None;
+
+        loop {
             tokio::select! {
                 _ = &mut shutdown => {
                     info!("shutdown signal received");
                     break;
                 }
-                msg = control_rx.recv() => {
-                    if let Some(msg) = msg {
-                        process_control_message(
-                            msg,
-                            ublk,
-                            &mut exports,
-                            &runtime,
-                        )
-                        .await?;
-                    } else {
-                        break;
+                msg = self.control_rx.recv() => {
+                    match msg {
+                        Some(msg) => {
+                            if let Err(err) = self.handle_control_message(msg).await {
+                                self.fail_inflight(&err);
+                                return Err(err);
+                            }
+                        }
+                        None => {
+                            warn!("control channel closed");
+                            break;
+                        }
                     }
                 }
-            }
-        } else {
-            tokio::select! {
-                _ = &mut shutdown => {
-                    info!("shutdown signal received");
-                    break;
-                }
-                msg = control_rx.recv() => {
-                    if let Some(msg) = msg {
-                        process_control_message(
-                            msg,
-                            ublk,
-                            &mut exports,
-                            &runtime,
-                        )
-                        .await?;
-                    } else {
-                        break;
-                    }
-                }
-                pending = pending_rx.recv() => {
+                pending = self.pending_rx.recv() => {
                     match pending {
                         Some(pending_req) => {
-                            let Some(slot) = exports.get(pending_req.export_id) else {
-                                warn!(
-                                    export_id = pending_req.export_id,
-                                    "received request for unknown export"
-                                );
-                                continue;
-                            };
-                            if let Err(err) = handle_request(
-                                &mut gadget,
-                                slot.export_id,
-                                slot,
-                                pending_req.request,
-                            )
-                            .await
-                            {
+                            if let Err(err) = self.handle_pending_request(pending_req).await {
                                 io_error = Some(err);
                                 break;
                             }
@@ -594,24 +662,224 @@ async fn run_event_loop(
                         }
                     }
                 }
+                _ = reconcile_tick.tick() => {
+                    if let Err(err) = self.reconcile_once().await {
+                        self.fail_inflight(&err);
+                        return Err(err);
+                    }
+                }
+            }
+        }
+
+        self.shutdown(io_error).await
+    }
+
+    async fn shutdown(mut self, io_error: Option<anyhow::Error>) -> Result<()> {
+        if let Err(err) = self.exports.clear(self.ublk).await {
+            warn!(error = ?err, "failed to clear exports during shutdown");
+        }
+        self.runtime.status().set_export_count(0).await;
+        if let Some(state_file) = self.runtime.state_file() {
+            if let Err(err) = state_file.clear() {
+                warn!(error = ?err, "failed to remove state file during shutdown");
+            } else {
+                debug!("state file cleared on shutdown");
+            }
+        }
+        if let Some(err) = io_error {
+            Err(err)
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn handle_control_message(&mut self, msg: ControlMessage) -> Result<()> {
+        match msg {
+            ControlMessage::Config(cmd) => self.configure(cmd).await,
+        }
+    }
+
+    async fn configure(&mut self, cmd: ConfigCommand) -> Result<()> {
+        let mut next = HashMap::new();
+        for entry in cmd.payload.entries() {
+            ensure!(
+                !next.contains_key(&entry.export_id),
+                "duplicate export_id {} in CONFIG_EXPORTS",
+                entry.export_id
+            );
+            required_block_count(entry)?;
+            next.insert(entry.export_id, entry.clone());
+        }
+        self.desired = next;
+        self.has_config = true;
+        if let Some(inflight) = self.inflight.take() {
+            inflight.respond(Err(anyhow!("CONFIG_EXPORTS superseded by new payload")));
+        }
+        self.inflight = Some(ConfigInFlight {
+            responder: cmd.respond_to,
+        });
+        Ok(())
+    }
+
+    async fn handle_pending_request(&mut self, pending: PendingRequest) -> Result<()> {
+        let Some(slot) = self.exports.get(pending.export_id) else {
+            warn!(
+                export_id = pending.export_id,
+                "received request for unknown export"
+            );
+            return Ok(());
+        };
+        handle_request(&mut self.gadget, slot.export_id, slot, pending.request).await
+    }
+
+    async fn reconcile_once(&mut self) -> Result<()> {
+        let failed = self.exports.refresh_lifecycles();
+        for export_id in failed {
+            warn!(export_id, "removing failed export");
+            if let Err(err) = self.exports.remove(export_id, self.ublk).await {
+                warn!(export_id, error = ?err, "failed to remove failed export");
+            }
+        }
+        self.reconcile_desired_exports().await?;
+        self.update_status().await;
+        self.persist_state().await;
+        self.try_finish_config();
+        Ok(())
+    }
+
+    async fn reconcile_desired_exports(&mut self) -> Result<()> {
+        if !self.has_config {
+            return Ok(());
+        }
+        let desired_ids: HashSet<u32> = self.desired.keys().copied().collect();
+        let existing_ids: Vec<u32> = self.exports.entries.keys().copied().collect();
+        for export_id in existing_ids {
+            if !desired_ids.contains(&export_id) {
+                self.exports.remove(export_id, self.ublk).await?;
+            }
+        }
+        for entry in self.desired.values() {
+            match self.exports.get_mut(entry.export_id) {
+                Some(slot) => {
+                    if !slot.matches_config(&self.runtime, entry) {
+                        info!(
+                            export_id = entry.export_id,
+                            "replacing export to match desired spec"
+                        );
+                        self.exports.remove(entry.export_id, self.ublk).await?;
+                        let slot = provision_export_slot(self.ublk, &self.runtime, entry).await?;
+                        self.exports.insert(slot);
+                        continue;
+                    }
+                    if slot.device().recovery_pending() {
+                        info!(
+                            export_id = entry.export_id,
+                            "finalizing recovered export configuration"
+                        );
+                        self.ublk
+                            .finalize_recovery(slot.device_mut())
+                            .await
+                            .context("complete ublk recovery")?;
+                        slot.transition(GadgetExportState::QueuesRunning);
+                        slot.start_request_task(self.runtime.pending_tx())
+                            .with_context(|| {
+                                format!(
+                                    "spawn recovered request loop for export {}",
+                                    entry.export_id
+                                )
+                            })?;
+                        slot.transition(GadgetExportState::Starting);
+                    } else if matches!(slot.lifecycle, GadgetExportState::UblkDeviceAdded) {
+                        slot.transition(GadgetExportState::QueuesRunning);
+                        slot.start_request_task(self.runtime.pending_tx())
+                            .with_context(|| {
+                                format!("spawn request loop for export {}", entry.export_id)
+                            })?;
+                        slot.transition(GadgetExportState::Starting);
+                    }
+                }
+                None => {
+                    info!(
+                        export_id = entry.export_id,
+                        "creating new export to satisfy desired spec"
+                    );
+                    let slot = provision_export_slot(self.ublk, &self.runtime, entry).await?;
+                    self.exports.insert(slot);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn update_status(&self) {
+        self.runtime
+            .status()
+            .set_export_count(self.exports.len() as u32)
+            .await;
+    }
+
+    async fn persist_state(&mut self) {
+        if !self.exports.take_dirty() {
+            return;
+        }
+        let Some(state_file) = self.runtime.state_file().cloned() else {
+            return;
+        };
+        let session_id = self.runtime.status().session_id().await;
+        if self.exports.is_empty() {
+            if let Err(err) = state_file.clear() {
+                warn!(error = ?err, "failed to clear state file");
+            }
+        } else {
+            let states = self.exports.export_states();
+            if let Err(err) = state_file.store(session_id, &states) {
+                warn!(error = ?err, "failed to write state file");
             }
         }
     }
 
-    exports.clear(ublk).await?;
-    runtime.status().set_export_count(0).await;
-    if let Some(state_file) = runtime.state_file() {
-        if let Err(err) = state_file.clear() {
-            warn!(error = ?err, "failed to remove state file during shutdown");
-        } else {
-            debug!("state file cleared on shutdown");
+    fn try_finish_config(&mut self) {
+        if self.inflight.is_none() {
+            return;
+        }
+        if !self.desired_ready() {
+            return;
+        }
+        if let Some(inflight) = self.inflight.take() {
+            inflight.respond(Ok(()));
         }
     }
-    if let Some(err) = io_error {
-        Err(err)
-    } else {
-        Ok(())
+
+    fn desired_ready(&self) -> bool {
+        if !self.has_config || self.desired.len() != self.exports.len() {
+            return false;
+        }
+        self.desired.keys().all(|export_id| {
+            self.exports
+                .get(*export_id)
+                .map(|slot| slot.is_online())
+                .unwrap_or(false)
+        })
     }
+
+    fn fail_inflight(&mut self, err: &anyhow::Error) {
+        if let Some(inflight) = self.inflight.take() {
+            inflight.respond(Err(anyhow!(err.to_string())));
+        }
+    }
+}
+
+async fn run_event_loop(
+    ublk: &mut SmooUblk,
+    gadget: SmooGadget,
+    runtime: RuntimeConfig,
+    exports: ExportsRuntime,
+    control_rx: mpsc::Receiver<ControlMessage>,
+    pending_rx: mpsc::Receiver<PendingRequest>,
+) -> Result<()> {
+    GadgetController::new(ublk, gadget, runtime, exports, control_rx, pending_rx)
+        .run()
+        .await
 }
 
 async fn handle_request(
@@ -1072,111 +1340,6 @@ async fn recover_exports(
     Ok(slots)
 }
 
-async fn process_control_message(
-    msg: ControlMessage,
-    ublk: &mut SmooUblk,
-    exports: &mut ExportsRuntime,
-    runtime: &RuntimeConfig,
-) -> Result<()> {
-    match msg {
-        ControlMessage::Config(cmd) => {
-            let result = apply_config(ublk, exports, runtime, cmd.payload).await;
-            let reply = result.map(|_| ());
-            let _ = cmd.respond_to.send(reply);
-        }
-    }
-    Ok(())
-}
-
-async fn apply_config(
-    ublk: &mut SmooUblk,
-    exports: &mut ExportsRuntime,
-    runtime: &RuntimeConfig,
-    config: ConfigExportsV0,
-) -> Result<()> {
-    let desired = config.entries();
-    let desired_ids: HashSet<u32> = desired.iter().map(|entry| entry.export_id).collect();
-    let current_ids: Vec<u32> = exports.entries.keys().copied().collect();
-    for export_id in current_ids {
-        if !desired_ids.contains(&export_id) {
-            info!(export_id, "CONFIG_EXPORTS removing export");
-            exports.remove(export_id, ublk).await?;
-        }
-    }
-    for entry in desired {
-        match exports.get_mut(entry.export_id) {
-            Some(slot) => {
-                if slot.device().recovery_pending() {
-                    ensure!(
-                        slot.block_size == entry.block_size,
-                        "recovered export {} block size mismatch",
-                        entry.export_id
-                    );
-                    let required_blocks = required_block_count(entry)?;
-                    ensure!(
-                        slot.device().block_count() == required_blocks,
-                        "recovered export {} capacity mismatch",
-                        entry.export_id
-                    );
-                    ensure!(
-                        slot.device().queue_count() == runtime.queue_count
-                            && slot.device().queue_depth() == runtime.queue_depth,
-                        "recovered export {} queue geometry mismatch",
-                        entry.export_id
-                    );
-                    info!(
-                        export_id = entry.export_id,
-                        "CONFIG_EXPORTS matches recovered export; finalizing recovery"
-                    );
-                    ublk.finalize_recovery(slot.device_mut())
-                        .await
-                        .context("complete ublk recovery")?;
-                    slot.start_request_task(runtime.pending_tx())
-                        .with_context(|| {
-                            format!(
-                                "spawn recovered request loop for export {}",
-                                entry.export_id
-                            )
-                        })?;
-                    slot.transition(ExportLifecycle::Online);
-                } else {
-                    info!(
-                        export_id = entry.export_id,
-                        "CONFIG_EXPORTS replacing active export"
-                    );
-                    exports.remove(entry.export_id, ublk).await?;
-                    let slot = provision_export_slot(ublk, runtime, entry).await?;
-                    exports.insert(slot);
-                }
-            }
-            None => {
-                info!(
-                    export_id = entry.export_id,
-                    "CONFIG_EXPORTS creating export"
-                );
-                let slot = provision_export_slot(ublk, runtime, entry).await?;
-                exports.insert(slot);
-            }
-        }
-    }
-    runtime
-        .status()
-        .set_export_count(exports.len() as u32)
-        .await;
-    if let Some(state_file) = runtime.state_file() {
-        let session_id = runtime.status().session_id().await;
-        if exports.len() > 0 {
-            let states = exports.export_states();
-            if let Err(err) = state_file.store(session_id, &states) {
-                warn!(error = ?err, "failed to write state file");
-            }
-        } else if let Err(err) = state_file.clear() {
-            warn!(error = ?err, "failed to clear state file");
-        }
-    }
-    Ok(())
-}
-
 fn required_block_count(entry: &ExportConfig) -> Result<usize> {
     ensure!(
         entry.size_bytes != 0,
@@ -1220,13 +1383,10 @@ async fn provision_export_slot(
     entry: &ExportConfig,
 ) -> Result<ExportSlot> {
     let mut slot = new_export_slot(ublk, runtime, entry).await?;
-    // `UBLK_CMD_START_DEV` runs `device_add_disk()` which synchronously probes partitions and
-    // issues I/O through our queues. We therefore start the per-export request task before
-    // waiting on START_DEV so the kernel never hits a dead queue and wedges the control mutex.
-    slot.transition(ExportLifecycle::QueuesReady);
+    slot.transition(GadgetExportState::QueuesRunning);
     slot.start_request_task(runtime.pending_tx())
         .with_context(|| format!("spawn request loop for export {}", entry.export_id))?;
-    slot.transition(ExportLifecycle::Starting);
+    slot.transition(GadgetExportState::Starting);
     Ok(slot)
 }
 
@@ -1336,6 +1496,21 @@ fn to_owned_fd(file: File) -> OwnedFd {
 fn parse_hex_u16(input: &str) -> Result<u16, String> {
     let trimmed = input.trim_start_matches("0x").trim_start_matches("0X");
     u16::from_str_radix(trimmed, 16).map_err(|err| err.to_string())
+}
+
+#[cfg(test)]
+mod controller_tests {
+    use super::GadgetExportState;
+
+    #[test]
+    fn gadget_state_transitions_follow_lifecycle() {
+        assert!(GadgetExportState::New.can_transition_to(GadgetExportState::UblkDeviceAdded));
+        assert!(GadgetExportState::QueuesRunning.can_transition_to(GadgetExportState::Starting));
+        assert!(GadgetExportState::Starting.can_transition_to(GadgetExportState::Online));
+        assert!(GadgetExportState::Online.can_transition_to(GadgetExportState::Failed));
+        assert!(!GadgetExportState::Online.can_transition_to(GadgetExportState::New));
+        assert!(GadgetExportState::ShuttingDown.can_transition_to(GadgetExportState::Deleted));
+    }
 }
 
 mod state {
