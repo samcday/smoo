@@ -241,3 +241,18 @@ Failure to service ep0 promptly leads to EP0 STALL + possible gadget reset.
   * cancellation safety
   * ordering guarantees
   * all invariants in this document
+
+
+## ublk io_uring Completion Invariant
+
+Every SQE dequeued from ublk **must** be driven to completion. This means:
+- A CQE is always posted with success, retry (`-EAGAIN`), or hard failure (`-EIO`), OR
+- The ublk device/queue is explicitly torn down.
+
+No in‑flight command may be forgotten or left indefinitely pending.
+
+## Recovery Semantics
+
+The gadget treats lack of protocol traffic as **recoverable**. If host user‑space dies or the WebUSB context vanishes, but the USB configuration remains active, the gadget returns **`-EAGAIN`** so consumers like `dd` simply stall and retry.
+
+“Host actually gone” is defined strictly as **USB/FunctionFS‑level disconnection**: FFS unbind/disconnect, configuration drop, or endpoint ops returning `-ENODEV`/`-ESHUTDOWN`. Only then should outstanding I/O complete with hard errors and teardown occur.
