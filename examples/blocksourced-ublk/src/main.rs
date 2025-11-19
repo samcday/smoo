@@ -10,6 +10,11 @@
 //! sudo RUST_LOG=info,ublk-ctrl=trace,smoo_gadget_ublk=trace \
 //!   cargo run -p blocksourced-ublk -- \
 //!     --device /dev/nvme0n1p3 --block-size 512
+//! # Infinite cats demo
+//! sudo RUST_LOG=info,ublk-ctrl=trace,smoo_gadget_ublk=trace \
+//!   cargo run -p blocksourced-ublk -- \
+//!     --meow --block-size 4096
+//!
 //! ```
 
 use anyhow::{Context, ensure};
@@ -17,6 +22,7 @@ use clap::{ArgGroup, Parser};
 use smoo_gadget_ublk::{SmooUblk, UblkIoRequest, UblkOp};
 use smoo_host_blocksources::{DeviceBlockSource, FileBlockSource};
 use smoo_host_core::BlockSource;
+use smoo_purrfection::{DebugPatternProvider, Geometry, VirtualFatBlockSource};
 use std::{io, path::PathBuf, sync::Arc};
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
@@ -25,7 +31,7 @@ use tracing_subscriber::prelude::*;
 #[derive(Debug, Parser)]
 #[command(name = "blocksourced-ublk")]
 #[command(about = "Expose a file or block device through a ublk queue", long_about = None)]
-#[command(group = ArgGroup::new("backing").args(["file", "device"]).required(true))]
+#[command(group = ArgGroup::new("backing").args(["file", "device", "meow"]).required(true))]
 struct Args {
     /// Backing file path
     #[arg(long, value_name = "PATH")]
@@ -33,6 +39,9 @@ struct Args {
     /// Backing block device path
     #[arg(long, value_name = "PATH")]
     device: Option<PathBuf>,
+    /// Present the procedural virtual FAT volume of infinite cats
+    #[arg(long)]
+    meow: bool,
     /// Number of ublk queues to configure
     #[arg(long, default_value_t = 1)]
     queue_count: u16,
@@ -60,6 +69,15 @@ async fn main() -> anyhow::Result<()> {
     ensure!(
         args.block_size.is_power_of_two(),
         "block size must be a power-of-two"
+    );
+    ensure!(
+        args.block_size % 512 == 0,
+        "block size must be a multiple of 512 bytes"
+    );
+    ensure!(
+        !args.meow || args.block_size == Geometry::BLOCK_SIZE,
+        "the --meow volume must use a {}-byte block size",
+        Geometry::BLOCK_SIZE
     );
 
     let source = open_source(&args).await.context("open block source")?;
@@ -114,8 +132,8 @@ async fn main() -> anyhow::Result<()> {
                         break;
                     }
                 };
-                let req_len = match request_byte_len(&req, block_size) {
-                    Ok(len) => len,
+                let req_geom = match request_geometry(&req, block_size) {
+                    Ok(geom) => geom,
                     Err(err) => {
                         let errno = errno_from_io(&err);
                         warn!(
@@ -123,14 +141,15 @@ async fn main() -> anyhow::Result<()> {
                             tag = req.tag,
                             errno = errno,
                             ?req.op,
-                            "invalid request length: {err}"
+                            "invalid request geometry: {err}"
                         );
                         device
                             .complete_io(req, -errno)
-                            .context("complete invalid length")?;
+                            .context("complete invalid geometry")?;
                         continue;
                     }
                 };
+                let req_len = req_geom.byte_len;
                 debug!(
                     queue = req.queue_id,
                     tag = req.tag,
@@ -160,7 +179,7 @@ async fn main() -> anyhow::Result<()> {
                             .checkout_buffer(req.queue_id, req.tag)
                             .context("checkout buffer")?;
                         source
-                            .read_blocks(req.sector, &mut buf.as_mut_slice()[..req_len])
+                            .read_blocks(req_geom.lba, &mut buf.as_mut_slice()[..req_len])
                             .await
                             .context("read backing source")?;
                         req_len
@@ -183,7 +202,7 @@ async fn main() -> anyhow::Result<()> {
                             .checkout_buffer(req.queue_id, req.tag)
                             .context("checkout buffer")?;
                         source
-                            .write_blocks(req.sector, &buf.as_slice()[..req_len])
+                            .write_blocks(req_geom.lba, &buf.as_slice()[..req_len])
                             .await
                             .context("write backing source")?;
                         req_len
@@ -194,7 +213,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                     UblkOp::Discard => {
                         source
-                            .discard(req.sector, req.num_sectors)
+                            .discard(req_geom.lba, req_geom.block_count)
                             .await
                             .context("discard backing source")?;
                         0
@@ -242,9 +261,10 @@ async fn main() -> anyhow::Result<()> {
 
 async fn open_source(args: &Args) -> anyhow::Result<Arc<dyn BlockSource>> {
     let block_size = args.block_size;
-    let source: Arc<dyn BlockSource> = match (&args.file, &args.device) {
-        (Some(path), None) => Arc::new(FileBlockSource::open(path, block_size).await?),
-        (None, Some(path)) => Arc::new(DeviceBlockSource::open(path, block_size).await?),
+    let source: Arc<dyn BlockSource> = match (&args.file, &args.device, args.meow) {
+        (Some(path), None, false) => Arc::new(FileBlockSource::open(path, block_size).await?),
+        (None, Some(path), false) => Arc::new(DeviceBlockSource::open(path, block_size).await?),
+        (None, None, true) => Arc::new(VirtualFatBlockSource::new(DebugPatternProvider::default())),
         _ => unreachable!("clap enforces mutually exclusive arguments"),
     };
     Ok(source)
@@ -283,10 +303,49 @@ fn errno_from_io(err: &io::Error) -> i32 {
     })
 }
 
-fn request_byte_len(req: &UblkIoRequest, block_size: usize) -> io::Result<usize> {
-    let sectors = usize::try_from(req.num_sectors)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "sector count overflow"))?;
-    sectors
-        .checked_mul(block_size)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "request byte length overflow"))
+struct RequestGeometry {
+    lba: u64,
+    block_count: u32,
+    byte_len: usize,
+}
+
+fn request_geometry(req: &UblkIoRequest, block_size: usize) -> io::Result<RequestGeometry> {
+    const SECTOR_BYTES: usize = 512;
+    if block_size % SECTOR_BYTES != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "logical block size must be a multiple of 512 bytes",
+        ));
+    }
+    let sectors_per_block = block_size / SECTOR_BYTES;
+    let sectors_per_block_u64 = sectors_per_block as u64;
+    if req.sector % sectors_per_block_u64 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "sector offset not aligned to logical block size",
+        ));
+    }
+    let lba = req.sector / sectors_per_block_u64;
+    let sectors_per_block_u32 = sectors_per_block as u32;
+    if req.num_sectors % sectors_per_block_u32 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "sector count not aligned to logical block size",
+        ));
+    }
+    let block_count = req.num_sectors / sectors_per_block_u32;
+    let blocks_usize = usize::try_from(block_count).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "block count exceeds addressable range",
+        )
+    })?;
+    let byte_len = blocks_usize.checked_mul(block_size).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "request byte length overflow")
+    })?;
+    Ok(RequestGeometry {
+        lba,
+        block_count,
+        byte_len,
+    })
 }

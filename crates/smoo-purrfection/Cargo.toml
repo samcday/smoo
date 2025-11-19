@@ -1,0 +1,11 @@
+[package]
+name = "smoo-purrfection"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+async-trait = { version = "0.1.89", default-features = false }
+smoo-host-core = { path = "../smoo-host-core" }
+
+[dev-dependencies]
+futures = { version = "0.3", default-features = false, features = ["executor"] }
