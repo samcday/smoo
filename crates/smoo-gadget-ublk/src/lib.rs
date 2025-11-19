@@ -13,13 +13,14 @@ use anyhow::{Context, ensure};
 use async_channel::{Receiver, RecvError, Sender};
 use io_uring::{IoUring, cqueue, squeue, types};
 use std::cmp;
+use std::fmt;
 use std::fs::File;
 use std::io;
 use std::mem::{size_of, transmute};
 use std::os::fd::AsRawFd;
 use std::ptr;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
@@ -34,6 +35,21 @@ mod sys {
     #![allow(unsafe_op_in_unsafe_fn)]
     include!(concat!(env!("OUT_DIR"), "/ublk_cmd.rs"));
 }
+/// # Gadget-side ublk lifecycle context
+///
+/// * `setup_device` historically issued `ADD_DEV` → `SET_PARAMS` → spawned queue workers → fired
+///   `START_DEV` on a helper thread without tracking any intermediate state.
+/// * Multiple exports therefore shared a single implicit control flow, and errors/panics in one
+///   device could leave its queues half-alive with no clear ownership or diagnostics.
+/// * When a daemon crashed between issuing `START_DEV` and servicing partition-scan I/O, the kernel
+///   kept `device_add_disk()` running and held the control mutex, wedging all other exports.
+///
+/// In contrast, the canonical `libublk-rs` implementation maintains a per-device state machine,
+/// only transitions when prerequisites are satisfied, and records queue progress so recovery logic
+/// knows exactly where things failed. This module now mirrors that idea with an explicit
+/// `DeviceState` enum so each export has a traceable lifecycle, matching the guidance in
+/// `Documentation/block/ublk.rst`.
+///
 /// Top level interface to ublk. Creates SmooUblkDevices
 pub struct SmooUblk {
     handle: Option<JoinHandle<()>>,
@@ -62,6 +78,8 @@ pub struct SmooUblkDevice {
     completion_txs: Vec<Sender<QueueCompletion>>,
     workers: Vec<QueueWorkerHandle>,
     start_handle: Option<JoinHandle<()>>,
+    start_result: Option<Receiver<anyhow::Result<()>>>,
+    state: Arc<SharedDeviceState>,
     shutdown: bool,
 }
 
@@ -101,6 +119,150 @@ struct QueueCompletion {
 }
 
 pub type UblkBuffer<'a> = BufferGuard<'a>;
+
+/// Lifecycle states used by the gadget-side ublk integration.
+///
+/// * `DeviceState` mirrors the ordering enforced by libublk-rs: a device is first created,
+///   parameters are pushed, queues become runnable, and only then is `START_DEV` allowed.
+/// * The `Recovering` state corresponds to `UBLK_CMD_START_USER_RECOVERY`/`END_USER_RECOVERY`
+///   flows; smoo will not issue normal I/O until recovery completes.
+/// * Terminal states (`Failed`, `Deleted`) are sticky and make diagnosing wedged exports easier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceState {
+    New,
+    DeviceAdded,
+    QueuesReady,
+    Starting,
+    Online,
+    Recovering,
+    ShuttingDown,
+    Failed,
+    Deleted,
+}
+
+impl DeviceState {
+    fn as_str(self) -> &'static str {
+        match self {
+            DeviceState::New => "new",
+            DeviceState::DeviceAdded => "device_added",
+            DeviceState::QueuesReady => "queues_ready",
+            DeviceState::Starting => "starting",
+            DeviceState::Online => "online",
+            DeviceState::Recovering => "recovering",
+            DeviceState::ShuttingDown => "shutting_down",
+            DeviceState::Failed => "failed",
+            DeviceState::Deleted => "deleted",
+        }
+    }
+
+    fn can_transition_to(self, next: DeviceState) -> bool {
+        use DeviceState::*;
+        matches!(
+            (self, next),
+            (New, DeviceAdded)
+                | (DeviceAdded, QueuesReady)
+                | (QueuesReady, Starting)
+                | (Starting, Online)
+                | (Starting, Failed)
+                | (Online, ShuttingDown)
+                | (Online, Failed)
+                | (Recovering, Online)
+                | (Recovering, Failed)
+                | (ShuttingDown, Deleted)
+                | (Failed, Deleted)
+                | (New, Failed)
+                | (DeviceAdded, Failed)
+                | (QueuesReady, Failed)
+                | (Recovering, ShuttingDown)
+                | (Starting, ShuttingDown)
+                | (Online, Deleted)
+                | (New, Deleted)
+                | (DeviceAdded, Deleted)
+                | (QueuesReady, Deleted)
+                | (Recovering, Deleted)
+                | (Starting, Deleted)
+                | (Failed, ShuttingDown)
+        )
+    }
+}
+
+impl fmt::Display for DeviceState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug)]
+struct SharedDeviceState {
+    inner: Mutex<SharedDeviceStateInner>,
+}
+
+#[derive(Debug)]
+struct SharedDeviceStateInner {
+    state: DeviceState,
+    export_id: Option<u32>,
+    last_error: Option<String>,
+}
+
+impl SharedDeviceState {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(SharedDeviceStateInner {
+                state: DeviceState::New,
+                export_id: None,
+                last_error: None,
+            }),
+        }
+    }
+
+    fn transition(&self, dev_id: u32, next: DeviceState) {
+        let mut guard = self.inner.lock().unwrap();
+        if guard.state == next {
+            return;
+        }
+        if !guard.state.can_transition_to(next) {
+            warn!(
+                dev_id,
+                export_id = guard.export_id,
+                from = %guard.state,
+                to = %next,
+                "invalid device state transition"
+            );
+            guard.state = next;
+            return;
+        }
+        info!(
+            dev_id,
+            export_id = guard.export_id,
+            from = %guard.state,
+            to = %next,
+            "device state transition"
+        );
+        guard.state = next;
+    }
+
+    fn mark_failed(&self, dev_id: u32, err: &anyhow::Error) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.last_error = Some(format!("{err:?}"));
+        guard.state = DeviceState::Failed;
+        error!(
+            dev_id,
+            export_id = guard.export_id,
+            error = %err,
+            "device entered failed state"
+        );
+    }
+
+    fn set_export_id(&self, export_id: u32) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.export_id = Some(export_id);
+    }
+
+    fn snapshot(&self) -> (DeviceState, Option<String>) {
+        let guard = self.inner.lock().unwrap();
+        (guard.state, guard.last_error.clone())
+    }
+}
 
 impl SmooUblk {
     pub fn max_io_bytes_hint(block_size: usize, queue_depth: u16) -> anyhow::Result<usize> {
@@ -360,6 +522,7 @@ impl SmooUblk {
         let buffers = QueueBuffers::new(queue_count, queue_depth, max_io_bytes)
             .context("allocate ublk buffers")?;
         let queue_buf_ptrs = buffers.raw_ptrs();
+        let shared_state = Arc::new(SharedDeviceState::new());
 
         // For now we use -1 as the dev_id, so that a fresh dev is created for us.
         // Once we support resuming this needs to change.
@@ -410,6 +573,7 @@ impl SmooUblk {
         // ublksrv_ctrl_dev_info struct.
         let dev_id = info.dev_id as u32;
         cmd.dev_id = dev_id;
+        shared_state.transition(dev_id, DeviceState::DeviceAdded);
 
         // Now we pass the ublk_params in a UBLK_CMD_SET_PARAMS to inform ublk of geometry/capacity.
         cmd.len = params.len as _;
@@ -465,6 +629,7 @@ impl SmooUblk {
                 "queue worker ready"
             );
         }
+        shared_state.transition(dev_id, DeviceState::QueuesReady);
 
         let device = SmooUblkDevice {
             dev_id,
@@ -480,14 +645,23 @@ impl SmooUblk {
             completion_txs,
             workers,
             start_handle: None,
+            start_result: None,
+            state: shared_state.clone(),
             shutdown: false,
         };
 
         cmd.len = 0;
         cmd.addr = 0;
         cmd.data[0] = unsafe { libc::getpid() } as u64;
+        // `UBLK_CMD_START_DEV` blocks inside `device_add_disk()` and runs a synchronous partition
+        // scan that immediately issues READs via our queues. Queue workers therefore must already
+        // be up and blocked in `FETCH_REQ`, otherwise the kernel holds the control mutex forever
+        // while waiting for I/O. We keep `START_DEV` on a helper thread so request tasks may run.
+        shared_state.transition(dev_id, DeviceState::Starting);
         let ctrl_sender = self.sender.clone();
         let start_cmd = cmd;
+        let start_state = shared_state.clone();
+        let (start_tx, start_rx) = async_channel::bounded::<anyhow::Result<()>>(1);
         let start_thread = std::thread::Builder::new()
             .name(format!("smoo-gadget-ublk-start-{}", dev_id))
             .spawn(move || {
@@ -498,15 +672,23 @@ impl SmooUblk {
                     start_cmd,
                     "start device",
                 );
-                match res {
-                    Ok(()) => info!(dev_id = dev_id, "start_dev completed"),
-                    Err(err) => error!(dev_id = dev_id, "start_dev failed: {:?}", err),
+                match &res {
+                    Ok(()) => {
+                        info!(dev_id = dev_id, "start_dev completed");
+                        start_state.transition(dev_id, DeviceState::Online);
+                    }
+                    Err(err) => {
+                        error!(dev_id = dev_id, "start_dev failed: {:?}", err);
+                        start_state.mark_failed(dev_id, err);
+                    }
                 }
+                let _ = start_tx.send_blocking(res);
             })
             .context("spawn start_dev thread")?;
 
         let mut device = device;
         device.start_handle = Some(start_thread);
+        device.start_result = Some(start_rx);
         Ok(device)
     }
 
@@ -580,6 +762,8 @@ impl SmooUblk {
             .context("allocate ublk buffers")?;
         let queue_buf_ptrs = buffers.raw_ptrs();
         self.start_user_recovery(dev_id).await?;
+        let shared_state = Arc::new(SharedDeviceState::new());
+        shared_state.transition(dev_id, DeviceState::Recovering);
         let cdev_path = format!("/dev/ublkc{}", dev_id);
         let base_cdev = File::options()
             .read(true)
@@ -645,6 +829,8 @@ impl SmooUblk {
             completion_txs,
             workers,
             start_handle: None,
+            start_result: None,
+            state: shared_state,
             shutdown: false,
         };
 
@@ -672,6 +858,7 @@ impl SmooUblk {
         )
         .await?;
         device.mark_recovery_complete();
+        device.state.transition(dev_id, DeviceState::Online);
         Ok(())
     }
 
@@ -706,6 +893,8 @@ impl SmooUblk {
         delete_ctrl: bool,
     ) -> anyhow::Result<()> {
         let dev_id = device.dev_id();
+        let shared_state = device.state.clone();
+        shared_state.transition(dev_id, DeviceState::ShuttingDown);
         device.shutdown();
         drop(device);
 
@@ -732,6 +921,7 @@ impl SmooUblk {
             .await?;
         }
 
+        shared_state.transition(dev_id, DeviceState::Deleted);
         Ok(())
     }
 
@@ -776,6 +966,18 @@ impl SmooUblkDevice {
         self.dev_id
     }
 
+    pub fn set_export_id(&self, export_id: u32) {
+        self.state.set_export_id(export_id);
+    }
+
+    pub fn state(&self) -> DeviceState {
+        self.state.snapshot().0
+    }
+
+    pub fn last_error(&self) -> Option<String> {
+        self.state.snapshot().1
+    }
+
     pub fn queue_count(&self) -> u16 {
         self.queue_count
     }
@@ -810,6 +1012,35 @@ impl SmooUblkDevice {
 
     pub fn ioctl_encode(&self) -> bool {
         self.ioctl_encode
+    }
+
+    pub async fn wait_until_online(&mut self) -> anyhow::Result<()> {
+        match self.state() {
+            DeviceState::Online => return Ok(()),
+            DeviceState::Failed => {
+                let (_, last_error) = self.state.snapshot();
+                if let Some(msg) = last_error {
+                    anyhow::bail!("ublk device {} failed to start: {}", self.dev_id, msg);
+                } else {
+                    anyhow::bail!("ublk device {} failed to start", self.dev_id);
+                }
+            }
+            DeviceState::Starting => {}
+            other => anyhow::bail!(
+                "device {} not waiting on START_DEV (state={})",
+                self.dev_id,
+                other
+            ),
+        }
+        let receiver = self
+            .start_result
+            .take()
+            .context("START_DEV completion channel missing")?;
+        match receiver.recv().await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => Err(err),
+            Err(err) => anyhow::bail!("START_DEV completion channel closed unexpectedly: {err}"),
+        }
     }
 
     pub fn checkout_buffer(&self, queue_id: u16, tag: u16) -> anyhow::Result<UblkBuffer<'_>> {
