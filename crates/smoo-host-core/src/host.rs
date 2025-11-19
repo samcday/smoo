@@ -217,7 +217,7 @@ where
                 "block size is zero",
             ));
         }
-        if byte_len % block_size != 0 {
+        if !byte_len.is_multiple_of(block_size) {
             return Err(HostError::with_message(
                 HostErrorKind::InvalidRequest,
                 "request byte length must align to block size",

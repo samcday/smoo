@@ -36,7 +36,7 @@ impl FileBlockSource {
     }
 
     fn ensure_aligned(&self, len: usize) -> BlockSourceResult<()> {
-        if len % self.block_size as usize != 0 {
+        if !len.is_multiple_of(self.block_size as usize) {
             return Err(BlockSourceError::with_message(
                 BlockSourceErrorKind::InvalidInput,
                 "buffer length must align to block size",
@@ -74,7 +74,7 @@ impl DeviceBlockSource {
     }
 
     fn ensure_aligned(&self, len: usize) -> BlockSourceResult<()> {
-        if len % self.block_size as usize != 0 {
+        if !len.is_multiple_of(self.block_size as usize) {
             return Err(BlockSourceError::with_message(
                 BlockSourceErrorKind::InvalidInput,
                 "buffer length must align to block size",

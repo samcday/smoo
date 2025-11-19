@@ -229,8 +229,7 @@ impl SmooUblk {
                     }
 
                     let completion = completion.unwrap_or_else(|| {
-                        Err(io::Error::new(
-                            io::ErrorKind::Other,
+                        Err(io::Error::other(
                             "ctrl completion missing result",
                         ))
                     });
@@ -749,11 +748,10 @@ impl SmooUblk {
 impl Drop for SmooUblk {
     fn drop(&mut self) {
         self.sender.close();
-        if let Some(handle) = self.handle.take() {
-            if let Err(err) = handle.join() {
+        if let Some(handle) = self.handle.take()
+            && let Err(err) = handle.join() {
                 warn!("smoo-gadget-ublk ctrl loop panicked: {:?}", err);
             }
-        }
     }
 }
 
@@ -859,11 +857,10 @@ impl SmooUblkDevice {
                 error!("queue worker join failed: {:?}", e);
             }
         }
-        if let Some(handle) = self.start_handle.take() {
-            if let Err(err) = handle.join() {
+        if let Some(handle) = self.start_handle.take()
+            && let Err(err) = handle.join() {
                 error!("start_dev thread join failed: {:?}", err);
             }
-        }
     }
 }
 

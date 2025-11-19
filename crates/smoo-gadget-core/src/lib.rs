@@ -66,12 +66,12 @@ impl ConfigExportsV0 {
                 "block size must be power-of-two"
             );
             ensure!(
-                block_size >= 512 && block_size <= 65536,
+                (512..=65536).contains(&block_size),
                 "block size {block_size} out of supported range"
             );
             if size_bytes != 0 {
                 ensure!(
-                    size_bytes % block_size as u64 == 0,
+                    size_bytes.is_multiple_of(block_size as u64),
                     "size_bytes must be multiple of block_size"
                 );
             }
