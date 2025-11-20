@@ -8,14 +8,7 @@ use smoo_host_core::{
 };
 use smoo_host_rusb::{RusbControl, RusbTransport, RusbTransportConfig};
 use smoo_proto::SmooStatusV0;
-use std::{
-    collections::BTreeMap,
-    fmt,
-    fs,
-    path::PathBuf,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::BTreeMap, fmt, fs, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{signal, sync::mpsc, time};
 use tracing::{debug, info, warn};
 
@@ -156,8 +149,7 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let (sources, config_payload) =
-        open_sources(&args).await.context("open block sources")?;
+    let (sources, config_payload) = open_sources(&args).await.context("open block sources")?;
     let mut expected_session_id = None;
     let mut has_connected = false;
     loop {
@@ -494,9 +486,7 @@ impl EndpointBuilder {
     }
 }
 
-async fn open_sources(
-    args: &Args,
-) -> Result<(BTreeMap<u32, SharedSource>, ConfigExportsV0)> {
+async fn open_sources(args: &Args) -> Result<(BTreeMap<u32, SharedSource>, ConfigExportsV0)> {
     let mut sources = BTreeMap::new();
     let mut entries: Vec<smoo_proto::ConfigExport> = Vec::new();
     let mut next_id: u32 = 1;

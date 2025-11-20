@@ -2,15 +2,15 @@ use anyhow::{anyhow, ensure, Context, Result};
 use clap::{Parser, ValueEnum};
 use futures::{stream::FuturesUnordered, StreamExt};
 use smoo_gadget_core::{
-    ConfigExportsV0, ControlIo, DmaHeap, ExportController, ExportFlags, ExportReconcileContext,
-    ExportSpec, ExportState, FunctionfsEndpoints, GadgetConfig, GadgetControl, GadgetStatusReport,
-    IoStateKind, PersistedExportRecord, RuntimeTunables, SetupCommand, SetupPacket, SmooGadget,
-    StateStore,
+    ConfigExport, ConfigExportsV0, ControlIo, DmaHeap, ExportController, ExportFlags,
+    ExportReconcileContext, ExportSpec, ExportState, FunctionfsEndpoints, GadgetConfig,
+    GadgetControl, GadgetStatusReport, IoStateKind, PersistedExportRecord, RuntimeTunables,
+    SetupCommand, SetupPacket, SmooGadget, StateStore,
 };
 use smoo_gadget_ublk::{SmooUblk, SmooUblkDevice, UblkBuffer, UblkIoRequest, UblkOp};
 use smoo_proto::{Ident, OpCode, Request, Response};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::File,
     io,
     os::fd::{FromRawFd, IntoRawFd, OwnedFd},
@@ -36,7 +36,6 @@ const SMOO_CLASS: u8 = 0xFF;
 const SMOO_SUBCLASS: u8 = 0x53;
 const SMOO_PROTOCOL: u8 = 0x4D;
 const DEFAULT_MAX_IO_BYTES: usize = 4 * 1024 * 1024;
-const SINGLE_EXPORT_ID: u32 = 0;
 
 #[derive(Debug, Parser)]
 #[command(name = "smoo-gadget-cli")]
@@ -234,22 +233,22 @@ enum ControlMessage {
 
 fn build_initial_exports(state_store: &StateStore) -> HashMap<u32, ExportController> {
     let mut exports = HashMap::new();
-    if let Some(record) = state_store.records().get(0).cloned() {
-        if let Some(dev_id) = record.assigned_dev_id {
-            exports.insert(
-                record.export_id,
-                ExportController::new(
-                    record.export_id,
-                    record.spec,
-                    ExportState::RecoveringPending { dev_id },
-                ),
+    for record in state_store.records() {
+        if exports.contains_key(&record.export_id) {
+            warn!(
+                export_id = record.export_id,
+                "duplicate export_id in state store; skipping"
             );
-        } else {
-            exports.insert(
-                record.export_id,
-                ExportController::new(record.export_id, record.spec, ExportState::New),
-            );
+            continue;
         }
+        let state = match record.assigned_dev_id {
+            Some(dev_id) => ExportState::RecoveringPending { dev_id },
+            None => ExportState::New,
+        };
+        exports.insert(
+            record.export_id,
+            ExportController::new(record.export_id, record.spec.clone(), state),
+        );
     }
     exports
 }
@@ -684,14 +683,32 @@ async fn initialize_session(_ublk: &mut SmooUblk, state_store: &mut StateStore) 
         }
         return Ok(());
     }
-    if state_store.records().len() > 1 {
-        warn!(
-            exports = state_store.records().len(),
-            "multi-export state unsupported; clearing state store"
-        );
+
+    let mut seen = HashSet::new();
+    let mut reset = false;
+    for record in state_store.records() {
+        if !seen.insert(record.export_id) {
+            warn!(
+                export_id = record.export_id,
+                "state file contains duplicate export_id; clearing state"
+            );
+            reset = true;
+            break;
+        }
+        if let Err(err) = validate_persisted_record(record) {
+            warn!(
+                export_id = record.export_id,
+                error = ?err,
+                "state file entry invalid; clearing state"
+            );
+            reset = true;
+            break;
+        }
+    }
+
+    if reset {
         reset_state_store(state_store);
         let _ = state_store.persist();
-        return Ok(());
     }
     Ok(())
 }
@@ -724,6 +741,13 @@ async fn apply_config(
     runtime: &mut RuntimeState,
     config: ConfigExportsV0,
 ) -> Result<()> {
+    let entries = config.entries();
+    let records = if entries.is_empty() {
+        Vec::new()
+    } else {
+        config_entries_to_records(entries)?
+    };
+
     for controller in runtime.exports.values_mut() {
         if let Some(device) = controller.take_device() {
             ublk.stop_dev(device, true)
@@ -733,8 +757,7 @@ async fn apply_config(
     }
     runtime.exports.clear();
 
-    let entries = config.entries();
-    if entries.is_empty() {
+    if records.is_empty() {
         info!("CONFIG_EXPORTS requested zero exports");
         runtime.state_store().replace_all(Vec::new());
         if let Err(err) = runtime.state_store().persist() {
@@ -743,39 +766,17 @@ async fn apply_config(
         runtime.status().set_export_count(0).await;
         return Ok(());
     }
-    if entries.len() > 1 {
-        warn!(count = entries.len(), "multi-export CONFIG_EXPORTS unsupported; using first entry");
-    }
-    let export = entries[0];
-    let block_size = export.block_size as usize;
-    ensure!(
-        export.size_bytes != 0,
-        "CONFIG_EXPORTS size_bytes must be non-zero"
-    );
-    let blocks = export
-        .size_bytes
-        .checked_div(block_size as u64)
-        .context("size bytes smaller than block size")?;
-    ensure!(blocks > 0, "export size too small");
-    let spec = ExportSpec {
-        block_size: export.block_size,
-        size_bytes: export.size_bytes,
-        flags: ExportFlags::empty(),
-    };
-    let controller_spec = spec.clone();
-    let record = PersistedExportRecord {
-        export_id: export.export_id,
-        spec,
-        assigned_dev_id: None,
-    };
-    runtime.state_store().replace_all(vec![record]);
+
+    runtime.state_store().replace_all(records.clone());
     if let Err(err) = runtime.state_store().persist() {
         warn!(error = ?err, "failed to write state store");
     }
-    runtime.exports.insert(
-        export.export_id,
-        ExportController::new(export.export_id, controller_spec, ExportState::New),
-    );
+    for record in records {
+        runtime.exports.insert(
+            record.export_id,
+            ExportController::new(record.export_id, record.spec, ExportState::New),
+        );
+    }
     runtime
         .status()
         .set_export_count(runtime.exports.len() as u32)
@@ -865,4 +866,78 @@ fn to_owned_fd(file: File) -> OwnedFd {
 fn parse_hex_u16(input: &str) -> Result<u16, String> {
     let trimmed = input.trim_start_matches("0x").trim_start_matches("0X");
     u16::from_str_radix(trimmed, 16).map_err(|err| err.to_string())
+}
+
+fn validate_persisted_record(record: &PersistedExportRecord) -> Result<()> {
+    ensure!(
+        record.export_id != 0,
+        "persisted export_id must be non-zero"
+    );
+    let block_size = record.spec.block_size;
+    ensure!(
+        block_size.is_power_of_two(),
+        "persisted block size must be power-of-two"
+    );
+    ensure!(
+        (512..=65536).contains(&block_size),
+        "persisted block size out of range"
+    );
+    ensure!(
+        record.spec.size_bytes != 0,
+        "persisted export size_bytes must be non-zero"
+    );
+    ensure!(
+        record.spec.size_bytes % block_size as u64 == 0,
+        "persisted export size_bytes must be multiple of block_size"
+    );
+    let blocks = record
+        .spec
+        .size_bytes
+        .checked_div(block_size as u64)
+        .context("persisted size_bytes smaller than block_size")?;
+    ensure!(blocks > 0, "persisted export size too small");
+    usize::try_from(blocks).context("persisted export block count overflows usize")?;
+    Ok(())
+}
+
+fn config_entries_to_records(entries: &[ConfigExport]) -> Result<Vec<PersistedExportRecord>> {
+    let mut seen = HashSet::new();
+    let mut records = Vec::with_capacity(entries.len());
+    for export in entries {
+        ensure!(
+            seen.insert(export.export_id),
+            "duplicate export_id {} in CONFIG_EXPORTS",
+            export.export_id
+        );
+        let spec = build_spec_from_export(*export)?;
+        records.push(PersistedExportRecord {
+            export_id: export.export_id,
+            spec,
+            assigned_dev_id: None,
+        });
+    }
+    Ok(records)
+}
+
+fn build_spec_from_export(export: ConfigExport) -> Result<ExportSpec> {
+    let block_size = export.block_size as usize;
+    ensure!(
+        export.size_bytes != 0,
+        "CONFIG_EXPORTS size_bytes must be non-zero"
+    );
+    ensure!(
+        export.size_bytes % block_size as u64 == 0,
+        "CONFIG_EXPORTS size_bytes must be multiple of block_size"
+    );
+    let blocks = export
+        .size_bytes
+        .checked_div(block_size as u64)
+        .context("size bytes smaller than block size")?;
+    ensure!(blocks > 0, "export size too small");
+    usize::try_from(blocks).context("export block count overflows usize")?;
+    Ok(ExportSpec {
+        block_size: export.block_size,
+        size_bytes: export.size_bytes,
+        flags: ExportFlags::empty(),
+    })
 }

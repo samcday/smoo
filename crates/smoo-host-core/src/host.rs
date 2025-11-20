@@ -1,7 +1,7 @@
 use crate::{
-    control::{fetch_ident, send_config_exports_v0, ConfigExportsV0},
     BlockSource, BlockSourceError, BlockSourceErrorKind, Transport, TransportError,
     TransportErrorKind, TransportResult,
+    control::{ConfigExportsV0, fetch_ident, send_config_exports_v0},
 };
 use alloc::{
     collections::BTreeMap,
@@ -251,10 +251,7 @@ where
             .checked_mul(block_size)
             .map(|len| len as usize)
             .ok_or_else(|| {
-                HostError::with_message(
-                    HostErrorKind::InvalidRequest,
-                    "request size overflow",
-                )
+                HostError::with_message(HostErrorKind::InvalidRequest, "request size overflow")
             })
     }
 
@@ -287,7 +284,14 @@ const ERRNO_EIO: u32 = 5;
 const ERRNO_EOPNOTSUPP: u32 = 95;
 
 fn invalid_request_response(request: Request, errno: u32) -> Response {
-    Response::new(request.export_id, request.op, errno as u8, request.lba, request.num_blocks, 0)
+    Response::new(
+        request.export_id,
+        request.op,
+        errno as u8,
+        request.lba,
+        request.num_blocks,
+        0,
+    )
 }
 
 fn short_io_response(request: Request) -> Response {

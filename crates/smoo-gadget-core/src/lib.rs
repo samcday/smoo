@@ -479,7 +479,10 @@ impl GadgetControl {
             && setup.request_type() == CONFIG_EXPORTS_REQ_TYPE
         {
             let len = setup.length() as usize;
-            ensure!(len >= ConfigExportsV0::HEADER_LEN, "CONFIG_EXPORTS payload too short");
+            ensure!(
+                len >= ConfigExportsV0::HEADER_LEN,
+                "CONFIG_EXPORTS payload too short"
+            );
             let mut buf = vec![0u8; len];
             io.read_out(&mut buf).await.context("read CONFIG_EXPORTS")?;
             let payload = ConfigExportsV0::try_from_slice(&buf)
