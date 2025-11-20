@@ -9,9 +9,9 @@ pub const IDENT_LEN: usize = 8;
 /// Vendor control request opcode used to fetch [`Ident`].
 pub const IDENT_REQUEST: u8 = 0x01;
 /// Number of bytes in an encoded [`Request`] control message.
-pub const REQUEST_LEN: usize = 20;
+pub const REQUEST_LEN: usize = 24;
 /// Number of bytes in an encoded [`Response`] control message.
-pub const RESPONSE_LEN: usize = 20;
+pub const RESPONSE_LEN: usize = 24;
 /// bmRequestType for CONFIG_EXPORTS (host → gadget, vendor, interface, OUT).
 pub const CONFIG_EXPORTS_REQ_TYPE: u8 = 0x41;
 /// Vendor control bRequest used to apply CONFIG_EXPORTS.
@@ -125,31 +125,47 @@ impl Ident {
 /// Request message emitted by the gadget.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Request {
+    pub export_id: u32,
     pub op: OpCode,
     pub lba: u64,
-    pub byte_len: u32,
+    pub num_blocks: u32,
     pub flags: u32,
 }
 
 impl Request {
-    pub const fn new(op: OpCode, lba: u64, byte_len: u32, flags: u32) -> Self {
+    pub const fn new(export_id: u32, op: OpCode, lba: u64, num_blocks: u32, flags: u32) -> Self {
         Self {
+            export_id,
             op,
             lba,
-            byte_len,
+            num_blocks,
             flags,
         }
     }
 
     pub fn encode(self) -> [u8; REQUEST_LEN] {
-        encode_common(self.op, self.lba, self.byte_len, self.flags)
+        let mut buf = [0u8; REQUEST_LEN];
+        buf[0] = self.op.into();
+        buf[4..8].copy_from_slice(&self.export_id.to_le_bytes());
+        buf[8..16].copy_from_slice(&self.lba.to_le_bytes());
+        buf[16..20].copy_from_slice(&self.num_blocks.to_le_bytes());
+        buf[20..24].copy_from_slice(&self.flags.to_le_bytes());
+        buf
     }
 
     pub fn decode(bytes: [u8; REQUEST_LEN]) -> Result<Self> {
-        decode_common(bytes).map(|(op, lba, byte_len, flags)| Self {
+        let export_id = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        let lba = u64::from_le_bytes([
+            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+        ]);
+        let num_blocks = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+        let flags = u32::from_le_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+        let op = OpCode::try_from(bytes[0])?;
+        Ok(Self {
+            export_id,
             op,
             lba,
-            byte_len,
+            num_blocks,
             flags,
         })
     }
@@ -174,32 +190,60 @@ impl TryFrom<&[u8]> for Request {
 /// Response message sent back by the host.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Response {
+    pub export_id: u32,
     pub op: OpCode,
+    pub status: u8,
     pub lba: u64,
-    pub byte_len: u32,
+    pub num_blocks: u32,
     pub flags: u32,
 }
 
 impl Response {
-    pub const fn new(op: OpCode, lba: u64, byte_len: u32, flags: u32) -> Self {
+    pub const fn new(
+        export_id: u32,
+        op: OpCode,
+        status: u8,
+        lba: u64,
+        num_blocks: u32,
+        flags: u32,
+    ) -> Self {
         Self {
+            export_id,
             op,
+            status,
             lba,
-            byte_len,
+            num_blocks,
             flags,
         }
     }
 
     pub fn encode(self) -> [u8; RESPONSE_LEN] {
-        encode_common(self.op, self.lba, self.byte_len, self.flags)
+        let mut buf = [0u8; RESPONSE_LEN];
+        buf[0] = self.op.into();
+        buf[1] = self.status;
+        buf[4..8].copy_from_slice(&self.export_id.to_le_bytes());
+        buf[8..16].copy_from_slice(&self.lba.to_le_bytes());
+        buf[16..20].copy_from_slice(&self.num_blocks.to_le_bytes());
+        buf[20..24].copy_from_slice(&self.flags.to_le_bytes());
+        buf
     }
 
     pub fn decode(bytes: [u8; RESPONSE_LEN]) -> Result<Self> {
-        decode_common(bytes).map(|(op, lba, byte_len, flags)| Self {
+        let export_id = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        let lba = u64::from_le_bytes([
+            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+        ]);
+        let num_blocks = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+        let flags = u32::from_le_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+        let op = OpCode::try_from(bytes[0])?;
+        let status = bytes[1];
+        Ok(Self {
+            export_id,
             op,
             lba,
-            byte_len,
+            num_blocks,
             flags,
+            status,
         })
     }
 }
@@ -319,114 +363,127 @@ impl SmooStatusV0 {
 }
 
 /// Encoded CONFIG_EXPORTS payload for protocol version 0.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConfigExportsV0 {
-    export: Option<ConfigExport>,
+    entries: heapless::Vec<ConfigExport, 32>,
 }
 
 impl ConfigExportsV0 {
-    /// Number of bytes in the encoded payload.
-    pub const ENCODED_LEN: usize = 28;
     /// Supported CONFIG_EXPORTS payload version.
     pub const VERSION: u16 = 0;
+    /// Number of bytes in the payload header.
+    pub const HEADER_LEN: usize = 8;
+    /// Number of bytes in each entry.
+    pub const ENTRY_LEN: usize = 24;
+    /// Maximum exports supported in one payload.
+    pub const MAX_EXPORTS: usize = 32;
 
-    /// Encode an empty export set.
-    pub const fn zero_exports() -> Self {
-        Self { export: None }
+    pub fn new(entries: heapless::Vec<ConfigExport, 32>) -> Result<Self> {
+        Ok(Self { entries })
     }
 
-    /// Encode a single export entry.
-    pub const fn single_export(block_size: u32, size_bytes: u64) -> Self {
-        Self {
-            export: Some(ConfigExport {
-                block_size,
-                size_bytes,
-            }),
-        }
+    pub fn entries(&self) -> &[ConfigExport] {
+        &self.entries
     }
 
-    /// Returns the desired export entry, if any.
-    pub const fn export(&self) -> Option<ConfigExport> {
-        self.export
-    }
-
-    /// Serialize the payload to its fixed-width wire representation.
-    pub fn encode(self) -> [u8; Self::ENCODED_LEN] {
-        let mut buf = [0u8; Self::ENCODED_LEN];
+    /// Serialize the payload to its wire representation.
+    pub fn encode(
+        &self,
+    ) -> heapless::Vec<u8, { Self::HEADER_LEN + Self::ENTRY_LEN * Self::MAX_EXPORTS }> {
+        let mut buf: heapless::Vec<u8, { Self::HEADER_LEN + Self::ENTRY_LEN * Self::MAX_EXPORTS }> =
+            heapless::Vec::new();
+        buf.resize(Self::HEADER_LEN + self.entries.len() * Self::ENTRY_LEN, 0)
+            .unwrap();
         buf[0..2].copy_from_slice(&Self::VERSION.to_le_bytes());
-        if let Some(export) = self.export {
-            buf[2..4].copy_from_slice(&1u16.to_le_bytes());
-            buf[8..12].copy_from_slice(&export.block_size.to_le_bytes());
-            buf[12..20].copy_from_slice(&export.size_bytes.to_le_bytes());
+        buf[2..4].copy_from_slice(&(self.entries.len() as u16).to_le_bytes());
+        for (idx, entry) in self.entries.iter().enumerate() {
+            let offset = Self::HEADER_LEN + idx * Self::ENTRY_LEN;
+            buf[offset..offset + 4].copy_from_slice(&entry.export_id.to_le_bytes());
+            buf[offset + 4..offset + 8].copy_from_slice(&entry.block_size.to_le_bytes());
+            buf[offset + 8..offset + 16].copy_from_slice(&entry.size_bytes.to_le_bytes());
         }
         buf
     }
 
-    /// Decode a CONFIG_EXPORTS payload.
-    pub fn decode(bytes: [u8; Self::ENCODED_LEN]) -> Result<Self> {
-        Self::try_from(bytes.as_slice())
-    }
-}
-
-impl TryFrom<&[u8]> for ConfigExportsV0 {
-    type Error = ProtoError;
-
-    fn try_from(value: &[u8]) -> Result<Self> {
-        if value.len() != Self::ENCODED_LEN {
+    /// Decode a CONFIG_EXPORTS payload from a borrowed slice.
+    pub fn try_from_slice(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < Self::HEADER_LEN {
             return Err(ProtoError::InvalidLength {
-                expected: Self::ENCODED_LEN,
-                actual: value.len(),
+                expected: Self::HEADER_LEN,
+                actual: bytes.len(),
             });
         }
-        let mut data = [0u8; Self::ENCODED_LEN];
-        data.copy_from_slice(value);
-        let version = u16::from_le_bytes([data[0], data[1]]);
+        let version = u16::from_le_bytes([bytes[0], bytes[1]]);
         if version != Self::VERSION {
             return Err(ProtoError::InvalidVersion {
                 expected: Self::VERSION,
                 actual: version,
             });
         }
-        let count = u16::from_le_bytes([data[2], data[3]]);
-        if count > 1 {
+        let count = u16::from_le_bytes([bytes[2], bytes[3]]) as usize;
+        if count > Self::MAX_EXPORTS {
             return Err(ProtoError::InvalidValue(
-                "CONFIG_EXPORTS count must be 0 or 1",
+                "CONFIG_EXPORTS count exceeds maximum",
             ));
         }
-        let flags = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+        let flags = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
         if flags != 0 {
             return Err(ProtoError::InvalidValue(
                 "CONFIG_EXPORTS header flags must be zero",
             ));
         }
-        let reserved0 = u32::from_le_bytes([data[20], data[21], data[22], data[23]]);
-        let reserved1 = u32::from_le_bytes([data[24], data[25], data[26], data[27]]);
-        if reserved0 != 0 || reserved1 != 0 {
-            return Err(ProtoError::InvalidValue(
-                "CONFIG_EXPORTS reserved fields must be zero",
-            ));
+        let expected_len = Self::HEADER_LEN + count * Self::ENTRY_LEN;
+        if bytes.len() != expected_len {
+            return Err(ProtoError::InvalidLength {
+                expected: expected_len,
+                actual: bytes.len(),
+            });
         }
-        let export = if count == 0 {
-            None
-        } else {
-            let block_size = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-            let size_bytes = u64::from_le_bytes([
-                data[12], data[13], data[14], data[15], data[16], data[17], data[18], data[19],
+        let mut entries: heapless::Vec<ConfigExport, 32> = heapless::Vec::new();
+        for idx in 0..count {
+            let offset = Self::HEADER_LEN + idx * Self::ENTRY_LEN;
+            let export_id = u32::from_le_bytes([
+                bytes[offset],
+                bytes[offset + 1],
+                bytes[offset + 2],
+                bytes[offset + 3],
             ]);
-            Some(validate_export(block_size, size_bytes)?)
-        };
-        Ok(Self { export })
+            let block_size = u32::from_le_bytes([
+                bytes[offset + 4],
+                bytes[offset + 5],
+                bytes[offset + 6],
+                bytes[offset + 7],
+            ]);
+            let size_bytes = u64::from_le_bytes([
+                bytes[offset + 8],
+                bytes[offset + 9],
+                bytes[offset + 10],
+                bytes[offset + 11],
+                bytes[offset + 12],
+                bytes[offset + 13],
+                bytes[offset + 14],
+                bytes[offset + 15],
+            ]);
+            entries
+                .push(validate_export(export_id, block_size, size_bytes)?)
+                .map_err(|_| ProtoError::InvalidValue("too many exports"))?;
+        }
+        Ok(Self { entries })
     }
 }
 
 /// Parameters describing a single export entry in v0 CONFIG_EXPORTS payloads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConfigExport {
+    pub export_id: u32,
     pub block_size: u32,
     pub size_bytes: u64,
 }
 
-fn validate_export(block_size: u32, size_bytes: u64) -> Result<ConfigExport> {
+fn validate_export(export_id: u32, block_size: u32, size_bytes: u64) -> Result<ConfigExport> {
+    if export_id == 0 {
+        return Err(ProtoError::InvalidValue("export_id must be non-zero"));
+    }
     if !block_size.is_power_of_two() {
         return Err(ProtoError::InvalidValue("block size must be power-of-two"));
     }
@@ -441,6 +498,7 @@ fn validate_export(block_size: u32, size_bytes: u64) -> Result<ConfigExport> {
         ));
     }
     Ok(ConfigExport {
+        export_id,
         block_size,
         size_bytes,
     })
@@ -469,7 +527,7 @@ mod tests {
 
     #[test]
     fn request_round_trip() {
-        let req = Request::new(OpCode::Write, 42, 4096, 0xAA55AA55);
+        let req = Request::new(2, OpCode::Write, 42, 8, 0xAA55AA55);
         let bytes = req.encode();
         assert_eq!(Request::decode(bytes).unwrap(), req);
         assert_eq!(Request::try_from(bytes.as_slice()).unwrap(), req);
@@ -477,7 +535,7 @@ mod tests {
 
     #[test]
     fn response_round_trip() {
-        let resp = Response::new(OpCode::Read, 9001, 512, 0);
+        let resp = Response::new(3, OpCode::Read, 0, 9001, 16, 0);
         let bytes = resp.encode();
         assert_eq!(Response::decode(bytes).unwrap(), resp);
         assert_eq!(Response::try_from(bytes.as_slice()).unwrap(), resp);
@@ -493,7 +551,7 @@ mod tests {
 
     #[test]
     fn bad_opcode() {
-        let mut bytes = Request::new(OpCode::Flush, 0, 0, 0).encode();
+        let mut bytes = Request::new(1, OpCode::Flush, 0, 0, 0).encode();
         bytes[0] = 0xFF;
         assert!(matches!(
             Request::decode(bytes),
@@ -504,48 +562,66 @@ mod tests {
     #[test]
     fn invalid_len() {
         assert!(matches!(
-            Request::try_from(&[0u8; 19][..]),
+            Request::try_from(&[0u8; 23][..]),
             Err(ProtoError::InvalidLength {
-                expected: 20,
-                actual: 19
+                expected: 24,
+                actual: 23
             })
         ));
     }
 
     #[test]
     fn config_exports_zero_round_trip() {
-        let payload = ConfigExportsV0::zero_exports();
+        let payload = ConfigExportsV0::new(heapless::Vec::new()).unwrap();
         let encoded = payload.encode();
-        let decoded = ConfigExportsV0::decode(encoded).unwrap();
-        assert_eq!(decoded.export(), None);
+        let decoded = ConfigExportsV0::try_from_slice(&encoded).unwrap();
+        assert!(decoded.entries().is_empty());
     }
 
     #[test]
     fn config_exports_single_round_trip() {
-        let payload = ConfigExportsV0::single_export(4096, 4096 * 8);
+        let mut entries = heapless::Vec::new();
+        entries
+            .push(ConfigExport {
+                export_id: 7,
+                block_size: 4096,
+                size_bytes: 4096 * 8,
+            })
+            .unwrap();
+        let payload = ConfigExportsV0::new(entries).unwrap();
         let encoded = payload.encode();
-        let decoded = ConfigExportsV0::decode(encoded).unwrap();
-        let export = decoded.export().unwrap();
+        let decoded = ConfigExportsV0::try_from_slice(&encoded).unwrap();
+        let export = decoded.entries().first().unwrap();
+        assert_eq!(export.export_id, 7);
         assert_eq!(export.block_size, 4096);
         assert_eq!(export.size_bytes, 4096 * 8);
     }
 
     #[test]
     fn config_exports_invalid_flags() {
-        let mut encoded = ConfigExportsV0::zero_exports().encode();
+        let mut encoded = ConfigExportsV0::new(heapless::Vec::new()).unwrap().encode();
         encoded[4] = 1;
         assert!(matches!(
-            ConfigExportsV0::decode(encoded),
+            ConfigExportsV0::try_from_slice(&encoded),
             Err(ProtoError::InvalidValue(_))
         ));
     }
 
     #[test]
     fn config_exports_invalid_block_size() {
-        let mut encoded = ConfigExportsV0::single_export(0, 0).encode();
+        let mut entries = heapless::Vec::new();
+        entries
+            .push(ConfigExport {
+                export_id: 1,
+                block_size: 1024,
+                size_bytes: 0,
+            })
+            .unwrap();
+        let mut encoded = ConfigExportsV0::new(entries).unwrap().encode();
+        encoded[4..8].copy_from_slice(&1u32.to_le_bytes()); // count = 1
         encoded[8..12].copy_from_slice(&500u32.to_le_bytes());
         assert!(matches!(
-            ConfigExportsV0::decode(encoded),
+            ConfigExportsV0::try_from_slice(&encoded),
             Err(ProtoError::InvalidValue(_))
         ));
     }
