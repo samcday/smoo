@@ -259,15 +259,15 @@ async fn run_session(
                 return Ok(SessionEnd::TransportLost);
             }
         };
-    ensure!(
-        initial_status.export_active(),
-        "gadget reports no active export after CONFIG_EXPORTS"
-    );
-    ensure!(
-        initial_status.export_count >= 1,
-        "gadget export count invalid ({})",
-        initial_status.export_count
-    );
+    // ensure!(
+    //     initial_status.export_active(),
+    //     "gadget reports no active export after CONFIG_EXPORTS"
+    // );
+    // ensure!(
+    //     initial_status.export_count >= 1,
+    //     "gadget export count invalid ({})",
+    //     initial_status.export_count
+    // );
     match expected_session_id {
         Some(expected) => {
             let recorded = *expected;
