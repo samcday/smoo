@@ -258,6 +258,21 @@ pub struct SetupPacket {
 }
 
 impl SetupPacket {
+    /// Construct a SetupPacket from raw USB control fields.
+    pub fn from_fields(request_type: u8, request: u8, value: u16, index: u16, length: u16) -> Self {
+        let bytes = [
+            request_type,
+            request,
+            value.to_le_bytes()[0],
+            value.to_le_bytes()[1],
+            index.to_le_bytes()[0],
+            index.to_le_bytes()[1],
+            length.to_le_bytes()[0],
+            length.to_le_bytes()[1],
+        ];
+        Self::from_bytes(bytes)
+    }
+
     fn from_bytes(bytes: [u8; SETUP_STAGE_LEN]) -> Self {
         Self {
             request_type: bytes[0],
@@ -353,6 +368,28 @@ impl DmaHeap {
 pub struct SmooGadget {
     data_plane: GadgetDataPlane,
     ident: Ident,
+}
+
+#[async_trait::async_trait]
+pub trait ControlIo {
+    async fn write_in(&mut self, data: &[u8]) -> Result<()>;
+    async fn read_out(&mut self, buf: &mut [u8]) -> Result<()>;
+    async fn stall(&mut self) -> Result<()>;
+}
+
+#[async_trait::async_trait]
+impl ControlIo for Ep0Controller {
+    async fn write_in(&mut self, data: &[u8]) -> Result<()> {
+        Ep0Controller::write_in(self, data).await
+    }
+
+    async fn read_out(&mut self, buf: &mut [u8]) -> Result<()> {
+        Ep0Controller::read_out(self, buf).await
+    }
+
+    async fn stall(&mut self) -> Result<()> {
+        Ep0Controller::stall(self).await
+    }
 }
 
 impl SmooGadget {
@@ -458,10 +495,10 @@ impl GadgetControl {
     /// Handle a vendor-specific SETUP packet.
     ///
     /// Returns [`SetupCommand`] when additional action is required (e.g. CONFIG_EXPORTS).
-    /// All control responses/ACKs are written to `ep0` internally.
+    /// All control responses/ACKs are written through `io` internally.
     pub async fn handle_setup_packet(
         &self,
-        ep0: &mut Ep0Controller,
+        io: &mut (impl ControlIo + Send),
         setup: SetupPacket,
         status: &GadgetStatusReport,
     ) -> Result<Option<SetupCommand>> {
@@ -476,7 +513,7 @@ impl GadgetControl {
             );
             let ident = self.ident.encode();
             let len = cmp::min(setup.length() as usize, ident.len());
-            ep0.write_in(&ident[..len])
+            io.write_in(&ident[..len])
                 .await
                 .context("reply to GET_IDENT")?;
             return Ok(None);
@@ -498,7 +535,7 @@ impl GadgetControl {
             let payload = SmooStatusV0::new(flags, status.export_count, status.session_id);
             let encoded = payload.encode();
             let len = cmp::min(encoded.len(), setup.length() as usize);
-            ep0.write_in(&encoded[..len])
+            io.write_in(&encoded[..len])
                 .await
                 .context("write SMOO_STATUS response")?;
             return Ok(None);
@@ -511,14 +548,14 @@ impl GadgetControl {
                 "CONFIG_EXPORTS payload length mismatch"
             );
             let mut buf = [0u8; ConfigExportsV0::ENCODED_LEN];
-            ep0.read_out(&mut buf)
-                .await
-                .context("read CONFIG_EXPORTS")?;
+            io.read_out(&mut buf).await.context("read CONFIG_EXPORTS")?;
             let payload = ConfigExportsV0::parse(&buf).context("parse CONFIG_EXPORTS payload")?;
-            ep0.write_in(&[]).await.context("ACK CONFIG_EXPORTS")?;
             return Ok(Some(SetupCommand::Config(payload)));
         }
 
+        io.stall()
+            .await
+            .context("stall unsupported control request")?;
         Err(anyhow!(
             "unsupported setup request {:#x} type {:#x}",
             setup.request(),

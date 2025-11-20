@@ -865,6 +865,7 @@ name = "smoo-gadget-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
  "libc 0.2.177",
  "rand 0.8.5",
@@ -885,6 +886,7 @@ name = "smoo-gadget-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "dma-heap",
  "libc 0.2.177",
  "mmap",

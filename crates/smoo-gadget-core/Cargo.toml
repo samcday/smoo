@@ -13,3 +13,4 @@ nix = { version = "0.30.1", features = ["ioctl", "poll"] }
 smoo-proto = { path = "../smoo-proto" }
 tokio = { version = "1.48.0", features = ["fs", "io-util", "rt"] }
 tracing = "0.1.41"
+async-trait = "0.1.83"

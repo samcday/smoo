@@ -4,15 +4,14 @@ use anyhow::{anyhow, ensure, Context, Result};
 use clap::{Parser, ValueEnum};
 use rand::{rngs::OsRng, RngCore};
 use smoo_gadget_core::{
-    ConfigExportsV0, DmaHeap, Ep0Controller, Ep0Event, FunctionfsEndpoints, GadgetConfig,
-    GadgetControl, GadgetStatusReport, SetupCommand, SmooGadget,
+    ConfigExportsV0, ControlIo, DmaHeap, FunctionfsEndpoints, GadgetConfig, GadgetControl,
+    GadgetStatusReport, SetupCommand, SetupPacket, SmooGadget,
 };
 use smoo_gadget_ublk::{SmooUblk, SmooUblkDevice, UblkBuffer, UblkIoRequest, UblkOp};
 use smoo_proto::{Ident, OpCode, Request, Response};
 use std::{
     fs::File,
     io,
-    io::Write,
     os::fd::{FromRawFd, IntoRawFd, OwnedFd},
     path::{Path, PathBuf},
     sync::Arc,
@@ -24,7 +23,10 @@ use tokio::{
 use tracing::{debug, info, warn};
 use tracing_subscriber::prelude::*;
 use usb_gadget::{
-    function::custom::{Custom, Endpoint, EndpointDirection, Interface, TransferType},
+    function::custom::{
+        CtrlReceiver, CtrlReq, CtrlSender, Custom, Endpoint, EndpointDirection, Interface,
+        TransferType,
+    },
     Class, Config, Gadget, Id, RegGadget, Strings,
 };
 
@@ -91,7 +93,7 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     usb_gadget::remove_all().context("remove existing USB gadgets")?;
-    let (ep0, endpoints, _gadget_guard) = setup_functionfs(&args).context("setup FunctionFS")?;
+    let (custom, endpoints, _gadget_guard) = setup_functionfs(&args).context("setup FunctionFS")?;
 
     let mut ublk = SmooUblk::new().context("init ublk")?;
     let state_file = args
@@ -131,7 +133,7 @@ async fn main() -> Result<()> {
     let (control_tx, control_rx) = mpsc::channel(8);
     let status = GadgetStatusShared::new(GadgetStatus::new(session_id, 0));
     let control_task = tokio::spawn(control_loop(
-        ep0,
+        custom,
         control_handler,
         status.clone(),
         control_tx,
@@ -424,26 +426,50 @@ async fn handle_request(
 }
 
 async fn control_loop(
-    mut ep0: Ep0Controller,
+    mut custom: Custom,
     handler: GadgetControl,
     status: GadgetStatusShared,
     tx: mpsc::Sender<ControlMessage>,
 ) -> Result<()> {
     loop {
-        let event = ep0
-            .next_event()
+        custom
+            .wait_event()
             .await
-            .context("read FunctionFS control event")?;
+            .context("wait for FunctionFS event")?;
+        let event = custom.event().context("read FunctionFS event")?;
         match event {
-            Ep0Event::Bind => debug!("FunctionFS bind event (control loop)"),
-            Ep0Event::Unbind => debug!("FunctionFS unbind event (control loop)"),
-            Ep0Event::Enable => debug!("FunctionFS enable event (control loop)"),
-            Ep0Event::Disable => debug!("FunctionFS disable event (control loop)"),
-            Ep0Event::Suspend => debug!("FunctionFS suspend event (control loop)"),
-            Ep0Event::Resume => debug!("FunctionFS resume event (control loop)"),
-            Ep0Event::Setup(setup) => {
+            usb_gadget::function::custom::Event::Bind => {
+                debug!("FunctionFS bind event (control loop)")
+            }
+            usb_gadget::function::custom::Event::Unbind => {
+                debug!("FunctionFS unbind event (control loop)")
+            }
+            usb_gadget::function::custom::Event::Enable => {
+                debug!("FunctionFS enable event (control loop)")
+            }
+            usb_gadget::function::custom::Event::Disable => {
+                debug!("FunctionFS disable event (control loop)")
+            }
+            usb_gadget::function::custom::Event::Suspend => {
+                debug!("FunctionFS suspend event (control loop)")
+            }
+            usb_gadget::function::custom::Event::Resume => {
+                debug!("FunctionFS resume event (control loop)")
+            }
+            usb_gadget::function::custom::Event::SetupDeviceToHost(sender) => {
                 let report = status.report().await;
-                match handler.handle_setup_packet(&mut ep0, setup, &report).await {
+                let setup = setup_from_ctrl_req(sender.ctrl_req());
+                let mut io = UsbControlIo::from_sender(sender);
+                if let Err(err) = handler.handle_setup_packet(&mut io, setup, &report).await {
+                    warn!(error = ?err, "vendor setup handling failed");
+                    let _ = io.stall().await;
+                }
+            }
+            usb_gadget::function::custom::Event::SetupHostToDevice(receiver) => {
+                let report = status.report().await;
+                let setup = setup_from_ctrl_req(receiver.ctrl_req());
+                let mut io = UsbControlIo::from_receiver(receiver);
+                match handler.handle_setup_packet(&mut io, setup, &report).await {
                     Ok(Some(SetupCommand::Config(payload))) => {
                         if tx.send(ControlMessage::Config(payload)).await.is_err() {
                             anyhow::bail!("control channel closed");
@@ -452,10 +478,14 @@ async fn control_loop(
                     Ok(None) => {}
                     Err(err) => {
                         warn!(error = ?err, "vendor setup handling failed");
-                        ep0.stall().await.context("stall vendor request failure")?;
+                        let _ = io.stall().await;
                     }
                 }
             }
+            usb_gadget::function::custom::Event::Unknown(code) => {
+                debug!(event = code, "FunctionFS unknown event");
+            }
+            _ => {}
         }
     }
 }
@@ -498,6 +528,82 @@ fn errno_from_io(err: &io::Error) -> i32 {
         io::ErrorKind::InvalidInput => libc::EINVAL,
         _ => libc::EIO,
     })
+}
+
+fn setup_from_ctrl_req(ctrl: &CtrlReq) -> SetupPacket {
+    SetupPacket::from_fields(
+        ctrl.request_type,
+        ctrl.request,
+        ctrl.value,
+        ctrl.index,
+        ctrl.length,
+    )
+}
+
+enum UsbControlInner<'a> {
+    In(Option<CtrlSender<'a>>),
+    Out(Option<CtrlReceiver<'a>>),
+}
+
+struct UsbControlIo<'a> {
+    inner: UsbControlInner<'a>,
+}
+
+impl<'a> UsbControlIo<'a> {
+    fn from_sender(sender: CtrlSender<'a>) -> Self {
+        Self {
+            inner: UsbControlInner::In(Some(sender)),
+        }
+    }
+
+    fn from_receiver(receiver: CtrlReceiver<'a>) -> Self {
+        Self {
+            inner: UsbControlInner::Out(Some(receiver)),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ControlIo for UsbControlIo<'_> {
+    async fn write_in(&mut self, data: &[u8]) -> Result<()> {
+        match &mut self.inner {
+            UsbControlInner::In(sender) => {
+                let sender = sender.take().context("control sender already used")?;
+                sender
+                    .send(data)
+                    .with_context(|| format!("send control response of {} bytes", data.len()))
+                    .map(|_| ())
+            }
+            UsbControlInner::Out(_) => Ok(()),
+        }
+    }
+
+    async fn read_out(&mut self, buf: &mut [u8]) -> Result<()> {
+        match &mut self.inner {
+            UsbControlInner::Out(receiver) => {
+                let receiver = receiver.take().context("control receiver already used")?;
+                let read = receiver
+                    .recv(buf)
+                    .with_context(|| format!("read control payload of {} bytes", buf.len()))?;
+                ensure!(read == buf.len(), "control payload truncated");
+                Ok(())
+            }
+            UsbControlInner::In(_) => Err(anyhow!("attempted to read_out on IN control transfer")),
+        }
+    }
+
+    async fn stall(&mut self) -> Result<()> {
+        match &mut self.inner {
+            UsbControlInner::In(sender) => {
+                let sender = sender.take().context("control sender already used")?;
+                sender.halt().context("stall control sender")
+            }
+            UsbControlInner::Out(receiver) => {
+                let receiver = receiver.take().context("control receiver already used")?;
+                receiver.halt().context("stall control receiver")
+            }
+        }
+    }
 }
 
 struct RecoveryOutcome {
@@ -758,21 +864,17 @@ async fn apply_config(
 
 struct GadgetGuard {
     #[allow(dead_code)]
-    custom: Custom,
-    #[allow(dead_code)]
     registration: RegGadget,
 }
 
-fn setup_functionfs(args: &Args) -> Result<(Ep0Controller, FunctionfsEndpoints, GadgetGuard)> {
-    let mut builder = Custom::builder().with_interface(
+fn setup_functionfs(args: &Args) -> Result<(Custom, FunctionfsEndpoints, GadgetGuard)> {
+    let builder = Custom::builder().with_interface(
         Interface::new(Class::vendor_specific(SMOO_SUBCLASS, SMOO_PROTOCOL), "smoo")
             .with_endpoint(interrupt_in_ep())
             .with_endpoint(interrupt_out_ep())
             .with_endpoint(bulk_in_ep())
             .with_endpoint(bulk_out_ep()),
     );
-    builder.ffs_no_init = true;
-    let (ffs_descs, ffs_strings) = builder.ffs_descriptors_and_strings()?;
     let (mut custom, handle) = builder.build();
 
     let klass = Class::new(SMOO_CLASS, SMOO_SUBCLASS, SMOO_PROTOCOL);
@@ -784,31 +886,15 @@ fn setup_functionfs(args: &Args) -> Result<(Ep0Controller, FunctionfsEndpoints, 
     let reg = gadget.register().context("register gadget")?;
 
     let ffs_dir = custom.ffs_dir().context("resolve FunctionFS dir")?;
-    let mut ep0 = File::options()
-        .read(true)
-        .write(true)
-        .open(ffs_dir.join("ep0"))
-        .context("open ep0")?;
-    ep0.write_all(&ffs_descs).context("write descriptors")?;
-    ep0.write_all(&ffs_strings).context("write strings")?;
-
     reg.bind(Some(&udc)).context("bind gadget to UDC")?;
 
     let interrupt_in = open_endpoint_fd(ffs_dir.join("ep1")).context("open interrupt IN")?;
     let interrupt_out = open_endpoint_fd(ffs_dir.join("ep2")).context("open interrupt OUT")?;
     let bulk_in = open_endpoint_fd(ffs_dir.join("ep3")).context("open bulk IN")?;
     let bulk_out = open_endpoint_fd(ffs_dir.join("ep4")).context("open bulk OUT")?;
-    let ep0 = Ep0Controller::from_owned_fd(to_owned_fd(ep0)).context("wrap ep0 controller")?;
     let endpoints = FunctionfsEndpoints::new(interrupt_in, interrupt_out, bulk_in, bulk_out);
 
-    Ok((
-        ep0,
-        endpoints,
-        GadgetGuard {
-            custom,
-            registration: reg,
-        },
-    ))
+    Ok((custom, endpoints, GadgetGuard { registration: reg }))
 }
 
 fn interrupt_in_ep() -> Endpoint {
