@@ -1,20 +1,13 @@
 use async_trait::async_trait;
 use rusb::{DeviceHandle, UsbContext};
-use smoo_host_core::{Transport, TransportError, TransportErrorKind, TransportResult};
-use smoo_proto::{
-    IDENT_LEN, IDENT_REQUEST, Ident, REQUEST_LEN, RESPONSE_LEN, Request, Response, SMOO_STATUS_LEN,
-    SMOO_STATUS_REQ_TYPE, SMOO_STATUS_REQUEST, SmooStatusV0,
+use smoo_host_core::{
+    ControlTransport, Transport, TransportError, TransportErrorKind, TransportResult,
 };
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::task;
-use tracing::debug;
-
-const IDENT_REQ_TYPE: u8 = 0xC1;
-const CONFIG_REQ_TYPE: u8 = 0x41;
-const CONFIG_EXPORTS_REQUEST: u8 = 0x02;
 
 /// Configuration for [`RusbTransport`].
 #[derive(Clone, Copy, Debug)]
@@ -46,11 +39,86 @@ impl Default for RusbTransportConfig {
     }
 }
 
+#[derive(Clone)]
+pub struct RusbControl<T: UsbContext + Send + Sync + 'static> {
+    handle: Arc<Mutex<DeviceHandle<T>>>,
+    interface: u8,
+    timeout: Duration,
+}
+
+impl<T: UsbContext + Send + Sync + 'static> RusbControl<T> {
+    pub fn new(handle: Arc<Mutex<DeviceHandle<T>>>, interface: u8, timeout: Duration) -> Self {
+        Self {
+            handle,
+            interface,
+            timeout,
+        }
+    }
+}
+
+#[async_trait]
+impl<T: UsbContext + Send + Sync + 'static> ControlTransport for RusbControl<T> {
+    async fn control_in(
+        &self,
+        request_type: u8,
+        request: u8,
+        buf: &mut [u8],
+    ) -> TransportResult<usize> {
+        let handle = self.handle.clone();
+        let interface = self.interface;
+        let timeout = self.timeout;
+        let len = buf.len();
+        let (read, data) = task::spawn_blocking(move || {
+            let mut tmp = vec![0u8; len];
+            let handle = handle.lock().unwrap();
+            let read = handle.read_control(
+                request_type,
+                request,
+                0,
+                interface as u16,
+                &mut tmp,
+                timeout,
+            )?;
+            Ok::<_, rusb::Error>((read, tmp))
+        })
+        .await
+        .map_err(|err| join_error("control-in transfer", err))?
+        .map_err(|err| map_rusb_error("control-in transfer", err))?;
+        buf[..read].copy_from_slice(&data[..read]);
+        Ok(read)
+    }
+
+    async fn control_out(
+        &self,
+        request_type: u8,
+        request: u8,
+        data: &[u8],
+    ) -> TransportResult<usize> {
+        let payload = data.to_vec();
+        let handle = self.handle.clone();
+        let interface = self.interface;
+        let timeout = self.timeout;
+        task::spawn_blocking(move || {
+            let handle = handle.lock().unwrap();
+            handle.write_control(
+                request_type,
+                request,
+                0,
+                interface as u16,
+                &payload,
+                timeout,
+            )
+        })
+        .await
+        .map_err(|err| join_error("control-out transfer", err))?
+        .map_err(|err| map_rusb_error("control-out transfer", err))
+    }
+}
+
 /// [`Transport`] implementation backed by `rusb`.
 pub struct RusbTransport<T: UsbContext + Send + Sync + 'static> {
-    handle: Arc<Mutex<DeviceHandle<T>>>,
+    control: RusbControl<T>,
     config: RusbTransportConfig,
-    ident: Option<Ident>,
 }
 
 impl<T: UsbContext + Send + Sync + 'static> RusbTransport<T> {
@@ -58,171 +126,86 @@ impl<T: UsbContext + Send + Sync + 'static> RusbTransport<T> {
         handle
             .claim_interface(config.interface)
             .map_err(|err| map_rusb_error("claim usb interface", err))?;
-        Ok(Self {
-            handle: Arc::new(Mutex::new(handle)),
-            config,
-            ident: None,
-        })
-    }
-
-    fn ident_request_type(&self) -> u8 {
-        IDENT_REQ_TYPE
-    }
-
-    async fn perform_ident(&mut self) -> TransportResult<Ident> {
-        if let Some(ident) = self.ident {
-            return Ok(ident);
-        }
-        let handle = self.handle.clone();
-        let request_type = self.ident_request_type();
-        let interface = self.config.interface;
-        let timeout = self.config.timeout;
-        let (len, buf) = task::spawn_blocking(move || {
-            let mut data = [0u8; IDENT_LEN];
-            let handle = handle.lock().unwrap();
-            let read = handle.read_control(
-                request_type,
-                IDENT_REQUEST,
-                0,
-                interface as u16,
-                &mut data,
-                timeout,
-            )?;
-            Ok::<_, rusb::Error>((read, data))
-        })
-        .await
-        .map_err(|err| join_error("ident control transfer", err))?
-        .map_err(|err| map_rusb_error("ident control transfer", err))?;
-
-        if len != IDENT_LEN {
-            return Err(protocol_error(format!(
-                "ident control transfer truncated (expected {IDENT_LEN}, got {len})"
-            )));
-        }
-        let ident = Ident::decode(buf)
-            .map_err(|err| protocol_error(format!("decode ident response: {err}")))?;
-        debug!(
-            major = ident.major,
-            minor = ident.minor,
-            interface = interface,
-            "ident handshake complete"
+        let control = RusbControl::new(
+            Arc::new(Mutex::new(handle)),
+            config.interface,
+            config.timeout,
         );
-        self.ident = Some(ident);
-        Ok(ident)
+        Ok(Self { control, config })
     }
 
-    pub async fn ensure_ident(&mut self) -> TransportResult<Ident> {
-        self.perform_ident().await
+    /// Returns a clonable control handle for issuing vendor requests alongside the transport.
+    pub fn control_handle(&self) -> RusbControl<T> {
+        self.control.clone()
+    }
+}
+
+#[async_trait]
+impl<T: UsbContext + Send + Sync + 'static> ControlTransport for RusbTransport<T> {
+    async fn control_in(
+        &self,
+        request_type: u8,
+        request: u8,
+        buf: &mut [u8],
+    ) -> TransportResult<usize> {
+        self.control.control_in(request_type, request, buf).await
     }
 
-    pub async fn send_config_exports_v0(
-        &mut self,
-        payload: &ConfigExportsV0Payload,
-    ) -> TransportResult<()> {
-        let handle = self.handle.clone();
-        let interface = self.config.interface;
-        let timeout = self.config.timeout;
-        let data = payload.encode();
-        let written = task::spawn_blocking(move || {
-            let handle = handle.lock().unwrap();
-            handle.write_control(
-                CONFIG_REQ_TYPE,
-                CONFIG_EXPORTS_REQUEST,
-                0,
-                interface as u16,
-                &data,
-                timeout,
-            )
-        })
-        .await
-        .map_err(|err| join_error("CONFIG_EXPORTS control transfer", err))?
-        .map_err(|err| map_rusb_error("CONFIG_EXPORTS control transfer", err))?;
-        if written != ConfigExportsV0Payload::ENCODED_LEN {
-            return Err(protocol_error(format!(
-                "CONFIG_EXPORTS transfer truncated (expected {}, got {written})",
-                ConfigExportsV0Payload::ENCODED_LEN
-            )));
-        }
-        Ok(())
-    }
-
-    /// Returns a status client that can issue SMOO_STATUS requests alongside the transport.
-    pub fn status_client(&self) -> StatusClient<T> {
-        StatusClient {
-            handle: self.handle.clone(),
-            interface: self.config.interface,
-            timeout: self.config.timeout,
-        }
+    async fn control_out(
+        &self,
+        request_type: u8,
+        request: u8,
+        data: &[u8],
+    ) -> TransportResult<usize> {
+        self.control.control_out(request_type, request, data).await
     }
 }
 
 #[async_trait]
 impl<T: UsbContext + Send + Sync + 'static> Transport for RusbTransport<T> {
-    async fn setup(&mut self) -> TransportResult<Ident> {
-        self.perform_ident().await
-    }
-
-    async fn read_request(&mut self) -> TransportResult<Request> {
-        if self.ident.is_none() {
-            return Err(not_ready());
-        }
-        let handle = self.handle.clone();
+    async fn read_interrupt(&mut self, buf: &mut [u8]) -> TransportResult<usize> {
+        let handle = self.control.handle.clone();
         let endpoint = self.config.interrupt_in;
         let timeout = self.config.timeout;
-        let (len, buf) = task::spawn_blocking(move || {
-            let mut data = [0u8; REQUEST_LEN];
+        let len = buf.len();
+        task::spawn_blocking(move || {
+            let mut tmp = vec![0u8; len];
             let handle = handle.lock().unwrap();
-            let read = handle.read_interrupt(endpoint, &mut data, timeout)?;
-            Ok::<_, rusb::Error>((read, data))
+            let read = handle.read_interrupt(endpoint, &mut tmp, timeout)?;
+            Ok::<_, rusb::Error>((read, tmp))
         })
         .await
         .map_err(|err| join_error("interrupt-in read", err))?
-        .map_err(|err| map_rusb_error("interrupt-in read", err))?;
-
-        if len != REQUEST_LEN {
-            return Err(protocol_error(format!(
-                "request transfer truncated (expected {REQUEST_LEN}, got {len})"
-            )));
-        }
-        Request::decode(buf).map_err(|err| protocol_error(format!("decode request: {err}")))
+        .map_err(|err| map_rusb_error("interrupt-in read", err))
+        .map(|(read, tmp)| {
+            buf[..read].copy_from_slice(&tmp[..read]);
+            read
+        })
     }
 
-    async fn send_response(&mut self, response: Response) -> TransportResult<()> {
-        if self.ident.is_none() {
-            return Err(not_ready());
-        }
-        let handle = self.handle.clone();
+    async fn write_interrupt(&mut self, buf: &[u8]) -> TransportResult<usize> {
+        let payload = buf.to_vec();
+        let handle = self.control.handle.clone();
         let endpoint = self.config.interrupt_out;
         let timeout = self.config.timeout;
-        let data = response.encode();
-        let written = task::spawn_blocking(move || {
+        task::spawn_blocking(move || {
             let handle = handle.lock().unwrap();
-            handle.write_interrupt(endpoint, &data, timeout)
+            handle.write_interrupt(endpoint, &payload, timeout)
         })
         .await
         .map_err(|err| join_error("interrupt-out write", err))?
-        .map_err(|err| map_rusb_error("interrupt-out write", err))?;
-
-        if written != RESPONSE_LEN {
-            return Err(protocol_error(format!(
-                "response transfer truncated (expected {RESPONSE_LEN}, wrote {written})"
-            )));
-        }
-        Ok(())
+        .map_err(|err| map_rusb_error("interrupt-out write", err))
     }
 
-    async fn read_bulk(&mut self, buf: &mut [u8]) -> TransportResult<()> {
-        if self.ident.is_none() {
-            return Err(not_ready());
-        }
+    async fn read_bulk(&mut self, buf: &mut [u8]) -> TransportResult<usize> {
         let len = buf.len();
         if len == 0 {
-            return Ok(());
+            return Ok(0);
         }
-        let handle = self.handle.clone();
+        let handle = self.control.handle.clone();
         let endpoint = self.config.bulk_in;
         let timeout = self.config.timeout;
-        let (read, data) = task::spawn_blocking(move || {
+        task::spawn_blocking(move || {
             let mut tmp = vec![0u8; len];
             let handle = handle.lock().unwrap();
             let read = handle.read_bulk(endpoint, &mut tmp, timeout)?;
@@ -230,80 +213,28 @@ impl<T: UsbContext + Send + Sync + 'static> Transport for RusbTransport<T> {
         })
         .await
         .map_err(|err| join_error("bulk-in read", err))?
-        .map_err(|err| map_rusb_error("bulk-in read", err))?;
-        if read != len {
-            return Err(protocol_error(format!(
-                "bulk read truncated (expected {len}, got {read})"
-            )));
-        }
-        buf.copy_from_slice(&data[..len]);
-        Ok(())
+        .map_err(|err| map_rusb_error("bulk-in read", err))
+        .map(|(read, tmp)| {
+            buf[..read].copy_from_slice(&tmp[..read]);
+            read
+        })
     }
 
-    async fn write_bulk(&mut self, buf: &[u8]) -> TransportResult<()> {
-        if self.ident.is_none() {
-            return Err(not_ready());
-        }
+    async fn write_bulk(&mut self, buf: &[u8]) -> TransportResult<usize> {
         if buf.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
-        let data = buf.to_vec();
-        let len = data.len();
-        let handle = self.handle.clone();
+        let payload = buf.to_vec();
+        let handle = self.control.handle.clone();
         let endpoint = self.config.bulk_out;
         let timeout = self.config.timeout;
-        let written = task::spawn_blocking(move || {
+        task::spawn_blocking(move || {
             let handle = handle.lock().unwrap();
-            handle.write_bulk(endpoint, &data, timeout)
+            handle.write_bulk(endpoint, &payload, timeout)
         })
         .await
         .map_err(|err| join_error("bulk-out write", err))?
-        .map_err(|err| map_rusb_error("bulk-out write", err))?;
-        if written != len {
-            return Err(protocol_error(format!(
-                "bulk write truncated (expected {len}, wrote {written})"
-            )));
-        }
-        Ok(())
-    }
-}
-
-/// Helper for issuing SMOO_STATUS control transfers.
-#[derive(Clone)]
-pub struct StatusClient<T: UsbContext + Send + Sync + 'static> {
-    handle: Arc<Mutex<DeviceHandle<T>>>,
-    interface: u8,
-    timeout: Duration,
-}
-
-impl<T: UsbContext + Send + Sync + 'static> StatusClient<T> {
-    pub async fn read_status(&self) -> TransportResult<SmooStatusV0> {
-        let handle = self.handle.clone();
-        let interface = self.interface;
-        let timeout = self.timeout;
-        let (len, buf) = task::spawn_blocking(move || {
-            let mut data = [0u8; SMOO_STATUS_LEN];
-            let handle = handle.lock().unwrap();
-            let read = handle.read_control(
-                SMOO_STATUS_REQ_TYPE,
-                SMOO_STATUS_REQUEST,
-                0,
-                interface as u16,
-                &mut data,
-                timeout,
-            )?;
-            Ok::<_, rusb::Error>((read, data))
-        })
-        .await
-        .map_err(|err| join_error("SMOO_STATUS control transfer", err))?
-        .map_err(|err| map_rusb_error("SMOO_STATUS control transfer", err))?;
-        if len != SMOO_STATUS_LEN {
-            return Err(protocol_error(format!(
-                "SMOO_STATUS transfer truncated (expected {SMOO_STATUS_LEN}, got {len})"
-            )));
-        }
-        SmooStatusV0::try_from_slice(&buf[..len])
-            .map_err(|err| protocol_error(format!("decode SMOO_STATUS payload: {err}")))
+        .map_err(|err| map_rusb_error("bulk-out write", err))
     }
 }
 
@@ -323,68 +254,4 @@ fn join_error(op: &str, err: task::JoinError) -> TransportError {
         TransportErrorKind::Other,
         format!("{op} task join failed: {err}"),
     )
-}
-
-fn not_ready() -> TransportError {
-    TransportError::with_message(
-        TransportErrorKind::NotReady,
-        "transport not set up".to_string(),
-    )
-}
-
-fn protocol_error(message: impl Into<String>) -> TransportError {
-    TransportError::with_message(TransportErrorKind::Protocol, message.into())
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ConfigExportsV0Payload {
-    count: u16,
-    block_size: u32,
-    size_bytes: u64,
-}
-
-impl ConfigExportsV0Payload {
-    pub const ENCODED_LEN: usize = 28;
-
-    pub fn zero_exports() -> Self {
-        Self {
-            count: 0,
-            block_size: 0,
-            size_bytes: 0,
-        }
-    }
-
-    pub fn single_export(block_size: u32, size_bytes: u64) -> Self {
-        Self {
-            count: 1,
-            block_size,
-            size_bytes,
-        }
-    }
-
-    pub fn encode(&self) -> [u8; Self::ENCODED_LEN] {
-        let mut buf = [0u8; Self::ENCODED_LEN];
-        buf[0..2].copy_from_slice(&0u16.to_le_bytes());
-        buf[2..4].copy_from_slice(&self.count.to_le_bytes());
-        buf[4..8].copy_from_slice(&0u32.to_le_bytes());
-        buf[8..12].copy_from_slice(&self.block_size.to_le_bytes());
-        buf[12..20].copy_from_slice(&self.size_bytes.to_le_bytes());
-        buf[20..24].copy_from_slice(&0u32.to_le_bytes());
-        buf[24..28].copy_from_slice(&0u32.to_le_bytes());
-        buf
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::ConfigExportsV0Payload;
-
-    #[test]
-    fn config_exports_single_encodes_fields() {
-        let payload = ConfigExportsV0Payload::single_export(4096, 8192);
-        let encoded = payload.encode();
-        assert_eq!(encoded.len(), ConfigExportsV0Payload::ENCODED_LEN);
-        assert_eq!(&encoded[2..4], &[1, 0]);
-        assert_eq!(&encoded[8..12], &4096u32.to_le_bytes());
-        assert_eq!(&encoded[12..20], &8192u64.to_le_bytes());
-    }
 }

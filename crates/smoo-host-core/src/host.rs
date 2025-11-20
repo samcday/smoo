@@ -1,13 +1,14 @@
 use crate::{
     BlockSource, BlockSourceError, BlockSourceErrorKind, Transport, TransportError,
-    TransportErrorKind,
+    TransportErrorKind, TransportResult,
+    control::{ConfigExportsV0Payload, fetch_ident, send_config_exports_v0},
 };
 use alloc::{
     string::{String, ToString},
     vec::Vec,
 };
 use core::fmt;
-use smoo_proto::{Ident, OpCode, Request, Response};
+use smoo_proto::{Ident, OpCode, REQUEST_LEN, RESPONSE_LEN, Request, Response};
 
 /// Host error categories.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,17 +101,44 @@ where
         self.ident
     }
 
+    /// Record a previously obtained Ident to avoid reissuing the control transfer.
+    pub fn record_ident(&mut self, ident: Ident) {
+        self.ident = Some(ident);
+    }
+
     pub async fn setup(&mut self) -> HostResult<Ident> {
-        let ident = self.transport.setup().await?;
+        if let Some(ident) = self.ident {
+            return Ok(ident);
+        }
+        let ident = fetch_ident(&self.transport).await?;
         self.ident = Some(ident);
         Ok(ident)
+    }
+
+    /// Configure the gadget with a single export matching the provided block size and capacity.
+    pub async fn configure_single_export_v0(
+        &mut self,
+        block_size: u32,
+        size_bytes: u64,
+    ) -> HostResult<()> {
+        let payload = ConfigExportsV0Payload::single_export(block_size, size_bytes);
+        self.configure_exports_v0(&payload).await
+    }
+
+    /// Send an explicit v0 CONFIG_EXPORTS payload.
+    pub async fn configure_exports_v0(
+        &mut self,
+        payload: &ConfigExportsV0Payload,
+    ) -> HostResult<()> {
+        send_config_exports_v0(&self.transport, payload).await?;
+        Ok(())
     }
 
     pub async fn run_once(&mut self) -> HostResult<()> {
         if self.ident.is_none() {
             self.setup().await?;
         }
-        let request = match self.transport.read_request().await {
+        let request = match self.read_request().await {
             Ok(req) => req,
             Err(err) if err.kind() == TransportErrorKind::Timeout => {
                 return Ok(());
@@ -118,7 +146,7 @@ where
             Err(err) => return Err(err.into()),
         };
         let response = self.handle_request(request).await?;
-        self.transport.send_response(response).await?;
+        self.send_response(response).await?;
         Ok(())
     }
 
@@ -172,7 +200,13 @@ where
             if read != byte_len {
                 return Ok(short_io_response(request));
             }
-            self.transport.write_bulk(&buf).await?;
+            let written = self.transport.write_bulk(&buf).await?;
+            if written != byte_len {
+                return Err(protocol_error(format!(
+                    "bulk write truncated (expected {byte_len}, wrote {written})"
+                ))
+                .into());
+            }
         }
         Ok(Response::new(
             OpCode::Read,
@@ -193,7 +227,13 @@ where
         let byte_len = request.byte_len as usize;
         if byte_len > 0 {
             let mut buf: Vec<u8> = vec![0u8; byte_len];
-            self.transport.read_bulk(&mut buf).await?;
+            let read = self.transport.read_bulk(&mut buf).await?;
+            if read != byte_len {
+                return Err(protocol_error(format!(
+                    "bulk read truncated (expected {byte_len}, got {read})"
+                ))
+                .into());
+            }
             let written = match self.source.write_blocks(request.lba, &buf).await {
                 Ok(len) => len,
                 Err(err) => return Ok(response_from_block_error(request, err)),
@@ -225,6 +265,29 @@ where
         }
         Ok(byte_len / block_size)
     }
+
+    async fn read_request(&mut self) -> TransportResult<Request> {
+        let mut buf = [0u8; REQUEST_LEN];
+        let len = self.transport.read_interrupt(&mut buf).await?;
+        if len != REQUEST_LEN {
+            return Err(protocol_error(format!(
+                "request transfer truncated (expected {REQUEST_LEN}, got {len})"
+            )));
+        }
+        Request::decode(buf).map_err(|err| protocol_error(format!("decode request: {err}")))
+    }
+
+    async fn send_response(&mut self, response: Response) -> HostResult<()> {
+        let data = response.encode();
+        let written = self.transport.write_interrupt(&data).await?;
+        if written != RESPONSE_LEN {
+            return Err(protocol_error(format!(
+                "response transfer truncated (expected {RESPONSE_LEN}, wrote {written})"
+            ))
+            .into());
+        }
+        Ok(())
+    }
 }
 
 const ERRNO_EINVAL: u32 = 22;
@@ -246,4 +309,8 @@ fn response_from_block_error(request: Request, err: BlockSourceError) -> Respons
         BlockSourceErrorKind::Io | BlockSourceErrorKind::Other => ERRNO_EIO,
     };
     Response::new(request.op, request.lba, 0, errno)
+}
+
+fn protocol_error(message: impl Into<String>) -> TransportError {
+    TransportError::with_message(TransportErrorKind::Protocol, message)
 }

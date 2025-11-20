@@ -1,7 +1,6 @@
 use alloc::string::String;
 use async_trait::async_trait;
 use core::fmt;
-use smoo_proto::{Ident, Request, Response};
 
 pub type TransportResult<T> = core::result::Result<T, TransportError>;
 
@@ -59,22 +58,44 @@ impl fmt::Display for TransportError {
 #[cfg(feature = "std")]
 impl std::error::Error for TransportError {}
 
-/// Abstracts the USB transport that carries control-plane messages between the
-/// host and gadget.
+/// Provides access to vendor control transfers used by the smoo protocol.
 #[async_trait]
-pub trait Transport: Send {
-    /// Execute the FunctionFS Ident handshake and return the gadget's reported Ident.
-    async fn setup(&mut self) -> TransportResult<Ident>;
+pub trait ControlTransport: Send + Sync {
+    /// Issue a vendor control IN transfer (device → host).
+    ///
+    /// Implementations handle the correct interface/index internally.
+    async fn control_in(
+        &self,
+        request_type: u8,
+        request: u8,
+        buf: &mut [u8],
+    ) -> TransportResult<usize>;
 
-    /// Receive the next Request from the gadget (interrupt IN).
-    async fn read_request(&mut self) -> TransportResult<Request>;
+    /// Issue a vendor control OUT transfer (host → device).
+    ///
+    /// Implementations handle the correct interface/index internally.
+    async fn control_out(
+        &self,
+        request_type: u8,
+        request: u8,
+        data: &[u8],
+    ) -> TransportResult<usize>;
+}
 
-    /// Send a Response back to the gadget (interrupt OUT).
-    async fn send_response(&mut self, response: Response) -> TransportResult<()>;
+/// Abstracts the USB transport that carries protocol messages between the
+/// host and gadget. This trait is intentionally low-level; smoo-specific
+/// encoding/decoding is handled in `host-core`.
+#[async_trait]
+pub trait Transport: ControlTransport {
+    /// Receive bytes from the Request interrupt endpoint (device → host).
+    async fn read_interrupt(&mut self, buf: &mut [u8]) -> TransportResult<usize>;
 
-    /// Read a full payload from the gadget over the bulk IN endpoint.
-    async fn read_bulk(&mut self, buf: &mut [u8]) -> TransportResult<()>;
+    /// Send bytes to the Response interrupt endpoint (host → device).
+    async fn write_interrupt(&mut self, buf: &[u8]) -> TransportResult<usize>;
 
-    /// Write a full payload to the gadget over the bulk OUT endpoint.
-    async fn write_bulk(&mut self, buf: &[u8]) -> TransportResult<()>;
+    /// Read a payload from the gadget over the bulk IN endpoint.
+    async fn read_bulk(&mut self, buf: &mut [u8]) -> TransportResult<usize>;
+
+    /// Write a payload to the gadget over the bulk OUT endpoint.
+    async fn write_bulk(&mut self, buf: &[u8]) -> TransportResult<usize>;
 }

@@ -3,9 +3,10 @@ use clap::{ArgGroup, Parser};
 use rusb::{Direction, TransferType, UsbContext};
 use smoo_host_blocksources::{DeviceBlockSource, FileBlockSource};
 use smoo_host_core::{
+    control::{fetch_ident, read_status, send_config_exports_v0, ConfigExportsV0Payload},
     BlockSource, BlockSourceResult, HostErrorKind, SmooHost, TransportError, TransportErrorKind,
 };
-use smoo_host_rusb::{ConfigExportsV0Payload, RusbTransport, RusbTransportConfig, StatusClient};
+use smoo_host_rusb::{RusbControl, RusbTransport, RusbTransportConfig};
 use smoo_proto::SmooStatusV0;
 use std::{fmt, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{signal, sync::mpsc, time};
@@ -230,9 +231,9 @@ async fn run_session(
         bulk_out: endpoints.bulk_out,
         timeout: Duration::from_millis(args.timeout_ms),
     };
-    let mut transport = RusbTransport::new(handle, transport_config).context("init transport")?;
-    let ident = transport
-        .ensure_ident()
+    let transport = RusbTransport::new(handle, transport_config).context("init transport")?;
+    let control = transport.control_handle();
+    let ident = fetch_ident(&control)
         .await
         .context("IDENT control transfer")?;
     debug!(
@@ -241,8 +242,7 @@ async fn run_session(
         "gadget IDENT response"
     );
     let config_payload = ConfigExportsV0Payload::single_export(block_size, size_bytes);
-    transport
-        .send_config_exports_v0(&config_payload)
+    send_config_exports_v0(&control, &config_payload)
         .await
         .context("CONFIG_EXPORTS control transfer")?;
     info!(
@@ -250,10 +250,8 @@ async fn run_session(
         size_bytes = size_bytes,
         "configured gadget export"
     );
-    let status_client = transport.status_client();
     let initial_status =
-        match fetch_status_with_retry(&status_client, STATUS_RETRY_ATTEMPTS, STATUS_RETRY_INTERVAL)
-            .await
+        match fetch_status_with_retry(&control, STATUS_RETRY_ATTEMPTS, STATUS_RETRY_INTERVAL).await
         {
             Ok(status) => status,
             Err(err) => {
@@ -290,7 +288,7 @@ async fn run_session(
     );
     let heartbeat_interval = Duration::from_secs(HEARTBEAT_INTERVAL_SECS);
     let (heartbeat_tx, mut heartbeat_rx) = mpsc::unbounded_channel();
-    let heartbeat_client = status_client.clone();
+    let heartbeat_client = control.clone();
     let session_id = initial_status.session_id;
     let heartbeat_task = tokio::spawn(async move {
         if let Err(err) = run_heartbeat(heartbeat_client, session_id, heartbeat_interval).await {
@@ -298,7 +296,7 @@ async fn run_session(
         }
     });
     let mut host = SmooHost::new(transport, source);
-    let ident = host.setup().await.context("ident handshake")?;
+    host.record_ident(ident);
     info!(
         major = ident.major,
         minor = ident.minor,
@@ -564,7 +562,7 @@ impl fmt::Display for HeartbeatFailure {
 }
 
 async fn run_heartbeat(
-    client: StatusClient<rusb::Context>,
+    client: RusbControl<rusb::Context>,
     initial_session_id: u64,
     interval: Duration,
 ) -> Result<(), HeartbeatFailure> {
@@ -572,7 +570,7 @@ async fn run_heartbeat(
     ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
-        match client.read_status().await {
+        match read_status(&client).await {
             Ok(status) => {
                 debug!(
                     session_id = status.session_id,
@@ -597,13 +595,13 @@ async fn run_heartbeat(
 }
 
 async fn fetch_status_with_retry(
-    client: &StatusClient<rusb::Context>,
+    client: &RusbControl<rusb::Context>,
     attempts: usize,
     delay: Duration,
 ) -> Result<SmooStatusV0, TransportError> {
     let mut attempt = 0;
     loop {
-        match client.read_status().await {
+        match read_status(client).await {
             Ok(status) => return Ok(status),
             Err(err) => {
                 if err.kind() == TransportErrorKind::Timeout && attempt == 0 {
