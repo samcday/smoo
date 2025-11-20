@@ -1,13 +1,14 @@
 use anyhow::{anyhow, ensure, Context, Result};
 use clap::{Parser, ValueEnum};
 use smoo_gadget_core::{
-    ConfigExportsV0, ControlIo, DmaHeap, ExportFlags, ExportSpec, FunctionfsEndpoints,
-    GadgetConfig, GadgetControl, GadgetStatusReport, PersistedExportRecord, SetupCommand,
-    SetupPacket, SmooGadget, StateStore,
+    ConfigExportsV0, ControlIo, DmaHeap, ExportController, ExportFlags, ExportReconcileContext,
+    ExportSpec, ExportState, FunctionfsEndpoints, GadgetConfig, GadgetControl, GadgetStatusReport,
+    PersistedExportRecord, RuntimeTunables, SetupCommand, SetupPacket, SmooGadget, StateStore,
 };
 use smoo_gadget_ublk::{SmooUblk, SmooUblkDevice, UblkBuffer, UblkIoRequest, UblkOp};
 use smoo_proto::{Ident, OpCode, Request, Response};
 use std::{
+    collections::HashMap,
     fs::File,
     io,
     os::fd::{FromRawFd, IntoRawFd, OwnedFd},
@@ -106,7 +107,7 @@ async fn main() -> Result<()> {
         StateStore::new()
     };
 
-    let recovered_device = initialize_session(&mut ublk, &mut state_store).await?;
+    initialize_session(&mut ublk, &mut state_store).await?;
     let ident = Ident::new(0, 1);
     let dma_heap = if args.no_dma_buf {
         None
@@ -131,7 +132,12 @@ async fn main() -> Result<()> {
 
     let control_handler = gadget.control_handler();
     let (control_tx, control_rx) = mpsc::channel(8);
-    let initial_export_count = if recovered_device.is_some() { 1 } else { 0 };
+
+    let exports = build_initial_exports(&state_store);
+    let initial_export_count = exports
+        .values()
+        .filter(|ctrl| ctrl.device().is_some())
+        .count() as u32;
     let status = GadgetStatusShared::new(GadgetStatus::new(
         state_store.session_id(),
         initial_export_count,
@@ -142,13 +148,19 @@ async fn main() -> Result<()> {
         status.clone(),
         control_tx,
     ));
-    let runtime = RuntimeState {
+    let tunables = RuntimeTunables {
         queue_count: args.queue_count,
         queue_depth: args.queue_depth,
+        max_io_bytes: DEFAULT_MAX_IO_BYTES,
+        dma_heap,
+    };
+    let runtime = RuntimeState {
         state_store,
         status,
+        exports,
+        tunables,
     };
-    let result = run_event_loop(&mut ublk, gadget, runtime, recovered_device, control_rx).await;
+    let result = run_event_loop(&mut ublk, gadget, runtime, control_rx).await;
     control_task.abort();
     let _ = control_task.await;
     result
@@ -197,10 +209,10 @@ impl GadgetStatusShared {
 }
 
 struct RuntimeState {
-    queue_count: u16,
-    queue_depth: u16,
     state_store: StateStore,
     status: GadgetStatusShared,
+    exports: HashMap<u32, ExportController>,
+    tunables: RuntimeTunables,
 }
 
 impl RuntimeState {
@@ -217,11 +229,54 @@ enum ControlMessage {
     Config(ConfigExportsV0),
 }
 
+fn build_initial_exports(state_store: &StateStore) -> HashMap<u32, ExportController> {
+    let mut exports = HashMap::new();
+    if let Some(record) = state_store.records().get(0).cloned() {
+        if let Some(dev_id) = record.assigned_dev_id {
+            exports.insert(
+                record.export_id,
+                ExportController::new(
+                    record.export_id,
+                    record.spec,
+                    ExportState::RecoveringPending { dev_id },
+                ),
+            );
+        } else {
+            exports.insert(
+                record.export_id,
+                ExportController::new(record.export_id, record.spec, ExportState::New),
+            );
+        }
+    }
+    exports
+}
+
+async fn reconcile_exports(ublk: &mut SmooUblk, runtime: &mut RuntimeState) -> Result<()> {
+    let RuntimeState {
+        state_store,
+        exports,
+        tunables,
+        ..
+    } = runtime;
+    let tunables = *tunables;
+    for controller in exports
+        .values_mut()
+        .filter(|ctrl| ctrl.needs_reconcile())
+    {
+        let mut cx = ExportReconcileContext {
+            ublk,
+            state_store,
+            tunables,
+        };
+        controller.reconcile(&mut cx).await?;
+    }
+    Ok(())
+}
+
 async fn run_event_loop(
     ublk: &mut SmooUblk,
     mut gadget: SmooGadget,
     mut runtime: RuntimeState,
-    mut device: Option<SmooUblkDevice>,
     mut control_rx: mpsc::Receiver<ControlMessage>,
 ) -> Result<()> {
     let shutdown = signal::ctrl_c();
@@ -229,69 +284,96 @@ async fn run_event_loop(
 
     let mut io_error = None;
     loop {
-        if let Some(active_device) = device.as_ref() {
+        let reconcile_needed = runtime
+            .exports
+            .values()
+            .any(|ctrl| ctrl.needs_reconcile());
+        if reconcile_needed {
+            reconcile_exports(ublk, &mut runtime).await?;
+        }
+        let active_count = runtime
+            .exports
+            .values()
+            .filter(|ctrl| ctrl.device().is_some())
+            .count() as u32;
+        runtime.status().set_export_count(active_count).await;
+
+        enum Event {
+            Shutdown,
+            Control(Option<ControlMessage>),
+            Io(u32, anyhow::Result<UblkIoRequest>),
+        }
+
+        let active_export = runtime
+            .exports
+            .iter()
+            .find_map(|(id, ctrl)| ctrl.device().is_some().then_some(*id));
+
+        let event = if let Some(export_id) = active_export {
+            let device = runtime
+                .exports
+                .get(&export_id)
+                .and_then(|ctrl| ctrl.device())
+                .expect("device present");
+            let next_io = device.next_io();
+            tokio::pin!(next_io);
             tokio::select! {
-                _ = &mut shutdown => {
-                    info!("shutdown signal received");
-                    break;
-                }
-                msg = control_rx.recv() => {
-                    if let Some(msg) = msg {
-                        process_control_message(
-                            msg,
-                            ublk,
-                            &mut device,
-                            &mut runtime,
-                        )
-                        .await?;
-                    } else {
-                        break;
-                    }
-                }
-                req = active_device.next_io() => {
-                    let req = match req {
-                        Ok(req) => req,
-                        Err(err) => {
-                            io_error = Some(err.context("receive ublk io"));
-                            break;
-                        }
-                    };
-                    if let Err(err) = handle_request(&mut gadget, active_device, req).await {
-                        io_error = Some(err);
-                        break;
-                    }
-                }
+                _ = &mut shutdown => Event::Shutdown,
+                msg = control_rx.recv() => Event::Control(msg),
+                req = &mut next_io => Event::Io(export_id, req),
             }
         } else {
             tokio::select! {
-                _ = &mut shutdown => {
-                    info!("shutdown signal received");
-                    break;
-                }
-                msg = control_rx.recv() => {
-                    if let Some(msg) = msg {
-                        process_control_message(
-                            msg,
-                            ublk,
-                            &mut device,
-                            &mut runtime,
-                        )
-                        .await?;
-                    } else {
+                _ = &mut shutdown => Event::Shutdown,
+                msg = control_rx.recv() => Event::Control(msg),
+            }
+        };
+
+        match event {
+            Event::Shutdown => {
+                info!("shutdown signal received");
+                break;
+            }
+            Event::Control(Some(msg)) => {
+                process_control_message(msg, ublk, &mut runtime).await?;
+            }
+            Event::Control(None) => break,
+            Event::Io(export_id, req) => {
+                let req = match req {
+                    Ok(req) => req,
+                    Err(err) => {
+                        io_error = Some(err.context("receive ublk io"));
                         break;
                     }
+                };
+                if let Some(device) = runtime
+                    .exports
+                    .get(&export_id)
+                    .and_then(|ctrl| ctrl.device())
+                {
+                    if let Err(err) = handle_request(&mut gadget, device, req).await {
+                        io_error = Some(err);
+                        break;
+                    }
+                } else {
+                    warn!(
+                        export_id,
+                        "received ublk io for export that no longer exists"
+                    );
                 }
             }
         }
     }
 
-    if let Some(device) = device.take() {
-        info!("stopping ublk device");
-        ublk.stop_dev(device, true)
-            .await
-            .context("stop ublk device")?;
-        runtime.status().set_export_count(0).await;
+    for controller in runtime.exports.values_mut() {
+        if let Some(device) = controller.take_device() {
+            info!(dev_id = device.dev_id(), "stopping ublk device");
+            ublk.stop_dev(device, true)
+                .await
+                .context("stop ublk device")?;
+        }
     }
+    runtime.status().set_export_count(0).await;
 
     // Clean shutdown: remove the state file to avoid retaining stale session info.
     if let Err(err) = runtime.state_store().remove_file() {
@@ -596,15 +678,12 @@ impl ControlIo for UsbControlIo<'_> {
         }
     }
 }
-async fn initialize_session(
-    ublk: &mut SmooUblk,
-    state_store: &mut StateStore,
-) -> Result<Option<SmooUblkDevice>> {
+async fn initialize_session(_ublk: &mut SmooUblk, state_store: &mut StateStore) -> Result<()> {
     if state_store.records().is_empty() {
         if state_store.path().is_some() {
             debug!("state file present but no exports recorded; nothing to recover");
         }
-        return Ok(None);
+        return Ok(());
     }
     if state_store.records().len() > 1 {
         warn!(
@@ -613,54 +692,9 @@ async fn initialize_session(
         );
         reset_state_store(state_store);
         let _ = state_store.persist();
-        return Ok(None);
+        return Ok(());
     }
-    let record = state_store.records()[0].clone();
-    let Some(dev_id) = record.assigned_dev_id else {
-        debug!(
-            export_id = record.export_id,
-            "state store missing dev_id; skipping recovery"
-        );
-        return Ok(None);
-    };
-
-    let cdev_path = format!("/dev/ublkc{}", dev_id);
-    if !Path::new(&cdev_path).exists() {
-        warn!(?cdev_path, "ublk device missing; clearing state store");
-        reset_state_store(state_store);
-        let _ = state_store.persist();
-        return Ok(None);
-    }
-
-    match ublk.recover_existing_device(dev_id).await {
-        Ok(device) => {
-            info!(
-                dev_id = dev_id,
-                session_id = state_store.session_id(),
-                "ublk recovery succeeded"
-            );
-            Ok(Some(device))
-        }
-        Err(err) => {
-            warn!(
-                dev_id = dev_id,
-                error = ?err,
-                "ublk recovery failed; removing stale device"
-            );
-            if Path::new(&cdev_path).exists() {
-                if let Err(clean_err) = ublk.force_remove_device(dev_id).await {
-                    warn!(
-                        dev_id = dev_id,
-                        error = ?clean_err,
-                        "failed to remove stale ublk device"
-                    );
-                }
-            }
-            reset_state_store(state_store);
-            let _ = state_store.persist();
-            Ok(None)
-        }
-    }
+    Ok(())
 }
 
 fn reset_state_store(state_store: &mut StateStore) {
@@ -674,12 +708,11 @@ fn reset_state_store(state_store: &mut StateStore) {
 async fn process_control_message(
     msg: ControlMessage,
     ublk: &mut SmooUblk,
-    device: &mut Option<SmooUblkDevice>,
     runtime: &mut RuntimeState,
 ) -> Result<()> {
     match msg {
         ControlMessage::Config(config) => {
-            if let Err(err) = apply_config(ublk, device, runtime, config).await {
+            if let Err(err) = apply_config(ublk, runtime, config).await {
                 warn!(error = ?err, "CONFIG_EXPORTS application failed");
             }
         }
@@ -689,20 +722,21 @@ async fn process_control_message(
 
 async fn apply_config(
     ublk: &mut SmooUblk,
-    device_slot: &mut Option<SmooUblkDevice>,
     runtime: &mut RuntimeState,
     config: ConfigExportsV0,
 ) -> Result<()> {
+    for controller in runtime.exports.values_mut() {
+        if let Some(device) = controller.take_device() {
+            ublk.stop_dev(device, true)
+                .await
+                .context("stop ublk device before applying CONFIG_EXPORTS")?;
+        }
+    }
+    runtime.exports.clear();
+
     match config.export() {
         None => {
-            if let Some(device) = device_slot.take() {
-                info!("CONFIG_EXPORTS removing current export");
-                ublk.stop_dev(device, true)
-                    .await
-                    .context("stop ublk device after CONFIG_EXPORTS (count=0)")?;
-            } else {
-                info!("CONFIG_EXPORTS requested zero exports (already idle)");
-            }
+            info!("CONFIG_EXPORTS requested zero exports");
             runtime.state_store().replace_all(Vec::new());
             if let Err(err) = runtime.state_store().persist() {
                 warn!(error = ?err, "failed to clear state file");
@@ -721,71 +755,31 @@ async fn apply_config(
                 .checked_div(block_size as u64)
                 .context("size bytes smaller than block size")?;
             ensure!(blocks > 0, "export size too small");
-            let block_count =
+            let _block_count =
                 usize::try_from(blocks).context("block count exceeds usize capacity")?;
             let spec = ExportSpec {
                 block_size: export.block_size,
                 size_bytes: export.size_bytes,
                 flags: ExportFlags::empty(),
             };
-
-            if let Some(existing) = device_slot.as_mut() {
-                if existing.recovery_pending() {
-                    let matches = existing.block_size() == block_size
-                        && existing.block_count() == block_count
-                        && existing.queue_count() == runtime.queue_count
-                        && existing.queue_depth() == runtime.queue_depth;
-                    ensure!(
-                        matches,
-                        "recovered export geometry mismatch; clear state store and retry"
-                    );
-                    info!("CONFIG_EXPORTS matches recovered export; finalizing recovery");
-                    ublk.finalize_recovery(existing)
-                        .await
-                        .context("complete ublk recovery")?;
-                    runtime.status().set_export_count(1).await;
-                    runtime
-                        .state_store()
-                        .replace_all(vec![PersistedExportRecord {
-                            export_id: SINGLE_EXPORT_ID,
-                            spec,
-                            assigned_dev_id: Some(existing.dev_id()),
-                        }]);
-                    if let Err(err) = runtime.state_store().persist() {
-                        warn!(error = ?err, "failed to write state store");
-                    }
-                    return Ok(());
-                }
-                let device = device_slot.take().expect("device present");
-                info!("CONFIG_EXPORTS replacing existing export");
-                ublk.stop_dev(device, true)
-                    .await
-                    .context("stop ublk device before reconfigure")?;
-            } else {
-                info!("CONFIG_EXPORTS creating export");
-            }
-
-            let new_device = ublk
-                .setup_device(
-                    block_size,
-                    block_count,
-                    runtime.queue_count,
-                    runtime.queue_depth,
-                )
-                .await
-                .context("setup ublk device from CONFIG_EXPORTS")?;
-            runtime.status().set_export_count(1).await;
-            runtime
-                .state_store()
-                .replace_all(vec![PersistedExportRecord {
-                    export_id: SINGLE_EXPORT_ID,
-                    spec,
-                    assigned_dev_id: Some(new_device.dev_id()),
-                }]);
+            let controller_spec = spec.clone();
+            let record = PersistedExportRecord {
+                export_id: SINGLE_EXPORT_ID,
+                spec,
+                assigned_dev_id: None,
+            };
+            runtime.state_store().replace_all(vec![record]);
             if let Err(err) = runtime.state_store().persist() {
                 warn!(error = ?err, "failed to write state store");
             }
-            *device_slot = Some(new_device);
+            runtime.exports.insert(
+                SINGLE_EXPORT_ID,
+                ExportController::new(SINGLE_EXPORT_ID, controller_spec, ExportState::New),
+            );
+            runtime
+                .status()
+                .set_export_count(runtime.exports.len() as u32)
+                .await;
             Ok(())
         }
     }
