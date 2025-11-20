@@ -185,6 +185,28 @@ impl StateStore {
             .context("sync state directory after rename")?;
         Ok(())
     }
+
+    /// Remove the state file from disk, if persistence is enabled.
+    pub fn remove_file(&self) -> Result<()> {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| format!("remove state file {}", path.display()));
+            }
+        }
+
+        if let Some(dir) = path.parent() {
+            if let Ok(dir_file) = File::open(dir) {
+                let _ = dir_file.sync_all();
+            }
+        }
+        Ok(())
+    }
 }
 
 fn generate_session_id() -> u64 {

@@ -291,13 +291,15 @@ async fn run_event_loop(
             .await
             .context("stop ublk device")?;
         runtime.status().set_export_count(0).await;
-        runtime.state_store().replace_all(Vec::new());
-        if let Err(err) = runtime.state_store().persist() {
-            warn!(error = ?err, "failed to persist state during shutdown");
-        } else {
-            debug!("state cleared on shutdown");
-        }
     }
+
+    // Clean shutdown: remove the state file to avoid retaining stale session info.
+    if let Err(err) = runtime.state_store().remove_file() {
+        warn!(error = ?err, "failed to remove state file on shutdown");
+    } else {
+        debug!("state file removed on shutdown");
+    }
+
     if let Some(err) = io_error {
         Err(err)
     } else {
