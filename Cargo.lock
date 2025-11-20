@@ -115,6 +115,9 @@ name = "bitflags"
 version = "2.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c8214115b7bf84099f1309324e63141d4c5d7cc26862f97a0a857dbefe165bd"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "block2"
@@ -868,13 +871,9 @@ dependencies = [
  "async-trait",
  "clap",
  "libc 0.2.177",
- "rand 0.8.5",
- "serde",
- "serde_json",
  "smoo-gadget-core",
  "smoo-gadget-ublk",
  "smoo-proto",
- "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -887,11 +886,16 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bitflags",
  "dma-heap",
  "libc 0.2.177",
  "mmap",
  "nix",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
  "smoo-proto",
+ "tempfile",
  "tokio",
  "tracing",
 ]

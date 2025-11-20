@@ -1,11 +1,9 @@
-mod state;
-
 use anyhow::{anyhow, ensure, Context, Result};
 use clap::{Parser, ValueEnum};
-use rand::{rngs::OsRng, RngCore};
 use smoo_gadget_core::{
-    ConfigExportsV0, ControlIo, DmaHeap, FunctionfsEndpoints, GadgetConfig, GadgetControl,
-    GadgetStatusReport, SetupCommand, SetupPacket, SmooGadget,
+    ConfigExportsV0, ControlIo, DmaHeap, ExportFlags, ExportSpec, FunctionfsEndpoints,
+    GadgetConfig, GadgetControl, GadgetStatusReport, PersistedExportRecord, SetupCommand,
+    SetupPacket, SmooGadget, StateStore,
 };
 use smoo_gadget_ublk::{SmooUblk, SmooUblkDevice, UblkBuffer, UblkIoRequest, UblkOp};
 use smoo_proto::{Ident, OpCode, Request, Response};
@@ -35,8 +33,6 @@ const SMOO_SUBCLASS: u8 = 0x53;
 const SMOO_PROTOCOL: u8 = 0x4D;
 const DEFAULT_MAX_IO_BYTES: usize = 4 * 1024 * 1024;
 const SINGLE_EXPORT_ID: u32 = 0;
-
-use state::{ExportState, StateFile, StateSnapshot};
 
 #[derive(Debug, Parser)]
 #[command(name = "smoo-gadget-cli")]
@@ -96,17 +92,21 @@ async fn main() -> Result<()> {
     let (custom, endpoints, _gadget_guard) = setup_functionfs(&args).context("setup FunctionFS")?;
 
     let mut ublk = SmooUblk::new().context("init ublk")?;
-    let state_file = args
-        .state_file
-        .as_ref()
-        .map(|path| StateFile::new(path.clone()));
-    if let Some(file) = &state_file {
-        info!(path = ?file.path(), "state file configured");
+    let mut state_store = if let Some(path) = args.state_file.as_ref() {
+        info!(path = ?path, "state file configured");
+        match StateStore::load(path.clone()) {
+            Ok(store) => store,
+            Err(err) => {
+                warn!(path = ?path, error = ?err, "failed to load state file; starting new session");
+                StateStore::new_with_path(path.clone())
+            }
+        }
     } else {
         debug!("state file disabled; crash recovery off");
-    }
+        StateStore::new()
+    };
 
-    let (session_id, recovered_device) = initialize_session(&mut ublk, state_file.as_ref()).await?;
+    let recovered_device = initialize_session(&mut ublk, &mut state_store).await?;
     let ident = Ident::new(0, 1);
     let dma_heap = if args.no_dma_buf {
         None
@@ -131,17 +131,21 @@ async fn main() -> Result<()> {
 
     let control_handler = gadget.control_handler();
     let (control_tx, control_rx) = mpsc::channel(8);
-    let status = GadgetStatusShared::new(GadgetStatus::new(session_id, 0));
+    let initial_export_count = if recovered_device.is_some() { 1 } else { 0 };
+    let status = GadgetStatusShared::new(GadgetStatus::new(
+        state_store.session_id(),
+        initial_export_count,
+    ));
     let control_task = tokio::spawn(control_loop(
         custom,
         control_handler,
         status.clone(),
         control_tx,
     ));
-    let runtime = RuntimeConfig {
+    let runtime = RuntimeState {
         queue_count: args.queue_count,
         queue_depth: args.queue_depth,
-        state_file: state_file.clone(),
+        state_store,
         status,
     };
     let result = run_event_loop(&mut ublk, gadget, runtime, recovered_device, control_rx).await;
@@ -196,30 +200,20 @@ impl GadgetStatusShared {
     }
 }
 
-#[derive(Clone)]
-struct RuntimeConfig {
+struct RuntimeState {
     queue_count: u16,
     queue_depth: u16,
-    state_file: Option<StateFile>,
+    state_store: StateStore,
     status: GadgetStatusShared,
 }
 
-impl RuntimeConfig {
-    fn state_file(&self) -> Option<&StateFile> {
-        self.state_file.as_ref()
-    }
-
+impl RuntimeState {
     fn status(&self) -> &GadgetStatusShared {
         &self.status
     }
-}
 
-fn generate_session_id() -> u64 {
-    loop {
-        let candidate = OsRng.next_u64();
-        if candidate != 0 {
-            return candidate;
-        }
+    fn state_store(&mut self) -> &mut StateStore {
+        &mut self.state_store
     }
 }
 
@@ -230,7 +224,7 @@ enum ControlMessage {
 async fn run_event_loop(
     ublk: &mut SmooUblk,
     mut gadget: SmooGadget,
-    runtime: RuntimeConfig,
+    mut runtime: RuntimeState,
     mut device: Option<SmooUblkDevice>,
     mut control_rx: mpsc::Receiver<ControlMessage>,
 ) -> Result<()> {
@@ -251,7 +245,7 @@ async fn run_event_loop(
                             msg,
                             ublk,
                             &mut device,
-                            &runtime,
+                            &mut runtime,
                         )
                         .await?;
                     } else {
@@ -284,7 +278,7 @@ async fn run_event_loop(
                             msg,
                             ublk,
                             &mut device,
-                            &runtime,
+                            &mut runtime,
                         )
                         .await?;
                     } else {
@@ -301,12 +295,11 @@ async fn run_event_loop(
             .await
             .context("stop ublk device")?;
         runtime.status().set_export_count(0).await;
-        if let Some(state_file) = runtime.state_file() {
-            if let Err(err) = state_file.clear() {
-                warn!(error = ?err, "failed to remove state file during shutdown");
-            } else {
-                debug!("state file cleared on shutdown");
-            }
+        runtime.state_store().replace_all(Vec::new());
+        if let Err(err) = runtime.state_store().persist() {
+            warn!(error = ?err, "failed to persist state during shutdown");
+        } else {
+            debug!("state cleared on shutdown");
         }
     }
     if let Some(err) = io_error {
@@ -605,152 +598,86 @@ impl ControlIo for UsbControlIo<'_> {
         }
     }
 }
-
-struct RecoveryOutcome {
-    device: Option<SmooUblkDevice>,
-    session_valid: bool,
-}
-
 async fn initialize_session(
     ublk: &mut SmooUblk,
-    state_file: Option<&StateFile>,
-) -> Result<(u64, Option<SmooUblkDevice>)> {
-    if let Some(state_file) = state_file {
-        match state_file.load() {
-            Ok(Some(snapshot)) => {
-                let recovery = attempt_recovery(ublk, state_file, &snapshot).await?;
-                if recovery.session_valid {
-                    info!(
-                        session_id = snapshot.session_id,
-                        "restored gadget session from state file"
-                    );
-                    Ok((snapshot.session_id, recovery.device))
-                } else {
-                    let session_id = generate_session_id();
-                    info!(
-                        session_id,
-                        "state file invalid; starting new gadget session"
-                    );
-                    Ok((session_id, None))
-                }
-            }
-            Ok(None) => {
-                let session_id = generate_session_id();
-                info!(
-                    session_id,
-                    "state file missing or empty; starting cold session"
-                );
-                Ok((session_id, None))
-            }
-            Err(err) => {
-                warn!(
-                    path = ?state_file.path(),
-                    error = ?err,
-                    "failed to read state file; ignoring"
-                );
-                let _ = state_file.clear();
-                let session_id = generate_session_id();
-                info!(
-                    session_id,
-                    "state file cleared after read failure; starting new session"
-                );
-                Ok((session_id, None))
-            }
+    state_store: &mut StateStore,
+) -> Result<Option<SmooUblkDevice>> {
+    if state_store.records().is_empty() {
+        if state_store.path().is_some() {
+            debug!("state file present but no exports recorded; nothing to recover");
         }
-    } else {
-        let session_id = generate_session_id();
-        info!(
-            session_id,
-            "state tracking disabled; starting new gadget session"
-        );
-        Ok((session_id, None))
+        return Ok(None);
     }
-}
-
-async fn attempt_recovery(
-    ublk: &mut SmooUblk,
-    state_file: &StateFile,
-    snapshot: &StateSnapshot,
-) -> Result<RecoveryOutcome> {
-    if snapshot.exports.is_empty() {
-        debug!(
-            path = ?state_file.path(),
-            "state file present but no exports recorded; nothing to recover"
-        );
-        return Ok(RecoveryOutcome {
-            device: None,
-            session_valid: true,
-        });
-    }
-    if snapshot.exports.len() > 1 {
+    if state_store.records().len() > 1 {
         warn!(
-            path = ?state_file.path(),
-            exports = snapshot.exports.len(),
-            "multi-export state unsupported; clearing state file"
+            exports = state_store.records().len(),
+            "multi-export state unsupported; clearing state store"
         );
-        let _ = state_file.clear();
-        return Ok(RecoveryOutcome {
-            device: None,
-            session_valid: false,
-        });
+        reset_state_store(state_store);
+        let _ = state_store.persist();
+        return Ok(None);
     }
-    let export_state = &snapshot.exports[0];
-    info!(
-        path = ?state_file.path(),
-        export_id = export_state.export_id,
-        dev_id = export_state.ublk_dev_id,
-        "state file found, attempting ublk recovery"
-    );
-    let cdev_path = format!("/dev/ublkc{}", export_state.ublk_dev_id);
+    let record = state_store.records()[0].clone();
+    let Some(dev_id) = record.assigned_dev_id else {
+        debug!(
+            export_id = record.export_id,
+            "state store missing dev_id; skipping recovery"
+        );
+        return Ok(None);
+    };
+
+    let cdev_path = format!("/dev/ublkc{}", dev_id);
     if !Path::new(&cdev_path).exists() {
-        warn!(?cdev_path, "ublk device missing; removing state file");
-        let _ = state_file.clear();
-        return Ok(RecoveryOutcome {
-            device: None,
-            session_valid: false,
-        });
+        warn!(?cdev_path, "ublk device missing; clearing state store");
+        reset_state_store(state_store);
+        let _ = state_store.persist();
+        return Ok(None);
     }
-    match ublk.recover_existing_device(export_state.ublk_dev_id).await {
+
+    match ublk.recover_existing_device(dev_id).await {
         Ok(device) => {
             info!(
-                dev_id = export_state.ublk_dev_id,
-                session_id = snapshot.session_id,
+                dev_id = dev_id,
+                session_id = state_store.session_id(),
                 "ublk recovery succeeded"
             );
-            Ok(RecoveryOutcome {
-                device: Some(device),
-                session_valid: true,
-            })
+            Ok(Some(device))
         }
         Err(err) => {
             warn!(
-                dev_id = export_state.ublk_dev_id,
+                dev_id = dev_id,
                 error = ?err,
-                "ublk recovery failed; removing state file"
+                "ublk recovery failed; removing stale device"
             );
             if Path::new(&cdev_path).exists() {
-                if let Err(clean_err) = ublk.force_remove_device(export_state.ublk_dev_id).await {
+                if let Err(clean_err) = ublk.force_remove_device(dev_id).await {
                     warn!(
-                        dev_id = export_state.ublk_dev_id,
+                        dev_id = dev_id,
                         error = ?clean_err,
                         "failed to remove stale ublk device"
                     );
                 }
             }
-            let _ = state_file.clear();
-            Ok(RecoveryOutcome {
-                device: None,
-                session_valid: false,
-            })
+            reset_state_store(state_store);
+            let _ = state_store.persist();
+            Ok(None)
         }
     }
+}
+
+fn reset_state_store(state_store: &mut StateStore) {
+    let path = state_store.path().map(Path::to_path_buf);
+    *state_store = match path {
+        Some(path) => StateStore::new_with_path(path),
+        None => StateStore::new(),
+    };
 }
 
 async fn process_control_message(
     msg: ControlMessage,
     ublk: &mut SmooUblk,
     device: &mut Option<SmooUblkDevice>,
-    runtime: &RuntimeConfig,
+    runtime: &mut RuntimeState,
 ) -> Result<()> {
     match msg {
         ControlMessage::Config(config) => {
@@ -765,7 +692,7 @@ async fn process_control_message(
 async fn apply_config(
     ublk: &mut SmooUblk,
     device_slot: &mut Option<SmooUblkDevice>,
-    runtime: &RuntimeConfig,
+    runtime: &mut RuntimeState,
     config: ConfigExportsV0,
 ) -> Result<()> {
     match config.export() {
@@ -778,10 +705,9 @@ async fn apply_config(
             } else {
                 info!("CONFIG_EXPORTS requested zero exports (already idle)");
             }
-            if let Some(state_file) = runtime.state_file() {
-                if let Err(err) = state_file.clear() {
-                    warn!(error = ?err, "failed to clear state file");
-                }
+            runtime.state_store().replace_all(Vec::new());
+            if let Err(err) = runtime.state_store().persist() {
+                warn!(error = ?err, "failed to clear state file");
             }
             runtime.status().set_export_count(0).await;
             Ok(())
@@ -799,6 +725,11 @@ async fn apply_config(
             ensure!(blocks > 0, "export size too small");
             let block_count =
                 usize::try_from(blocks).context("block count exceeds usize capacity")?;
+            let spec = ExportSpec {
+                block_size: export.block_size,
+                size_bytes: export.size_bytes,
+                flags: ExportFlags::empty(),
+            };
 
             if let Some(existing) = device_slot.as_mut() {
                 if existing.recovery_pending() {
@@ -808,22 +739,22 @@ async fn apply_config(
                         && existing.queue_depth() == runtime.queue_depth;
                     ensure!(
                         matches,
-                        "recovered export geometry mismatch; clear state file and retry"
+                        "recovered export geometry mismatch; clear state store and retry"
                     );
                     info!("CONFIG_EXPORTS matches recovered export; finalizing recovery");
                     ublk.finalize_recovery(existing)
                         .await
                         .context("complete ublk recovery")?;
                     runtime.status().set_export_count(1).await;
-                    if let Some(state_file) = runtime.state_file() {
-                        let export_state = ExportState {
+                    runtime
+                        .state_store()
+                        .replace_all(vec![PersistedExportRecord {
                             export_id: SINGLE_EXPORT_ID,
-                            ublk_dev_id: existing.dev_id(),
-                        };
-                        let session_id = runtime.status().session_id().await;
-                        if let Err(err) = state_file.store(session_id, &[export_state]) {
-                            warn!(error = ?err, "failed to write state file");
-                        }
+                            spec,
+                            assigned_dev_id: Some(existing.dev_id()),
+                        }]);
+                    if let Err(err) = runtime.state_store().persist() {
+                        warn!(error = ?err, "failed to write state store");
                     }
                     return Ok(());
                 }
@@ -846,15 +777,15 @@ async fn apply_config(
                 .await
                 .context("setup ublk device from CONFIG_EXPORTS")?;
             runtime.status().set_export_count(1).await;
-            if let Some(state_file) = runtime.state_file() {
-                let export_state = ExportState {
+            runtime
+                .state_store()
+                .replace_all(vec![PersistedExportRecord {
                     export_id: SINGLE_EXPORT_ID,
-                    ublk_dev_id: new_device.dev_id(),
-                };
-                let session_id = runtime.status().session_id().await;
-                if let Err(err) = state_file.store(session_id, &[export_state]) {
-                    warn!(error = ?err, "failed to write state file");
-                }
+                    spec,
+                    assigned_dev_id: Some(new_device.dev_id()),
+                }]);
+            if let Err(err) = runtime.state_store().persist() {
+                warn!(error = ?err, "failed to write state store");
             }
             *device_slot = Some(new_device);
             Ok(())
