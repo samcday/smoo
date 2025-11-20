@@ -18,9 +18,13 @@ use tokio::{
 };
 
 mod dma;
+mod runtime;
 mod state_store;
 
 use crate::dma::{FunctionfsDmaScratch, dmabuf_transfer_blocking};
+pub use runtime::{
+    ExportController, ExportReconcileContext, ExportState, GadgetRuntime, RuntimeTunables,
+};
 pub use smoo_proto::{ConfigExport, ConfigExportsV0};
 pub use state_store::{ExportFlags, ExportSpec, PersistedExportRecord, StateStore};
 
@@ -274,7 +278,7 @@ impl GadgetConfig {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum DmaHeap {
     System,
     Cma,

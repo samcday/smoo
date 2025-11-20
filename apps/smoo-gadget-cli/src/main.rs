@@ -185,10 +185,6 @@ impl GadgetStatusShared {
         *self.inner.read().await
     }
 
-    async fn session_id(&self) -> u64 {
-        self.inner.read().await.session_id
-    }
-
     async fn report(&self) -> GadgetStatusReport {
         let snapshot = self.snapshot().await;
         GadgetStatusReport::new(snapshot.session_id, snapshot.export_count)
