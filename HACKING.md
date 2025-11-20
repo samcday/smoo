@@ -166,7 +166,7 @@ Backs actual storage.
 Two vendor control requests:
 
 * **IDENT (IN)**: idempotent, side‑effect‑free. Returns protocol version and capability flags.
-* **CONFIG_EXPORTS (OUT)**: authoritative replace of the complete export set. Payload describes all exports for this host session. Invalid payloads MUST STALL the control transfer.
+* **CONFIG_EXPORTS (OUT)**: authoritative replace of the complete export set. Payload describes all exports for this host session.
 
 ### Export Mapping
 
@@ -178,26 +178,6 @@ Each export entry includes:
 * flags (optional)
 
 Gadget maps `export_id` → ublk device. CONFIG_EXPORTS creates/removes ublk devices to match payload. Successful CONFIG_EXPORTS MUST update the state file.
-
-### Gadget State Machine
-
-States:
-
-* **COLD** → process start.
-* **BOUND** → descriptors written; waiting for ENABLE.
-* **USB_ENABLED** → endpoints active.
-* **READY** → IDENT accepted; no exports yet.
-* **RUNNING** → CONFIG_EXPORTS applied; ublk active.
-* **SUSPENDED** → bus suspend; I/O paused.
-* **RECOVERING** → state file found; reattaching to ublk devices.
-
-Transitions:
-
-* ENABLE → USB_ENABLED
-* IDENT → READY
-* CONFIG_EXPORTS → RUNNING
-* SUSPEND/RESUME → pause/resume I/O
-* DISABLE → teardown → BOUND
 
 ### Gadget Crash Recovery
 
