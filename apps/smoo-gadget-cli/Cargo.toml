@@ -17,3 +17,4 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 usb-gadget = { version = "0.7.6", features = ["tokio"] }
 libc = "0.2.177"
 async-trait = "0.1.83"
+futures = "0.3.31"

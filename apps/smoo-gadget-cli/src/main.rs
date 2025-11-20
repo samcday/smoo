@@ -1,9 +1,11 @@
 use anyhow::{anyhow, ensure, Context, Result};
 use clap::{Parser, ValueEnum};
+use futures::{stream::FuturesUnordered, StreamExt};
 use smoo_gadget_core::{
     ConfigExportsV0, ControlIo, DmaHeap, ExportController, ExportFlags, ExportReconcileContext,
     ExportSpec, ExportState, FunctionfsEndpoints, GadgetConfig, GadgetControl, GadgetStatusReport,
-    PersistedExportRecord, RuntimeTunables, SetupCommand, SetupPacket, SmooGadget, StateStore,
+    IoStateKind, PersistedExportRecord, RuntimeTunables, SetupCommand, SetupPacket, SmooGadget,
+    StateStore,
 };
 use smoo_gadget_ublk::{SmooUblk, SmooUblkDevice, UblkBuffer, UblkIoRequest, UblkOp};
 use smoo_proto::{Ident, OpCode, Request, Response};
@@ -13,6 +15,7 @@ use std::{
     io,
     os::fd::{FromRawFd, IntoRawFd, OwnedFd},
     path::{Path, PathBuf},
+    pin::Pin,
     sync::Arc,
 };
 use tokio::{
@@ -270,6 +273,32 @@ async fn reconcile_exports(ublk: &mut SmooUblk, runtime: &mut RuntimeState) -> R
     Ok(())
 }
 
+type IoFuture = Pin<
+    Box<
+        dyn std::future::Future<
+                Output = (
+                    u32,
+                    IoStateKind,
+                    u32,
+                    anyhow::Result<UblkIoRequest>,
+                    SmooUblkDevice,
+                ),
+            > + Send,
+    >,
+>;
+
+fn enqueue_io(runtime: &mut RuntimeState, io_futs: &mut FuturesUnordered<IoFuture>) {
+    for (export_id, controller) in runtime.exports.iter_mut() {
+        if let Some((kind, dev_id, device)) = controller.take_device_for_io() {
+            let export_id = *export_id;
+            io_futs.push(Box::pin(async move {
+                let res = device.next_io().await;
+                (export_id, kind, dev_id, res, device)
+            }));
+        }
+    }
+}
+
 async fn run_event_loop(
     ublk: &mut SmooUblk,
     mut gadget: SmooGadget,
@@ -278,6 +307,7 @@ async fn run_event_loop(
 ) -> Result<()> {
     let shutdown = signal::ctrl_c();
     tokio::pin!(shutdown);
+    let mut io_futs: FuturesUnordered<IoFuture> = FuturesUnordered::new();
 
     let mut io_error = None;
     loop {
@@ -288,70 +318,42 @@ async fn run_event_loop(
         let active_count = runtime
             .exports
             .values()
-            .filter(|ctrl| ctrl.device().is_some())
+            .filter(|ctrl| ctrl.dev_id().is_some())
             .count() as u32;
         runtime.status().set_export_count(active_count).await;
+        enqueue_io(&mut runtime, &mut io_futs);
 
-        let mut polled = false;
-        let mut pending_control: Option<ControlMessage> = None;
-        'io: for (_id, controller) in runtime.exports.iter_mut() {
-            if let Some((kind, dev_id, device)) = controller.take_device_for_io() {
-                polled = true;
-                let event = tokio::select! {
-                    _ = &mut shutdown => {
-                        controller.restore_device_after_io(kind, dev_id, device);
-                        break 'io;
-                    }
-                    msg = control_rx.recv() => {
-                        controller.restore_device_after_io(kind, dev_id, device);
-                        (msg, kind, dev_id, None)
-                    }
-                    req = device.next_io() => {
-                        (None, kind, dev_id, Some((req, device)))
-                    }
-                };
-                match event {
-                    (Some(msg), _kind, _dev_id, _) => {
-                        pending_control = Some(msg);
-                        break 'io;
-                    }
-                    (None, kind, dev_id, Some((req_res, device))) => match req_res {
-                        Ok(req) => {
-                            if let Err(err) = handle_request(&mut gadget, &device, req).await {
-                                controller.fail_after_io(dev_id, format!("{err:#}"));
-                                io_error = Some(err);
-                                break 'io;
-                            }
-                            controller.restore_device_after_io(kind, dev_id, device);
-                        }
-                        Err(err) => {
-                            controller.fail_after_io(dev_id, format!("{err:#}"));
-                            controller.restore_device_after_io(kind, dev_id, device);
-                            io_error = Some(err.context("receive ublk io"));
-                            break 'io;
-                        }
-                    },
-                    _ => {}
-                }
+        tokio::select! {
+            _ = &mut shutdown => {
+                info!("shutdown signal received");
+                break;
             }
-        }
-
-        if let Some(msg) = pending_control {
-            process_control_message(msg, ublk, &mut runtime).await?;
-            continue;
-        }
-
-        if !polled {
-            tokio::select! {
-                _ = &mut shutdown => {
-                    info!("shutdown signal received");
+            maybe_msg = control_rx.recv() => {
+                if let Some(msg) = maybe_msg {
+                    process_control_message(msg, ublk, &mut runtime).await?;
+                } else {
                     break;
                 }
-                msg = control_rx.recv() => {
-                    if let Some(msg) = msg {
-                        process_control_message(msg, ublk, &mut runtime).await?;
-                    } else {
-                        break;
+            }
+            next_io = io_futs.next(), if !io_futs.is_empty() => {
+                if let Some((export_id, kind, dev_id, req_res, device)) = next_io {
+                    if let Some(ctrl) = runtime.exports.get_mut(&export_id) {
+                        match req_res {
+                            Ok(req) => {
+                                if let Err(err) = handle_request(&mut gadget, &device, req).await {
+                                    ctrl.fail_after_io(dev_id, format!("{err:#}"));
+                                    io_error = Some(err);
+                                    break;
+                                }
+                                ctrl.restore_device_after_io(kind, dev_id, device);
+                            }
+                            Err(err) => {
+                                ctrl.fail_after_io(dev_id, format!("{err:#}"));
+                                ctrl.restore_device_after_io(kind, dev_id, device);
+                                io_error = Some(err.context("receive ublk io"));
+                                break;
+                            }
+                        }
                     }
                 }
             }
