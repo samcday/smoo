@@ -37,11 +37,6 @@ The goal is to keep a clean, comprehensible codebase while safely harnessing LLM
 - Codex output must compile.
 - Agents must refer back to **HACKING.md** for protocol, invariants, and architecture.
 - Prefer async‑only code; blocking must be justified.
-- After changes, return a commit-style summary in 50/80 format with a
-  subsystem prefix (e.g. `gadget:`) in the subject:
-  * Subject line ≤50 chars.
-  * Up to 3 detail lines, each ≤80 chars.
-  * Base the summary on the diff vs HEAD (staged + unstaged).
 
 ## Notes
 
