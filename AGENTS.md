@@ -30,14 +30,12 @@ The goal is to keep a clean, comprehensible codebase while safely harnessing LLM
 3. Codex is invoked with that prompt.
 4. Codex returns a diff or new file.
 5. Sam reviews and commits.
-6. A note is attached to the commit with the prompt and output from Codex.
 
 ## Ground Rules
 
 - Code must be formatted with `rustfmt --edition 2021`.
 - Codex output must compile.
 - Agents must refer back to **HACKING.md** for protocol, invariants, and architecture.
-- No inline giant code blocks in chat unless explicitly requested.
 - Prefer async‑only code; blocking must be justified.
 
 ## Notes
