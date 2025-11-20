@@ -478,13 +478,11 @@ impl GadgetControl {
         if setup.request() == CONFIG_EXPORTS_REQUEST
             && setup.request_type() == CONFIG_EXPORTS_REQ_TYPE
         {
-            ensure!(
-                setup.length() as usize == ConfigExportsV0::ENCODED_LEN,
-                "CONFIG_EXPORTS payload length mismatch"
-            );
-            let mut buf = [0u8; ConfigExportsV0::ENCODED_LEN];
+            let len = setup.length() as usize;
+            ensure!(len >= ConfigExportsV0::HEADER_LEN, "CONFIG_EXPORTS payload too short");
+            let mut buf = vec![0u8; len];
             io.read_out(&mut buf).await.context("read CONFIG_EXPORTS")?;
-            let payload = ConfigExportsV0::decode(buf)
+            let payload = ConfigExportsV0::try_from_slice(&buf)
                 .map_err(|err| anyhow!("parse CONFIG_EXPORTS payload: {err}"))?;
             return Ok(Some(SetupCommand::Config(payload)));
         }

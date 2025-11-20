@@ -340,7 +340,9 @@ async fn run_event_loop(
                     if let Some(ctrl) = runtime.exports.get_mut(&export_id) {
                         match req_res {
                             Ok(req) => {
-                                if let Err(err) = handle_request(&mut gadget, &device, req).await {
+                                if let Err(err) =
+                                    handle_request(&mut gadget, export_id, &device, req).await
+                                {
                                     ctrl.fail_after_io(dev_id, format!("{err:#}"));
                                     io_error = Some(err);
                                     break;
@@ -386,6 +388,7 @@ async fn run_event_loop(
 
 async fn handle_request(
     gadget: &mut SmooGadget,
+    export_id: u32,
     device: &SmooUblkDevice,
     req: UblkIoRequest,
 ) -> Result<()> {
@@ -448,8 +451,9 @@ async fn handle_request(
             );
         }
 
-        let byte_len = u32::try_from(req_len).context("request length exceeds protocol limit")?;
-        let proto_req = Request::new(opcode, req.sector, byte_len, 0);
+        let num_blocks = u32::try_from(req_len / block_size)
+            .context("request block count exceeds protocol limit")?;
+        let proto_req = Request::new(export_id, opcode, req.sector, num_blocks, 0);
         gadget
             .send_request(proto_req)
             .await
@@ -473,8 +477,8 @@ async fn handle_request(
 
         let response = gadget.read_response().await.context("read smoo response")?;
 
-        let status = response_status(&response, req_len)?;
-        if status >= 0 && status as usize != req_len {
+        let status = response_status(&response, req_len, block_size)?;
+        if status >= 0 && (status as usize) != req_len {
             warn!(
                 queue = req.queue_id,
                 tag = req.tag,
@@ -568,12 +572,12 @@ fn opcode_from_ublk(op: UblkOp) -> Option<OpCode> {
     }
 }
 
-fn response_status(resp: &Response, expected_len: usize) -> Result<i32> {
-    if resp.flags != 0 {
-        let errno = i32::try_from(resp.flags).unwrap_or(libc::EIO);
+fn response_status(resp: &Response, expected_len: usize, block_size: usize) -> Result<i32> {
+    if resp.status != 0 {
+        let errno = i32::from(resp.status);
         return Ok(-errno);
     }
-    let len = resp.byte_len as usize;
+    let len = resp.num_blocks as usize * block_size;
     i32::try_from(len)
         .or_else(|_| i32::try_from(expected_len))
         .map_err(|_| anyhow!("response length exceeds i32"))
@@ -729,55 +733,54 @@ async fn apply_config(
     }
     runtime.exports.clear();
 
-    match config.export() {
-        None => {
-            info!("CONFIG_EXPORTS requested zero exports");
-            runtime.state_store().replace_all(Vec::new());
-            if let Err(err) = runtime.state_store().persist() {
-                warn!(error = ?err, "failed to clear state file");
-            }
-            runtime.status().set_export_count(0).await;
-            Ok(())
+    let entries = config.entries();
+    if entries.is_empty() {
+        info!("CONFIG_EXPORTS requested zero exports");
+        runtime.state_store().replace_all(Vec::new());
+        if let Err(err) = runtime.state_store().persist() {
+            warn!(error = ?err, "failed to clear state file");
         }
-        Some(export) => {
-            let block_size = export.block_size as usize;
-            ensure!(
-                export.size_bytes != 0,
-                "CONFIG_EXPORTS size_bytes must be non-zero"
-            );
-            let blocks = export
-                .size_bytes
-                .checked_div(block_size as u64)
-                .context("size bytes smaller than block size")?;
-            ensure!(blocks > 0, "export size too small");
-            let _block_count =
-                usize::try_from(blocks).context("block count exceeds usize capacity")?;
-            let spec = ExportSpec {
-                block_size: export.block_size,
-                size_bytes: export.size_bytes,
-                flags: ExportFlags::empty(),
-            };
-            let controller_spec = spec.clone();
-            let record = PersistedExportRecord {
-                export_id: SINGLE_EXPORT_ID,
-                spec,
-                assigned_dev_id: None,
-            };
-            runtime.state_store().replace_all(vec![record]);
-            if let Err(err) = runtime.state_store().persist() {
-                warn!(error = ?err, "failed to write state store");
-            }
-            runtime.exports.insert(
-                SINGLE_EXPORT_ID,
-                ExportController::new(SINGLE_EXPORT_ID, controller_spec, ExportState::New),
-            );
-            runtime
-                .status()
-                .set_export_count(runtime.exports.len() as u32)
-                .await;
-            Ok(())
-        }
+        runtime.status().set_export_count(0).await;
+        return Ok(());
     }
+    if entries.len() > 1 {
+        warn!(count = entries.len(), "multi-export CONFIG_EXPORTS unsupported; using first entry");
+    }
+    let export = entries[0];
+    let block_size = export.block_size as usize;
+    ensure!(
+        export.size_bytes != 0,
+        "CONFIG_EXPORTS size_bytes must be non-zero"
+    );
+    let blocks = export
+        .size_bytes
+        .checked_div(block_size as u64)
+        .context("size bytes smaller than block size")?;
+    ensure!(blocks > 0, "export size too small");
+    let spec = ExportSpec {
+        block_size: export.block_size,
+        size_bytes: export.size_bytes,
+        flags: ExportFlags::empty(),
+    };
+    let controller_spec = spec.clone();
+    let record = PersistedExportRecord {
+        export_id: export.export_id,
+        spec,
+        assigned_dev_id: None,
+    };
+    runtime.state_store().replace_all(vec![record]);
+    if let Err(err) = runtime.state_store().persist() {
+        warn!(error = ?err, "failed to write state store");
+    }
+    runtime.exports.insert(
+        export.export_id,
+        ExportController::new(export.export_id, controller_spec, ExportState::New),
+    );
+    runtime
+        .status()
+        .set_export_count(runtime.exports.len() as u32)
+        .await;
+    Ok(())
 }
 
 struct GadgetGuard {

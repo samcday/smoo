@@ -8,7 +8,14 @@ use smoo_host_core::{
 };
 use smoo_host_rusb::{RusbControl, RusbTransport, RusbTransportConfig};
 use smoo_proto::SmooStatusV0;
-use std::{fmt, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    fs,
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{signal, sync::mpsc, time};
 use tracing::{debug, info, warn};
 
@@ -28,7 +35,7 @@ const RECONNECT_PAUSE: Duration = Duration::from_secs(1);
     about = "Host shim for smoo gadgets",
     long_about = "Host shim for smoo gadgets. By default all visible USB devices are scanned and the first interface matching the vendor triple 0xFF/0x53/0x4D is selected."
 )]
-#[command(group = ArgGroup::new("backing").args(["file", "device"]).required(true))]
+#[command(group = ArgGroup::new("backing").args(["files", "devices"]).required(true))]
 struct Args {
     /// Optional USB vendor ID filter (hex). Defaults to all vendors.
     #[arg(long, value_name = "HEX", value_parser = parse_hex_u16)]
@@ -36,12 +43,12 @@ struct Args {
     /// Optional USB product ID filter (hex). Defaults to all products.
     #[arg(long, value_name = "HEX", value_parser = parse_hex_u16)]
     product_id: Option<u16>,
-    /// Optional disk image backing file
-    #[arg(long, value_name = "PATH")]
-    file: Option<PathBuf>,
-    /// Optional block device backing file
-    #[arg(long, value_name = "PATH")]
-    device: Option<PathBuf>,
+    /// Disk image backing file(s). Repeatable for multiple exports.
+    #[arg(long = "file", value_name = "PATH")]
+    files: Vec<PathBuf>,
+    /// Raw block device path(s). Repeatable for multiple exports.
+    #[arg(long = "device", value_name = "PATH")]
+    devices: Vec<PathBuf>,
     /// Logical block size exposed through the gadget (bytes)
     #[arg(long, default_value_t = 512)]
     block_size: u32,
@@ -149,23 +156,15 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let source = SharedSource::new(open_source(&args).await.context("open block source")?);
-    let block_size = source.block_size();
-    let size_bytes = match source.total_blocks().await {
-        Ok(blocks) => blocks.checked_mul(block_size as u64).unwrap_or(0),
-        Err(err) => {
-            warn!(error = %err, "determine total blocks failed; advertising dynamic size");
-            0
-        }
-    };
+    let (sources, config_payload) =
+        open_sources(&args).await.context("open block sources")?;
     let mut expected_session_id = None;
     let mut has_connected = false;
     loop {
         match run_session(
             &args,
-            source.clone(),
-            block_size,
-            size_bytes,
+            sources.clone(),
+            &config_payload,
             &mut expected_session_id,
             has_connected,
         )
@@ -190,9 +189,8 @@ enum SessionEnd {
 
 async fn run_session(
     args: &Args,
-    source: SharedSource,
-    block_size: u32,
-    size_bytes: u64,
+    sources: BTreeMap<u32, SharedSource>,
+    config_payload: &ConfigExportsV0,
     expected_session_id: &mut Option<u64>,
     has_connected: bool,
 ) -> Result<SessionEnd> {
@@ -241,14 +239,12 @@ async fn run_session(
         minor = ident.minor,
         "gadget IDENT response"
     );
-    let config_payload = ConfigExportsV0::single_export(block_size, size_bytes);
     send_config_exports_v0(&control, &config_payload)
         .await
         .context("CONFIG_EXPORTS control transfer")?;
     info!(
-        block_size = block_size,
-        size_bytes = size_bytes,
-        "configured gadget export"
+        exports = config_payload.entries().len(),
+        "configured gadget exports"
     );
     let initial_status =
         match fetch_status_with_retry(&control, STATUS_RETRY_ATTEMPTS, STATUS_RETRY_INTERVAL).await
@@ -295,7 +291,7 @@ async fn run_session(
             let _ = heartbeat_tx.send(err);
         }
     });
-    let mut host = SmooHost::new(transport, source);
+    let mut host = SmooHost::new(transport, sources);
     host.record_ident(ident);
     info!(
         major = ident.major,
@@ -349,19 +345,6 @@ async fn run_session(
     let _ = heartbeat_task.await;
 
     Ok(outcome)
-}
-
-async fn open_source(args: &Args) -> Result<HostSource> {
-    let block_size = args.block_size;
-    match (&args.file, &args.device) {
-        (Some(path), None) => Ok(HostSource::File(
-            FileBlockSource::open(path, block_size).await?,
-        )),
-        (None, Some(path)) => Ok(HostSource::Device(
-            DeviceBlockSource::open(path, block_size).await?,
-        )),
-        _ => unreachable!("clap enforces mutually exclusive arguments"),
-    }
 }
 
 fn discover_device(args: &Args, log_scan: bool) -> Result<(rusb::DeviceHandle<rusb::Context>, u8)> {
@@ -509,6 +492,57 @@ impl EndpointBuilder {
             bulk_out,
         })
     }
+}
+
+async fn open_sources(
+    args: &Args,
+) -> Result<(BTreeMap<u32, SharedSource>, ConfigExportsV0)> {
+    let mut sources = BTreeMap::new();
+    let mut entries: Vec<smoo_proto::ConfigExport> = Vec::new();
+    let mut next_id: u32 = 1;
+
+    for path in &args.files {
+        let block_size = args.block_size;
+        let size_bytes = file_size_bytes(path)?;
+        let source = SharedSource::new(HostSource::File(
+            FileBlockSource::open(path, block_size).await?,
+        ));
+        sources.insert(next_id, source);
+        entries.push(smoo_proto::ConfigExport {
+            export_id: next_id,
+            block_size,
+            size_bytes,
+        });
+        next_id = next_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("export_id overflow"))?;
+    }
+
+    for path in &args.devices {
+        let block_size = args.block_size;
+        let size_bytes = file_size_bytes(path)?;
+        let source = SharedSource::new(HostSource::Device(
+            DeviceBlockSource::open(path, block_size).await?,
+        ));
+        sources.insert(next_id, source);
+        entries.push(smoo_proto::ConfigExport {
+            export_id: next_id,
+            block_size,
+            size_bytes,
+        });
+        next_id = next_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("export_id overflow"))?;
+    }
+
+    let payload = ConfigExportsV0::from_slice(&entries)
+        .map_err(|err| anyhow!("build CONFIG_EXPORTS payload: {err:?}"))?;
+    Ok((sources, payload))
+}
+
+fn file_size_bytes(path: &PathBuf) -> Result<u64> {
+    let meta = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    Ok(meta.len())
 }
 
 fn infer_interface_endpoints<T: UsbContext>(

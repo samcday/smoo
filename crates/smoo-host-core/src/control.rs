@@ -31,10 +31,10 @@ pub async fn send_config_exports_v0<T: ControlTransport>(
     let written = transport
         .control_out(CONFIG_EXPORTS_REQ_TYPE, CONFIG_EXPORTS_REQUEST, &data)
         .await?;
-    if written != ConfigExportsV0::ENCODED_LEN {
+    if written != data.len() {
         return Err(protocol_error(format!(
             "CONFIG_EXPORTS transfer truncated (expected {}, got {written})",
-            ConfigExportsV0::ENCODED_LEN
+            data.len()
         )));
     }
     Ok(())
@@ -65,10 +65,22 @@ mod tests {
 
     #[test]
     fn config_exports_single_encodes_fields() {
-        let payload = ConfigExportsV0::single_export(4096, 8192);
+        let mut entries = heapless::Vec::new();
+        entries
+            .push(smoo_proto::ConfigExport {
+                export_id: 5,
+                block_size: 4096,
+                size_bytes: 8192,
+            })
+            .unwrap();
+        let payload = ConfigExportsV0::new(entries).unwrap();
         let encoded = payload.encode();
-        assert_eq!(encoded.len(), ConfigExportsV0::ENCODED_LEN);
+        assert_eq!(
+            encoded.len(),
+            ConfigExportsV0::HEADER_LEN + ConfigExportsV0::ENTRY_LEN
+        );
         assert_eq!(&encoded[2..4], &[1, 0]);
+        assert_eq!(&encoded[8..12], &5u32.to_le_bytes());
         assert_eq!(&encoded[8..12], &4096u32.to_le_bytes());
         assert_eq!(&encoded[12..20], &8192u64.to_le_bytes());
     }

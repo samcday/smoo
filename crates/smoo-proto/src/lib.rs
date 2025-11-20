@@ -386,6 +386,15 @@ impl ConfigExportsV0 {
         &self.entries
     }
 
+    pub fn from_slice(entries: &[ConfigExport]) -> Result<Self> {
+        let mut vec: heapless::Vec<ConfigExport, 32> = heapless::Vec::new();
+        for entry in entries {
+            vec.push(*entry)
+                .map_err(|_| ProtoError::InvalidValue("too many exports"))?;
+        }
+        Self::new(vec)
+    }
+
     /// Serialize the payload to its wire representation.
     pub fn encode(
         &self,
