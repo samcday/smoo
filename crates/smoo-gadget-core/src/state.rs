@@ -1,9 +1,10 @@
-use super::*;
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
     fs, io,
     path::{Path, PathBuf},
 };
+
 const SNAPSHOT_VERSION: u32 = 0;
 
 #[derive(Clone)]
@@ -25,7 +26,7 @@ impl StateFile {
             Ok(data) => data,
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(err) => {
-                return Err(err).context(format!("read state file {}", self.path.display()))
+                return Err(err).context(format!("read state file {}", self.path.display()));
             }
         };
         let snapshot: StateSnapshot = serde_json::from_slice(&data).context("decode state file")?;
@@ -37,7 +38,7 @@ impl StateFile {
         Ok(Some(snapshot))
     }
 
-    pub fn store(&self, session_id: u64, exports: &[ExportState]) -> Result<()> {
+    pub fn store(&self, session_id: u64, exports: &[Export]) -> Result<()> {
         if let Some(dir) = self.path.parent() {
             fs::create_dir_all(dir).context(format!("create {}", dir.display()))?;
         }
@@ -62,9 +63,13 @@ impl StateFile {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExportState {
+pub struct Export {
     pub export_id: u32,
-    pub ublk_dev_id: u32,
+    /// Present when an existing ublk device is bound to this export (recovery).
+    #[serde(default)]
+    pub ublk_dev_id: Option<u32>,
+    pub block_size: u32,
+    pub block_count: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,7 +77,7 @@ pub struct StateSnapshot {
     pub version: u32,
     pub session_id: u64,
     #[serde(default)]
-    pub exports: Vec<ExportState>,
+    pub exports: Vec<Export>,
 }
 
 #[cfg(test)]
@@ -85,9 +90,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("state.json");
         let state_file = StateFile::new(path.clone());
-        let exports = vec![ExportState {
+        let exports = vec![Export {
             export_id: 0,
-            ublk_dev_id: 7,
+            ublk_dev_id: Some(7),
+            block_size: 4096,
+            block_count: 1024,
         }];
         state_file.store(42, &exports).unwrap();
         let loaded = state_file.load().unwrap().expect("snapshot");

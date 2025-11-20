@@ -17,10 +17,13 @@ use tokio::{
     task,
 };
 
+pub mod controllers;
 mod dma;
+pub mod state;
 
 use crate::dma::{FunctionfsDmaScratch, dmabuf_transfer_blocking};
 pub use smoo_proto::{ConfigExport, ConfigExportsV0};
+pub use state::{Export, StateFile, StateSnapshot};
 
 const USB_DIR_IN: u8 = 0x80;
 const USB_TYPE_VENDOR: u8 = 0x40;

@@ -1,9 +1,8 @@
-mod state;
-
 use anyhow::{anyhow, ensure, Context, Result};
 use clap::{Parser, ValueEnum};
 use rand::{rngs::OsRng, RngCore};
 use smoo_gadget_core::{
+    state::{Export, StateFile, StateSnapshot},
     ConfigExportsV0, ControlIo, DmaHeap, FunctionfsEndpoints, GadgetConfig, GadgetControl,
     GadgetStatusReport, SetupCommand, SetupPacket, SmooGadget,
 };
@@ -35,8 +34,6 @@ const SMOO_SUBCLASS: u8 = 0x53;
 const SMOO_PROTOCOL: u8 = 0x4D;
 const DEFAULT_MAX_IO_BYTES: usize = 4 * 1024 * 1024;
 const SINGLE_EXPORT_ID: u32 = 0;
-
-use state::{ExportState, StateFile, StateSnapshot};
 
 #[derive(Debug, Parser)]
 #[command(name = "smoo-gadget-cli")]
@@ -701,7 +698,15 @@ async fn attempt_recovery(
         dev_id = export_state.ublk_dev_id,
         "state file found, attempting ublk recovery"
     );
-    let cdev_path = format!("/dev/ublkc{}", export_state.ublk_dev_id);
+    let Some(dev_id) = export_state.ublk_dev_id else {
+        warn!("state file missing ublk_dev_id; clearing");
+        let _ = state_file.clear();
+        return Ok(RecoveryOutcome {
+            device: None,
+            session_valid: false,
+        });
+    };
+    let cdev_path = format!("/dev/ublkc{dev_id}");
     if !Path::new(&cdev_path).exists() {
         warn!(?cdev_path, "ublk device missing; removing state file");
         let _ = state_file.clear();
@@ -710,7 +715,7 @@ async fn attempt_recovery(
             session_valid: false,
         });
     }
-    match ublk.recover_existing_device(export_state.ublk_dev_id).await {
+    match ublk.recover_existing_device(dev_id).await {
         Ok(device) => {
             info!(
                 dev_id = export_state.ublk_dev_id,
@@ -729,7 +734,7 @@ async fn attempt_recovery(
                 "ublk recovery failed; removing state file"
             );
             if Path::new(&cdev_path).exists() {
-                if let Err(clean_err) = ublk.force_remove_device(export_state.ublk_dev_id).await {
+                if let Err(clean_err) = ublk.force_remove_device(dev_id).await {
                     warn!(
                         dev_id = export_state.ublk_dev_id,
                         error = ?clean_err,
@@ -816,9 +821,12 @@ async fn apply_config(
                         .context("complete ublk recovery")?;
                     runtime.status().set_export_count(1).await;
                     if let Some(state_file) = runtime.state_file() {
-                        let export_state = ExportState {
+                        let export_state = Export {
                             export_id: SINGLE_EXPORT_ID,
-                            ublk_dev_id: existing.dev_id(),
+                            ublk_dev_id: Some(existing.dev_id()),
+                            block_size: u32::try_from(block_size)
+                                .context("block size exceeds u32")?,
+                            block_count: block_count as u64,
                         };
                         let session_id = runtime.status().session_id().await;
                         if let Err(err) = state_file.store(session_id, &[export_state]) {
@@ -847,9 +855,11 @@ async fn apply_config(
                 .context("setup ublk device from CONFIG_EXPORTS")?;
             runtime.status().set_export_count(1).await;
             if let Some(state_file) = runtime.state_file() {
-                let export_state = ExportState {
+                let export_state = Export {
                     export_id: SINGLE_EXPORT_ID,
-                    ublk_dev_id: new_device.dev_id(),
+                    ublk_dev_id: Some(new_device.dev_id()),
+                    block_size: u32::try_from(block_size).context("block size exceeds u32")?,
+                    block_count: block_count as u64,
                 };
                 let session_id = runtime.status().session_id().await;
                 if let Err(err) = state_file.store(session_id, &[export_state]) {
