@@ -259,10 +259,7 @@ async fn reconcile_exports(ublk: &mut SmooUblk, runtime: &mut RuntimeState) -> R
         ..
     } = runtime;
     let tunables = *tunables;
-    for controller in exports
-        .values_mut()
-        .filter(|ctrl| ctrl.needs_reconcile())
-    {
+    for controller in exports.values_mut().filter(|ctrl| ctrl.needs_reconcile()) {
         let mut cx = ExportReconcileContext {
             ublk,
             state_store,
@@ -284,10 +281,7 @@ async fn run_event_loop(
 
     let mut io_error = None;
     loop {
-        let reconcile_needed = runtime
-            .exports
-            .values()
-            .any(|ctrl| ctrl.needs_reconcile());
+        let reconcile_needed = runtime.exports.values().any(|ctrl| ctrl.needs_reconcile());
         if reconcile_needed {
             reconcile_exports(ublk, &mut runtime).await?;
         }
@@ -298,68 +292,67 @@ async fn run_event_loop(
             .count() as u32;
         runtime.status().set_export_count(active_count).await;
 
-        enum Event {
-            Shutdown,
-            Control(Option<ControlMessage>),
-            Io(u32, anyhow::Result<UblkIoRequest>),
-        }
-
-        let active_export = runtime
-            .exports
-            .iter()
-            .find_map(|(id, ctrl)| ctrl.device().is_some().then_some(*id));
-
-        let event = if let Some(export_id) = active_export {
-            let device = runtime
-                .exports
-                .get(&export_id)
-                .and_then(|ctrl| ctrl.device())
-                .expect("device present");
-            let next_io = device.next_io();
-            tokio::pin!(next_io);
-            tokio::select! {
-                _ = &mut shutdown => Event::Shutdown,
-                msg = control_rx.recv() => Event::Control(msg),
-                req = &mut next_io => Event::Io(export_id, req),
-            }
-        } else {
-            tokio::select! {
-                _ = &mut shutdown => Event::Shutdown,
-                msg = control_rx.recv() => Event::Control(msg),
-            }
-        };
-
-        match event {
-            Event::Shutdown => {
-                info!("shutdown signal received");
-                break;
-            }
-            Event::Control(Some(msg)) => {
-                process_control_message(msg, ublk, &mut runtime).await?;
-            }
-            Event::Control(None) => break,
-            Event::Io(export_id, req) => {
-                let req = match req {
-                    Ok(req) => req,
-                    Err(err) => {
-                        io_error = Some(err.context("receive ublk io"));
-                        break;
+        let mut polled = false;
+        let mut pending_control: Option<ControlMessage> = None;
+        'io: for (_id, controller) in runtime.exports.iter_mut() {
+            if let Some((kind, dev_id, device)) = controller.take_device_for_io() {
+                polled = true;
+                let event = tokio::select! {
+                    _ = &mut shutdown => {
+                        controller.restore_device_after_io(kind, dev_id, device);
+                        break 'io;
+                    }
+                    msg = control_rx.recv() => {
+                        controller.restore_device_after_io(kind, dev_id, device);
+                        (msg, kind, dev_id, None)
+                    }
+                    req = device.next_io() => {
+                        (None, kind, dev_id, Some((req, device)))
                     }
                 };
-                if let Some(device) = runtime
-                    .exports
-                    .get(&export_id)
-                    .and_then(|ctrl| ctrl.device())
-                {
-                    if let Err(err) = handle_request(&mut gadget, device, req).await {
-                        io_error = Some(err);
+                match event {
+                    (Some(msg), _kind, _dev_id, _) => {
+                        pending_control = Some(msg);
+                        break 'io;
+                    }
+                    (None, kind, dev_id, Some((req_res, device))) => match req_res {
+                        Ok(req) => {
+                            if let Err(err) = handle_request(&mut gadget, &device, req).await {
+                                controller.fail_after_io(dev_id, format!("{err:#}"));
+                                io_error = Some(err);
+                                break 'io;
+                            }
+                            controller.restore_device_after_io(kind, dev_id, device);
+                        }
+                        Err(err) => {
+                            controller.fail_after_io(dev_id, format!("{err:#}"));
+                            controller.restore_device_after_io(kind, dev_id, device);
+                            io_error = Some(err.context("receive ublk io"));
+                            break 'io;
+                        }
+                    },
+                    _ => {}
+                }
+            }
+        }
+
+        if let Some(msg) = pending_control {
+            process_control_message(msg, ublk, &mut runtime).await?;
+            continue;
+        }
+
+        if !polled {
+            tokio::select! {
+                _ = &mut shutdown => {
+                    info!("shutdown signal received");
+                    break;
+                }
+                msg = control_rx.recv() => {
+                    if let Some(msg) = msg {
+                        process_control_message(msg, ublk, &mut runtime).await?;
+                    } else {
                         break;
                     }
-                } else {
-                    warn!(
-                        export_id,
-                        "received ublk io for export that no longer exists"
-                    );
                 }
             }
         }

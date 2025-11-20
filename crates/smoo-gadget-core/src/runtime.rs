@@ -1,5 +1,5 @@
 use crate::{ExportSpec, PersistedExportRecord, StateStore};
-use anyhow::{anyhow, ensure, Result};
+use anyhow::{Result, anyhow, ensure};
 use smoo_gadget_ublk::SmooUblk;
 use smoo_gadget_ublk::SmooUblkDevice;
 use std::collections::HashMap;
@@ -34,6 +34,10 @@ pub enum ExportState {
         dev_id: u32,
         device: SmooUblkDevice,
     },
+    IoInFlight {
+        dev_id: u32,
+        kind: IoStateKind,
+    },
     Failed {
         dev_id: Option<u32>,
         device: Option<SmooUblkDevice>,
@@ -41,6 +45,13 @@ pub enum ExportState {
         retry_at: Instant,
     },
     Deleted,
+}
+
+#[derive(Clone, Copy)]
+pub enum IoStateKind {
+    Recovering,
+    Starting,
+    Online,
 }
 
 pub struct ExportReconcileContext<'a> {
@@ -131,8 +142,69 @@ impl ExportController {
         result
     }
 
+    pub fn take_device_for_io(&mut self) -> Option<(IoStateKind, u32, SmooUblkDevice)> {
+        let mut result = None;
+        self.state = match std::mem::replace(&mut self.state, ExportState::New) {
+            ExportState::Recovering { dev_id, device } => {
+                result = Some((IoStateKind::Recovering, dev_id, device));
+                ExportState::IoInFlight {
+                    dev_id,
+                    kind: IoStateKind::Recovering,
+                }
+            }
+            ExportState::Starting { dev_id, device } => {
+                result = Some((IoStateKind::Starting, dev_id, device));
+                ExportState::IoInFlight {
+                    dev_id,
+                    kind: IoStateKind::Starting,
+                }
+            }
+            ExportState::Online { dev_id, device } => {
+                result = Some((IoStateKind::Online, dev_id, device));
+                ExportState::IoInFlight {
+                    dev_id,
+                    kind: IoStateKind::Online,
+                }
+            }
+            ExportState::ShuttingDown { dev_id, device } => {
+                result = Some((IoStateKind::Online, dev_id, device));
+                ExportState::IoInFlight {
+                    dev_id,
+                    kind: IoStateKind::Online,
+                }
+            }
+            other => other,
+        };
+        result
+    }
+
+    pub fn restore_device_after_io(
+        &mut self,
+        kind: IoStateKind,
+        dev_id: u32,
+        device: SmooUblkDevice,
+    ) {
+        self.state = match kind {
+            IoStateKind::Recovering => ExportState::Recovering { dev_id, device },
+            IoStateKind::Starting => ExportState::Starting { dev_id, device },
+            IoStateKind::Online => ExportState::Online { dev_id, device },
+        };
+    }
+
+    pub fn fail_after_io(&mut self, dev_id: u32, err: String) {
+        self.state = ExportState::Failed {
+            dev_id: Some(dev_id),
+            device: None,
+            last_error: err,
+            retry_at: Instant::now() + self.retry_backoff,
+        };
+    }
+
     pub fn needs_reconcile(&self) -> bool {
-        !matches!(self.state, ExportState::Online { .. })
+        !matches!(
+            self.state,
+            ExportState::Online { .. } | ExportState::IoInFlight { .. }
+        )
     }
 
     pub async fn reconcile(&mut self, cx: &mut ExportReconcileContext<'_>) -> Result<()> {
@@ -203,6 +275,11 @@ impl ExportController {
                     .ok();
                 cx.state_store.persist().ok();
                 self.state = ExportState::Deleted;
+            }
+            ExportState::IoInFlight { dev_id, kind } => {
+                // If reconcile runs while a device is temporarily out for IO, keep
+                // the placeholder so the main loop can restore it.
+                self.state = ExportState::IoInFlight { dev_id, kind };
             }
             ExportState::Failed {
                 dev_id,
