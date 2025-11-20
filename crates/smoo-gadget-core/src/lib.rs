@@ -1,9 +1,9 @@
 use anyhow::{Context, Result, anyhow, ensure};
 use dma_heap::HeapKind;
 use smoo_proto::{
-    IDENT_LEN, IDENT_REQUEST, Ident, RESPONSE_LEN, Request, Response,
-    SMOO_STATUS_FLAG_EXPORT_ACTIVE, SMOO_STATUS_LEN, SMOO_STATUS_REQ_TYPE, SMOO_STATUS_REQUEST,
-    SmooStatusV0,
+    CONFIG_EXPORTS_REQ_TYPE, CONFIG_EXPORTS_REQUEST, IDENT_LEN, IDENT_REQUEST, Ident, RESPONSE_LEN,
+    Request, Response, SMOO_STATUS_FLAG_EXPORT_ACTIVE, SMOO_STATUS_LEN, SMOO_STATUS_REQ_TYPE,
+    SMOO_STATUS_REQUEST, SmooStatusV0,
 };
 use std::{
     cmp,
@@ -20,85 +20,12 @@ use tokio::{
 mod dma;
 
 use crate::dma::{FunctionfsDmaScratch, dmabuf_transfer_blocking};
+pub use smoo_proto::{ConfigExport, ConfigExportsV0};
 
 const USB_DIR_IN: u8 = 0x80;
 const USB_TYPE_VENDOR: u8 = 0x40;
 const USB_RECIP_INTERFACE: u8 = 0x01;
 const SMOO_REQ_TYPE: u8 = USB_DIR_IN | USB_TYPE_VENDOR | USB_RECIP_INTERFACE;
-/// bmRequestType for CONFIG_EXPORTS (OUT/vendor/interface).
-pub const SMOO_CONFIG_REQ_TYPE: u8 = USB_TYPE_VENDOR | USB_RECIP_INTERFACE;
-/// Vendor control bRequest for CONFIG_EXPORTS.
-pub const CONFIG_EXPORTS_REQUEST: u8 = 0x02;
-
-/// Parsed representation of the v0 CONFIG_EXPORTS payload (single export max).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ConfigExportsV0 {
-    export: Option<SingleExport>,
-}
-
-impl ConfigExportsV0 {
-    /// Number of bytes in the encoded payload.
-    pub const ENCODED_LEN: usize = 28;
-
-    pub fn parse(data: &[u8]) -> Result<Self> {
-        ensure!(
-            data.len() == Self::ENCODED_LEN,
-            "CONFIG_EXPORTS payload must be {} bytes",
-            Self::ENCODED_LEN
-        );
-        let version = u16::from_le_bytes([data[0], data[1]]);
-        ensure!(version == 0, "unsupported CONFIG_EXPORTS version {version}");
-        let count = u16::from_le_bytes([data[2], data[3]]);
-        ensure!(count <= 1, "CONFIG_EXPORTS count must be 0 or 1");
-        let flags = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-        ensure!(flags == 0, "CONFIG_EXPORTS header flags must be zero");
-        let block_size = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-        let size_bytes = u64::from_le_bytes([
-            data[12], data[13], data[14], data[15], data[16], data[17], data[18], data[19],
-        ]);
-        let reserved0 = u32::from_le_bytes([data[20], data[21], data[22], data[23]]);
-        let reserved1 = u32::from_le_bytes([data[24], data[25], data[26], data[27]]);
-        ensure!(
-            reserved0 == 0 && reserved1 == 0,
-            "reserved fields must be zero"
-        );
-        let export = if count == 0 {
-            None
-        } else {
-            ensure!(
-                block_size.is_power_of_two(),
-                "block size must be power-of-two"
-            );
-            ensure!(
-                (512..=65536).contains(&block_size),
-                "block size {block_size} out of supported range"
-            );
-            if size_bytes != 0 {
-                ensure!(
-                    size_bytes.is_multiple_of(block_size as u64),
-                    "size_bytes must be multiple of block_size"
-                );
-            }
-            Some(SingleExport {
-                block_size,
-                size_bytes,
-            })
-        };
-        Ok(Self { export })
-    }
-
-    /// Returns the desired export, if any.
-    pub fn export(&self) -> Option<SingleExport> {
-        self.export.clone()
-    }
-}
-
-/// Parameters describing a single export entry in v0 CONFIG_EXPORTS payloads.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SingleExport {
-    pub block_size: u32,
-    pub size_bytes: u64,
-}
 
 const SETUP_STAGE_LEN: usize = 8;
 const FUNCTIONFS_EVENT_SIZE: usize = SETUP_STAGE_LEN + 4;
@@ -541,7 +468,8 @@ impl GadgetControl {
             return Ok(None);
         }
 
-        if setup.request() == CONFIG_EXPORTS_REQUEST && setup.request_type() == SMOO_CONFIG_REQ_TYPE
+        if setup.request() == CONFIG_EXPORTS_REQUEST
+            && setup.request_type() == CONFIG_EXPORTS_REQ_TYPE
         {
             ensure!(
                 setup.length() as usize == ConfigExportsV0::ENCODED_LEN,
@@ -549,7 +477,8 @@ impl GadgetControl {
             );
             let mut buf = [0u8; ConfigExportsV0::ENCODED_LEN];
             io.read_out(&mut buf).await.context("read CONFIG_EXPORTS")?;
-            let payload = ConfigExportsV0::parse(&buf).context("parse CONFIG_EXPORTS payload")?;
+            let payload = ConfigExportsV0::decode(buf)
+                .map_err(|err| anyhow!("parse CONFIG_EXPORTS payload: {err}"))?;
             return Ok(Some(SetupCommand::Config(payload)));
         }
 
@@ -749,7 +678,7 @@ mod tests {
     #[test]
     fn config_exports_none() {
         let payload = [0u8; ConfigExportsV0::ENCODED_LEN];
-        let parsed = ConfigExportsV0::parse(&payload).expect("parse");
+        let parsed = ConfigExportsV0::decode(payload).expect("parse");
         assert!(parsed.export().is_none());
     }
 
@@ -759,7 +688,7 @@ mod tests {
         payload[2] = 1;
         payload[8..12].copy_from_slice(&4096u32.to_le_bytes());
         payload[12..20].copy_from_slice(&(4096u64 * 8).to_le_bytes());
-        let parsed = ConfigExportsV0::parse(&payload).expect("parse");
+        let parsed = ConfigExportsV0::decode(payload).expect("parse");
         let export = parsed.export().expect("export");
         assert_eq!(export.block_size, 4096);
         assert_eq!(export.size_bytes, 4096 * 8);
@@ -769,6 +698,6 @@ mod tests {
     fn config_exports_invalid_flags() {
         let mut payload = [0u8; ConfigExportsV0::ENCODED_LEN];
         payload[4] = 1;
-        assert!(ConfigExportsV0::parse(&payload).is_err());
+        assert!(ConfigExportsV0::decode(payload).is_err());
     }
 }

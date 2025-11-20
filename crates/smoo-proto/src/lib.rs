@@ -12,6 +12,10 @@ pub const IDENT_REQUEST: u8 = 0x01;
 pub const REQUEST_LEN: usize = 20;
 /// Number of bytes in an encoded [`Response`] control message.
 pub const RESPONSE_LEN: usize = 20;
+/// bmRequestType for CONFIG_EXPORTS (host → gadget, vendor, interface, OUT).
+pub const CONFIG_EXPORTS_REQ_TYPE: u8 = 0x41;
+/// Vendor control bRequest used to apply CONFIG_EXPORTS.
+pub const CONFIG_EXPORTS_REQUEST: u8 = 0x02;
 /// Vendor control bRequest used to fetch [`SmooStatusV0`].
 pub const SMOO_STATUS_REQUEST: u8 = 0x03;
 /// bmRequestType for SMOO status/heartbeat (device → host, vendor, interface).
@@ -34,6 +38,8 @@ pub enum ProtoError {
     InvalidMagic,
     /// Payload or struct version mismatch.
     InvalidVersion { expected: u16, actual: u16 },
+    /// Field value failed validation.
+    InvalidValue(&'static str),
 }
 
 impl fmt::Display for ProtoError {
@@ -48,6 +54,7 @@ impl fmt::Display for ProtoError {
                 f,
                 "unsupported payload version {actual}, expected {expected}"
             ),
+            ProtoError::InvalidValue(field) => write!(f, "invalid field value: {field}"),
         }
     }
 }
@@ -311,6 +318,134 @@ impl SmooStatusV0 {
     }
 }
 
+/// Encoded CONFIG_EXPORTS payload for protocol version 0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConfigExportsV0 {
+    export: Option<ConfigExport>,
+}
+
+impl ConfigExportsV0 {
+    /// Number of bytes in the encoded payload.
+    pub const ENCODED_LEN: usize = 28;
+    /// Supported CONFIG_EXPORTS payload version.
+    pub const VERSION: u16 = 0;
+
+    /// Encode an empty export set.
+    pub const fn zero_exports() -> Self {
+        Self { export: None }
+    }
+
+    /// Encode a single export entry.
+    pub const fn single_export(block_size: u32, size_bytes: u64) -> Self {
+        Self {
+            export: Some(ConfigExport {
+                block_size,
+                size_bytes,
+            }),
+        }
+    }
+
+    /// Returns the desired export entry, if any.
+    pub const fn export(&self) -> Option<ConfigExport> {
+        self.export
+    }
+
+    /// Serialize the payload to its fixed-width wire representation.
+    pub fn encode(self) -> [u8; Self::ENCODED_LEN] {
+        let mut buf = [0u8; Self::ENCODED_LEN];
+        buf[0..2].copy_from_slice(&Self::VERSION.to_le_bytes());
+        if let Some(export) = self.export {
+            buf[2..4].copy_from_slice(&1u16.to_le_bytes());
+            buf[8..12].copy_from_slice(&export.block_size.to_le_bytes());
+            buf[12..20].copy_from_slice(&export.size_bytes.to_le_bytes());
+        }
+        buf
+    }
+
+    /// Decode a CONFIG_EXPORTS payload.
+    pub fn decode(bytes: [u8; Self::ENCODED_LEN]) -> Result<Self> {
+        Self::try_from(bytes.as_slice())
+    }
+}
+
+impl TryFrom<&[u8]> for ConfigExportsV0 {
+    type Error = ProtoError;
+
+    fn try_from(value: &[u8]) -> Result<Self> {
+        if value.len() != Self::ENCODED_LEN {
+            return Err(ProtoError::InvalidLength {
+                expected: Self::ENCODED_LEN,
+                actual: value.len(),
+            });
+        }
+        let mut data = [0u8; Self::ENCODED_LEN];
+        data.copy_from_slice(value);
+        let version = u16::from_le_bytes([data[0], data[1]]);
+        if version != Self::VERSION {
+            return Err(ProtoError::InvalidVersion {
+                expected: Self::VERSION,
+                actual: version,
+            });
+        }
+        let count = u16::from_le_bytes([data[2], data[3]]);
+        if count > 1 {
+            return Err(ProtoError::InvalidValue(
+                "CONFIG_EXPORTS count must be 0 or 1",
+            ));
+        }
+        let flags = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+        if flags != 0 {
+            return Err(ProtoError::InvalidValue(
+                "CONFIG_EXPORTS header flags must be zero",
+            ));
+        }
+        let reserved0 = u32::from_le_bytes([data[20], data[21], data[22], data[23]]);
+        let reserved1 = u32::from_le_bytes([data[24], data[25], data[26], data[27]]);
+        if reserved0 != 0 || reserved1 != 0 {
+            return Err(ProtoError::InvalidValue(
+                "CONFIG_EXPORTS reserved fields must be zero",
+            ));
+        }
+        let export = if count == 0 {
+            None
+        } else {
+            let block_size = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+            let size_bytes = u64::from_le_bytes([
+                data[12], data[13], data[14], data[15], data[16], data[17], data[18], data[19],
+            ]);
+            Some(validate_export(block_size, size_bytes)?)
+        };
+        Ok(Self { export })
+    }
+}
+
+/// Parameters describing a single export entry in v0 CONFIG_EXPORTS payloads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConfigExport {
+    pub block_size: u32,
+    pub size_bytes: u64,
+}
+
+fn validate_export(block_size: u32, size_bytes: u64) -> Result<ConfigExport> {
+    if !block_size.is_power_of_two() {
+        return Err(ProtoError::InvalidValue("block size must be power-of-two"));
+    }
+    if !(512..=65536).contains(&block_size) {
+        return Err(ProtoError::InvalidValue(
+            "block size out of supported range",
+        ));
+    }
+    if size_bytes != 0 && !size_bytes.is_multiple_of(block_size as u64) {
+        return Err(ProtoError::InvalidValue(
+            "size_bytes must be multiple of block_size",
+        ));
+    }
+    Ok(ConfigExport {
+        block_size,
+        size_bytes,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,6 +509,44 @@ mod tests {
                 expected: 20,
                 actual: 19
             })
+        ));
+    }
+
+    #[test]
+    fn config_exports_zero_round_trip() {
+        let payload = ConfigExportsV0::zero_exports();
+        let encoded = payload.encode();
+        let decoded = ConfigExportsV0::decode(encoded).unwrap();
+        assert_eq!(decoded.export(), None);
+    }
+
+    #[test]
+    fn config_exports_single_round_trip() {
+        let payload = ConfigExportsV0::single_export(4096, 4096 * 8);
+        let encoded = payload.encode();
+        let decoded = ConfigExportsV0::decode(encoded).unwrap();
+        let export = decoded.export().unwrap();
+        assert_eq!(export.block_size, 4096);
+        assert_eq!(export.size_bytes, 4096 * 8);
+    }
+
+    #[test]
+    fn config_exports_invalid_flags() {
+        let mut encoded = ConfigExportsV0::zero_exports().encode();
+        encoded[4] = 1;
+        assert!(matches!(
+            ConfigExportsV0::decode(encoded),
+            Err(ProtoError::InvalidValue(_))
+        ));
+    }
+
+    #[test]
+    fn config_exports_invalid_block_size() {
+        let mut encoded = ConfigExportsV0::single_export(0, 0).encode();
+        encoded[8..12].copy_from_slice(&500u32.to_le_bytes());
+        assert!(matches!(
+            ConfigExportsV0::decode(encoded),
+            Err(ProtoError::InvalidValue(_))
         ));
     }
 }

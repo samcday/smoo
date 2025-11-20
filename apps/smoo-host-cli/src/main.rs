@@ -3,7 +3,7 @@ use clap::{ArgGroup, Parser};
 use rusb::{Direction, TransferType, UsbContext};
 use smoo_host_blocksources::{DeviceBlockSource, FileBlockSource};
 use smoo_host_core::{
-    control::{fetch_ident, read_status, send_config_exports_v0, ConfigExportsV0Payload},
+    control::{fetch_ident, read_status, send_config_exports_v0, ConfigExportsV0},
     BlockSource, BlockSourceResult, HostErrorKind, SmooHost, TransportError, TransportErrorKind,
 };
 use smoo_host_rusb::{RusbControl, RusbTransport, RusbTransportConfig};
@@ -241,7 +241,7 @@ async fn run_session(
         minor = ident.minor,
         "gadget IDENT response"
     );
-    let config_payload = ConfigExportsV0Payload::single_export(block_size, size_bytes);
+    let config_payload = ConfigExportsV0::single_export(block_size, size_bytes);
     send_config_exports_v0(&control, &config_payload)
         .await
         .context("CONFIG_EXPORTS control transfer")?;

@@ -1,7 +1,7 @@
 use crate::{
     BlockSource, BlockSourceError, BlockSourceErrorKind, Transport, TransportError,
     TransportErrorKind, TransportResult,
-    control::{ConfigExportsV0Payload, fetch_ident, send_config_exports_v0},
+    control::{ConfigExportsV0, fetch_ident, send_config_exports_v0},
 };
 use alloc::{
     string::{String, ToString},
@@ -121,15 +121,12 @@ where
         block_size: u32,
         size_bytes: u64,
     ) -> HostResult<()> {
-        let payload = ConfigExportsV0Payload::single_export(block_size, size_bytes);
+        let payload = ConfigExportsV0::single_export(block_size, size_bytes);
         self.configure_exports_v0(&payload).await
     }
 
     /// Send an explicit v0 CONFIG_EXPORTS payload.
-    pub async fn configure_exports_v0(
-        &mut self,
-        payload: &ConfigExportsV0Payload,
-    ) -> HostResult<()> {
+    pub async fn configure_exports_v0(&mut self, payload: &ConfigExportsV0) -> HostResult<()> {
         send_config_exports_v0(&self.transport, payload).await?;
         Ok(())
     }

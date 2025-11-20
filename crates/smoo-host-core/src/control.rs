@@ -1,56 +1,12 @@
 use crate::{ControlTransport, TransportError, TransportErrorKind, TransportResult};
 use smoo_proto::{
-    IDENT_LEN, IDENT_REQUEST, Ident, SMOO_STATUS_LEN, SMOO_STATUS_REQ_TYPE, SMOO_STATUS_REQUEST,
-    SmooStatusV0,
+    CONFIG_EXPORTS_REQ_TYPE, CONFIG_EXPORTS_REQUEST, IDENT_LEN, IDENT_REQUEST, Ident,
+    SMOO_STATUS_LEN, SMOO_STATUS_REQ_TYPE, SMOO_STATUS_REQUEST, SmooStatusV0,
 };
 
+pub use smoo_proto::ConfigExportsV0;
+
 const IDENT_REQ_TYPE: u8 = 0xC1;
-const CONFIG_REQ_TYPE: u8 = 0x41;
-const CONFIG_EXPORTS_REQUEST: u8 = 0x02;
-
-/// Payload for CONFIG_EXPORTS v0 requests.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ConfigExportsV0Payload {
-    count: u16,
-    block_size: u32,
-    size_bytes: u64,
-}
-
-impl ConfigExportsV0Payload {
-    /// Number of bytes in the encoded CONFIG_EXPORTS v0 payload.
-    pub const ENCODED_LEN: usize = 28;
-
-    /// Encode a payload with no exports configured.
-    pub const fn zero_exports() -> Self {
-        Self {
-            count: 0,
-            block_size: 0,
-            size_bytes: 0,
-        }
-    }
-
-    /// Encode a payload with a single export.
-    pub const fn single_export(block_size: u32, size_bytes: u64) -> Self {
-        Self {
-            count: 1,
-            block_size,
-            size_bytes,
-        }
-    }
-
-    /// Encode the payload into the protocol wire format.
-    pub fn encode(&self) -> [u8; Self::ENCODED_LEN] {
-        let mut buf = [0u8; Self::ENCODED_LEN];
-        buf[0..2].copy_from_slice(&0u16.to_le_bytes());
-        buf[2..4].copy_from_slice(&self.count.to_le_bytes());
-        buf[4..8].copy_from_slice(&0u32.to_le_bytes());
-        buf[8..12].copy_from_slice(&self.block_size.to_le_bytes());
-        buf[12..20].copy_from_slice(&self.size_bytes.to_le_bytes());
-        buf[20..24].copy_from_slice(&0u32.to_le_bytes());
-        buf[24..28].copy_from_slice(&0u32.to_le_bytes());
-        buf
-    }
-}
 
 /// Execute the IDENT control transfer and decode the gadget's response.
 pub async fn fetch_ident<T: ControlTransport>(transport: &T) -> TransportResult<Ident> {
@@ -69,16 +25,16 @@ pub async fn fetch_ident<T: ControlTransport>(transport: &T) -> TransportResult<
 /// Send a v0 CONFIG_EXPORTS payload to the gadget.
 pub async fn send_config_exports_v0<T: ControlTransport>(
     transport: &T,
-    payload: &ConfigExportsV0Payload,
+    payload: &ConfigExportsV0,
 ) -> TransportResult<()> {
     let data = payload.encode();
     let written = transport
-        .control_out(CONFIG_REQ_TYPE, CONFIG_EXPORTS_REQUEST, &data)
+        .control_out(CONFIG_EXPORTS_REQ_TYPE, CONFIG_EXPORTS_REQUEST, &data)
         .await?;
-    if written != ConfigExportsV0Payload::ENCODED_LEN {
+    if written != ConfigExportsV0::ENCODED_LEN {
         return Err(protocol_error(format!(
             "CONFIG_EXPORTS transfer truncated (expected {}, got {written})",
-            ConfigExportsV0Payload::ENCODED_LEN
+            ConfigExportsV0::ENCODED_LEN
         )));
     }
     Ok(())
@@ -105,13 +61,13 @@ fn protocol_error(message: impl Into<String>) -> TransportError {
 
 #[cfg(test)]
 mod tests {
-    use super::ConfigExportsV0Payload;
+    use super::ConfigExportsV0;
 
     #[test]
     fn config_exports_single_encodes_fields() {
-        let payload = ConfigExportsV0Payload::single_export(4096, 8192);
+        let payload = ConfigExportsV0::single_export(4096, 8192);
         let encoded = payload.encode();
-        assert_eq!(encoded.len(), ConfigExportsV0Payload::ENCODED_LEN);
+        assert_eq!(encoded.len(), ConfigExportsV0::ENCODED_LEN);
         assert_eq!(&encoded[2..4], &[1, 0]);
         assert_eq!(&encoded[8..12], &4096u32.to_le_bytes());
         assert_eq!(&encoded[12..20], &8192u64.to_le_bytes());
