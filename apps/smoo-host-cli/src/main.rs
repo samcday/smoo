@@ -1,6 +1,7 @@
 use anyhow::{anyhow, ensure, Context, Result};
 use clap::{ArgGroup, Parser};
 use rusb::{Direction, TransferType, UsbContext};
+use smoo_host_blocksource_http::HttpBlockSource;
 use smoo_host_blocksources::{DeviceBlockSource, FileBlockSource};
 use smoo_host_core::{
     control::{fetch_ident, read_status, send_config_exports_v0, ConfigExportsV0},
@@ -28,7 +29,7 @@ const RECONNECT_PAUSE: Duration = Duration::from_secs(1);
     about = "Host shim for smoo gadgets",
     long_about = "Host shim for smoo gadgets. By default all visible USB devices are scanned and the first interface matching the vendor triple 0xFF/0x53/0x4D is selected."
 )]
-#[command(group = ArgGroup::new("backing").args(["files", "devices"]).required(true))]
+#[command(group = ArgGroup::new("backing").args(["files", "devices", "http"]).required(true))]
 struct Args {
     /// Optional USB vendor ID filter (hex). Defaults to all vendors.
     #[arg(long, value_name = "HEX", value_parser = parse_hex_u16)]
@@ -42,6 +43,12 @@ struct Args {
     /// Raw block device path(s). Repeatable for multiple exports.
     #[arg(long = "device", value_name = "PATH")]
     devices: Vec<PathBuf>,
+    /// HTTP backing image(s). Repeatable; must be absolute URLs.
+    #[arg(long = "http", value_name = "URL")]
+    http: Vec<String>,
+    /// Optional size overrides (bytes) for HTTP backings, matched by position.
+    #[arg(long = "http-size-bytes", value_name = "BYTES")]
+    http_sizes: Vec<u64>,
     /// Logical block size exposed through the gadget (bytes)
     #[arg(long, default_value_t = 512)]
     block_size: u32,
@@ -53,6 +60,7 @@ struct Args {
 enum HostSource {
     File(FileBlockSource),
     Device(DeviceBlockSource),
+    Http(HttpBlockSource),
 }
 
 #[derive(Clone)]
@@ -74,6 +82,7 @@ impl BlockSource for HostSource {
         match self {
             HostSource::File(inner) => inner.block_size(),
             HostSource::Device(inner) => inner.block_size(),
+            HostSource::Http(inner) => inner.block_size(),
         }
     }
 
@@ -81,6 +90,7 @@ impl BlockSource for HostSource {
         match self {
             HostSource::File(inner) => inner.total_blocks().await,
             HostSource::Device(inner) => inner.total_blocks().await,
+            HostSource::Http(inner) => inner.total_blocks().await,
         }
     }
 
@@ -88,6 +98,7 @@ impl BlockSource for HostSource {
         match self {
             HostSource::File(inner) => inner.read_blocks(lba, buf).await,
             HostSource::Device(inner) => inner.read_blocks(lba, buf).await,
+            HostSource::Http(inner) => inner.read_blocks(lba, buf).await,
         }
     }
 
@@ -95,6 +106,7 @@ impl BlockSource for HostSource {
         match self {
             HostSource::File(inner) => inner.write_blocks(lba, buf).await,
             HostSource::Device(inner) => inner.write_blocks(lba, buf).await,
+            HostSource::Http(inner) => inner.write_blocks(lba, buf).await,
         }
     }
 
@@ -102,6 +114,7 @@ impl BlockSource for HostSource {
         match self {
             HostSource::File(inner) => inner.flush().await,
             HostSource::Device(inner) => inner.flush().await,
+            HostSource::Http(inner) => inner.flush().await,
         }
     }
 
@@ -109,6 +122,7 @@ impl BlockSource for HostSource {
         match self {
             HostSource::File(inner) => inner.discard(lba, num_blocks).await,
             HostSource::Device(inner) => inner.discard(lba, num_blocks).await,
+            HostSource::Http(inner) => inner.discard(lba, num_blocks).await,
         }
     }
 }
@@ -506,6 +520,46 @@ async fn open_sources(args: &Args) -> Result<(BTreeMap<u32, SharedSource>, Confi
             DeviceBlockSource::open(path, block_size).await?,
         ));
         sources.insert(next_id, source);
+        entries.push(smoo_proto::ConfigExport {
+            export_id: next_id,
+            block_size,
+            size_bytes,
+        });
+        next_id = next_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("export_id overflow"))?;
+    }
+
+    if !args.http_sizes.is_empty() && args.http_sizes.len() != args.http.len() {
+        anyhow::bail!(
+            "--http-size-bytes must be provided for each --http (got {} sizes for {} urls)",
+            args.http_sizes.len(),
+            args.http.len()
+        );
+    }
+
+    for (idx, url_str) in args.http.iter().enumerate() {
+        let url = url::Url::parse(url_str)
+            .with_context(|| format!("parse http backing URL {url_str}"))?;
+        ensure!(
+            url.scheme() == "http" || url.scheme() == "https",
+            "unsupported URL scheme {}",
+            url.scheme()
+        );
+        let block_size = args.block_size;
+        let size_override = args.http_sizes.get(idx).copied();
+        let source = if let Some(size) = size_override {
+            HttpBlockSource::new_with_size(url.clone(), block_size, size)
+                .await
+                .context("init HTTP block source with size override")?
+        } else {
+            HttpBlockSource::new(url.clone(), block_size)
+                .await
+                .context("init HTTP block source")?
+        };
+        let size_bytes = source.size_bytes();
+        let shared = SharedSource::new(HostSource::Http(source));
+        sources.insert(next_id, shared);
         entries.push(smoo_proto::ConfigExport {
             export_id: next_id,
             block_size,
