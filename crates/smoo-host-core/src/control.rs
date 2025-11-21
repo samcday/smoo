@@ -1,3 +1,4 @@
+use alloc::{format, string::String};
 use crate::{ControlTransport, TransportError, TransportErrorKind, TransportResult};
 use smoo_proto::{
     CONFIG_EXPORTS_REQ_TYPE, CONFIG_EXPORTS_REQUEST, IDENT_LEN, IDENT_REQUEST, Ident,

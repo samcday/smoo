@@ -3,11 +3,7 @@ use crate::{
     TransportErrorKind, TransportResult,
     control::{ConfigExportsV0, fetch_ident, send_config_exports_v0},
 };
-use alloc::{
-    collections::BTreeMap,
-    string::{String, ToString},
-    vec::Vec,
-};
+use alloc::{collections::BTreeMap, format, string::{String, ToString}, vec, vec::Vec};
 use core::fmt;
 use smoo_proto::{Ident, OpCode, REQUEST_LEN, RESPONSE_LEN, Request, Response};
 
