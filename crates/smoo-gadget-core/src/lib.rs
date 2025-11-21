@@ -16,6 +16,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     task,
 };
+use tracing::trace;
 
 mod dma;
 mod runtime;
@@ -445,6 +446,7 @@ impl GadgetControl {
                 setup.length() as usize >= IDENT_LEN,
                 "GET_IDENT length too small"
             );
+            trace!("ep0: GET_IDENT");
             let ident = self.ident.encode();
             let len = cmp::min(setup.length() as usize, ident.len());
             io.write_in(&ident[..len])
@@ -461,6 +463,11 @@ impl GadgetControl {
             ensure!(
                 setup.length() as usize >= SMOO_STATUS_LEN,
                 "SMOO_STATUS buffer too small"
+            );
+            trace!(
+                current_exports = status.export_count,
+                session_id = status.session_id,
+                "ep0: SMOO_STATUS"
             );
             let mut flags = 0;
             if status.export_active() {
@@ -483,6 +490,7 @@ impl GadgetControl {
                 len >= ConfigExportsV0::HEADER_LEN,
                 "CONFIG_EXPORTS payload too short"
             );
+            trace!(len, "ep0: CONFIG_EXPORTS setup");
             let mut buf = vec![0u8; len];
             io.read_out(&mut buf).await.context("read CONFIG_EXPORTS")?;
             let payload = ConfigExportsV0::try_from_slice(&buf)
@@ -557,6 +565,7 @@ impl GadgetDataPlane {
 
     pub async fn send_request(&mut self, request: Request) -> Result<()> {
         let encoded = request.encode();
+        trace!(bytes = encoded.len(), "interrupt IN: sending Request");
         self.interrupt_in
             .write_all(&encoded)
             .await
@@ -565,15 +574,18 @@ impl GadgetDataPlane {
             .flush()
             .await
             .context("flush interrupt IN")?;
+        trace!("interrupt IN: Request flushed");
         Ok(())
     }
 
     pub async fn read_response(&mut self) -> Result<Response> {
         let mut buf = [0u8; RESPONSE_LEN];
+        trace!(bytes = buf.len(), "interrupt OUT: reading Response");
         self.interrupt_out
             .read_exact(&mut buf)
             .await
             .context("read response from interrupt OUT")?;
+        trace!("interrupt OUT: Response received");
         Response::try_from(buf.as_slice()).map_err(|err| anyhow!("decode response: {err}"))
     }
 
@@ -581,10 +593,12 @@ impl GadgetDataPlane {
         if buf.is_empty() {
             return Ok(());
         }
+        trace!(bytes = buf.len(), "bulk OUT: reading payload");
         self.bulk_out
             .read_exact(buf)
             .await
             .context("read payload from bulk OUT")?;
+        trace!("bulk OUT: payload received");
         Ok(())
     }
 
@@ -592,6 +606,7 @@ impl GadgetDataPlane {
         if buf.is_empty() {
             return Ok(());
         }
+        trace!(bytes = buf.len(), "bulk IN: writing payload");
         self.bulk_in
             .write_all(buf)
             .await
@@ -605,6 +620,7 @@ impl GadgetDataPlane {
         }
         let len = buf.len();
         if self.dma_scratch.is_some() {
+            trace!(bytes = len, "bulk OUT: reading payload via DMA-BUF");
             let mut slot = {
                 let scratch = self.dma_scratch.as_mut().unwrap();
                 scratch
@@ -624,6 +640,7 @@ impl GadgetDataPlane {
             }
             result
         } else {
+            trace!(bytes = len, "bulk OUT: reading payload via read()");
             self.read_bulk(buf).await.context("read bulk payload")
         }
     }
@@ -634,6 +651,7 @@ impl GadgetDataPlane {
         }
         let len = buf.len();
         if self.dma_scratch.is_some() {
+            trace!(bytes = len, "bulk IN: writing payload via DMA-BUF");
             let mut slot = {
                 let scratch = self.dma_scratch.as_mut().unwrap();
                 scratch
@@ -652,6 +670,7 @@ impl GadgetDataPlane {
             }
             result
         } else {
+            trace!(bytes = len, "bulk IN: writing payload via write()");
             self.write_bulk(buf).await.context("write bulk payload")
         }
     }

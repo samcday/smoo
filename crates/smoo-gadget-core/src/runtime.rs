@@ -47,7 +47,7 @@ pub enum ExportState {
     Deleted,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum IoStateKind {
     Recovering,
     Starting,

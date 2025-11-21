@@ -17,12 +17,13 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
+    time::Duration,
 };
 use tokio::{
     signal,
     sync::{mpsc, RwLock},
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 use tracing_subscriber::prelude::*;
 use usb_gadget::{
     function::custom::{
@@ -262,12 +263,24 @@ async fn reconcile_exports(ublk: &mut SmooUblk, runtime: &mut RuntimeState) -> R
     } = runtime;
     let tunables = *tunables;
     for controller in exports.values_mut().filter(|ctrl| ctrl.needs_reconcile()) {
+        trace!(
+            export_id = controller.export_id,
+            state = export_state_tag(controller),
+            dev_id = controller.dev_id(),
+            "reconcile begin"
+        );
         let mut cx = ExportReconcileContext {
             ublk,
             state_store,
             tunables,
         };
         controller.reconcile(&mut cx).await?;
+        trace!(
+            export_id = controller.export_id,
+            state = export_state_tag(controller),
+            dev_id = controller.dev_id(),
+            "reconcile end"
+        );
     }
     Ok(())
 }
@@ -290,6 +303,14 @@ fn enqueue_io(runtime: &mut RuntimeState, io_futs: &mut FuturesUnordered<IoFutur
     for (export_id, controller) in runtime.exports.iter_mut() {
         if let Some((kind, dev_id, device)) = controller.take_device_for_io() {
             let export_id = *export_id;
+            trace!(
+                export_id,
+                dev_id,
+                queue_count = device.queue_count(),
+                queue_depth = device.queue_depth(),
+                kind = ?kind,
+                "enqueue ublk device for IO"
+            );
             io_futs.push(Box::pin(async move {
                 let res = device.next_io().await;
                 (export_id, kind, dev_id, res, device)
@@ -307,9 +328,14 @@ async fn run_event_loop(
     let shutdown = signal::ctrl_c();
     tokio::pin!(shutdown);
     let mut io_futs: FuturesUnordered<IoFuture> = FuturesUnordered::new();
+    let idle_sleep = tokio::time::sleep(Duration::from_millis(10));
+    tokio::pin!(idle_sleep);
 
     let mut io_error = None;
     loop {
+        idle_sleep
+            .as_mut()
+            .reset(tokio::time::Instant::now() + Duration::from_millis(10));
         let reconcile_needed = runtime.exports.values().any(|ctrl| ctrl.needs_reconcile());
         if reconcile_needed {
             reconcile_exports(ublk, &mut runtime).await?;
@@ -339,6 +365,16 @@ async fn run_event_loop(
                     if let Some(ctrl) = runtime.exports.get_mut(&export_id) {
                         match req_res {
                             Ok(req) => {
+                                trace!(
+                                    export_id,
+                                    dev_id,
+                                    queue = req.queue_id,
+                                    tag = req.tag,
+                                    op = ?req.op,
+                                    sector = req.sector,
+                                    num_sectors = req.num_sectors,
+                                    "dispatch ublk request to host"
+                                );
                                 if let Err(err) =
                                     handle_request(&mut gadget, export_id, &device, req).await
                                 {
@@ -426,6 +462,17 @@ async fn handle_request(
         }
     };
 
+    trace!(
+        export_id,
+        dev_id = device.dev_id(),
+        queue = req.queue_id,
+        tag = req.tag,
+        op = ?req.op,
+        req_bytes = req_len,
+        block_size,
+        "handle_request begin"
+    );
+
     let mut payload: Option<UblkBuffer<'_>> = None;
     let result = async {
         if matches!(opcode, OpCode::Read | OpCode::Write) && req_len > 0 {
@@ -453,10 +500,27 @@ async fn handle_request(
         let num_blocks = u32::try_from(req_len / block_size)
             .context("request block count exceeds protocol limit")?;
         let proto_req = Request::new(export_id, opcode, req.sector, num_blocks, 0);
+        trace!(
+            export_id,
+            dev_id = device.dev_id(),
+            queue = req.queue_id,
+            tag = req.tag,
+            op = ?opcode,
+            num_blocks,
+            req_bytes = req_len,
+            "sending smoo Request"
+        );
         gadget
             .send_request(proto_req)
             .await
             .context("send smoo request")?;
+        trace!(
+            export_id,
+            dev_id = device.dev_id(),
+            queue = req.queue_id,
+            tag = req.tag,
+            "smoo Request sent"
+        );
 
         if opcode == OpCode::Read && req_len > 0 {
             if let Some(buf) = payload.as_mut() {
@@ -861,6 +925,20 @@ fn open_endpoint_fd(path: PathBuf) -> Result<OwnedFd> {
 fn to_owned_fd(file: File) -> OwnedFd {
     let raw = file.into_raw_fd();
     unsafe { OwnedFd::from_raw_fd(raw) }
+}
+
+fn export_state_tag(controller: &ExportController) -> &'static str {
+    match controller.state {
+        ExportState::New => "new",
+        ExportState::RecoveringPending { .. } => "recovering_pending",
+        ExportState::Recovering { .. } => "recovering",
+        ExportState::Starting { .. } => "starting",
+        ExportState::Online { .. } => "online",
+        ExportState::ShuttingDown { .. } => "shutting_down",
+        ExportState::IoInFlight { .. } => "io_in_flight",
+        ExportState::Failed { .. } => "failed",
+        ExportState::Deleted => "deleted",
+    }
 }
 
 fn parse_hex_u16(input: &str) -> Result<u16, String> {

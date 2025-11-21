@@ -14,6 +14,7 @@ use anyhow::{Context, ensure};
 use async_channel::{Receiver, RecvError, Sender};
 use io_uring::{IoUring, cqueue, squeue, types};
 use std::cmp;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io;
 use std::mem::{size_of, transmute};
@@ -40,6 +41,29 @@ type CtrlCommand = (
     Sender<Result<(), io::Error>>,
     Option<Duration>,
 );
+
+struct PendingCtrl {
+    reply: Sender<Result<(), io::Error>>,
+    _opcode: u32,
+    _cmd_user_data: u64,
+    _timeout_user_data: Option<u64>,
+    cancel_user_data: Option<u64>,
+}
+
+impl PendingCtrl {
+    fn resolve(self, res: i32) {
+        let result = match res {
+            0 => Ok(()),
+            r if r < 0 => Err(io::Error::from_raw_os_error(-r)),
+            r => Err(io::Error::from_raw_os_error(-r)),
+        };
+        send_ctrl_reply(self.reply, result);
+    }
+
+    fn cancel_user_data(&self) -> Option<u64> {
+        self.cancel_user_data
+    }
+}
 
 pub struct SmooUblkDevice {
     dev_id: u32,
@@ -102,8 +126,8 @@ impl SmooUblk {
 
     pub fn new() -> anyhow::Result<Self> {
         let ublk_ctrl = File::options().write(true).open("/dev/ublk-control")?;
-        let (sender, receiver) = async_channel::bounded::<CtrlCommand>(1);
-        // Setup a simple ring + reactor that round trips one op at a time to /dev/ublk-control
+        let (sender, receiver) = async_channel::unbounded::<CtrlCommand>();
+        // Control loop pumps multiple outstanding ops to /dev/ublk-control
         let mut ring: IoUring<io_uring::squeue::Entry128, _> =
             IoUring::<io_uring::squeue::Entry128>::builder().build(CTRL_RING_DEPTH)?;
 
@@ -112,136 +136,113 @@ impl SmooUblk {
             let _enter = span.enter();
             info!("starting loop");
             let mut next_cmd_id: u64 = 1;
+            let mut pending: HashMap<u64, PendingCtrl> = HashMap::new();
+            let mut timeout_lookup: HashMap<u64, u64> = HashMap::new();
+            let mut cancel_lookup: HashMap<u64, u64> = HashMap::new();
+            let mut needs_submit = false;
             loop {
-                let (opcode, cmd, reply, timeout) = match receiver.recv_blocking() {
-                    Ok(msg) => msg,
-                    Err(RecvError) => {
-                        info!("smoo-gadget-ublk ctrl loop shutting down");
-                        break;
-                    }
-                };
-
-                tracing::span!(Level::DEBUG, "ctrl cmd", opcode).in_scope(|| {
-                    let send_completion = |res| {
-                        if let Err(e) = reply.send_blocking(res) {
-                            trace!("ctrl reply receiver dropped: {}", e);
-                        }
-                    };
-
-                    let cmd_bytes_len = size_of::<sys::ublksrv_ctrl_cmd>();
-                    assert!(cmd_bytes_len <= 80, "ublksrv_ctrl_cmd larger than 80 bytes");
-                    let mut cmd_buf = [0u8; 80];
-                    let raw_cmd = unsafe {
-                        std::slice::from_raw_parts(
-                            (&cmd as *const sys::ublksrv_ctrl_cmd).cast::<u8>(),
-                            cmd_bytes_len,
-                        )
-                    };
-                    cmd_buf[..cmd_bytes_len].copy_from_slice(raw_cmd);
-
-                    let cmd_user_data = next_cmd_id << 2;
-                    let timeout_user_data = cmd_user_data | 1;
-                    let cancel_user_data = cmd_user_data | 2;
+                // Drain new commands quickly
+                while let Ok((opcode, cmd, reply, timeout)) = receiver.try_recv() {
+                    let cmd_id = next_cmd_id;
                     next_cmd_id = next_cmd_id.wrapping_add(1);
-
-                    let mut cmd_entry = io_uring::opcode::UringCmd80::new(
-                        io_uring::types::Fd(ublk_ctrl.as_raw_fd()),
+                    match queue_ctrl_cmd(
+                        &mut ring,
+                        &mut pending,
+                        &mut timeout_lookup,
+                        cmd_id,
                         opcode,
-                    )
-                    .cmd(cmd_buf)
-                    .build()
-                    .user_data(cmd_user_data);
-
-                    if timeout.is_some() {
-                        cmd_entry = cmd_entry.flags(squeue::Flags::IO_LINK);
-                    }
-
-                    if let Err(e) = push_ctrl_entry(&mut ring, &cmd_entry) {
-                        error!("write ublksrv_ctrl_cmd SQE failed: {}", e);
-                        send_completion(Err(e));
-                        return;
-                    }
-
-                    let timeout_spec = timeout.map(types::Timespec::from);
-                    if let Some(ref ts) = timeout_spec {
-                        let timeout_entry = squeue::Entry128::from(
-                            io_uring::opcode::LinkTimeout::new(ts)
-                                .build()
-                                .user_data(timeout_user_data),
-                        );
-                        if let Err(e) = push_ctrl_entry(&mut ring, &timeout_entry) {
-                            error!("link timeout SQE failed: {}", e);
-                            send_completion(Err(e));
-                            return;
+                        cmd,
+                        reply,
+                        timeout,
+                        ublk_ctrl.as_raw_fd(),
+                    ) {
+                        Ok(()) => {
+                            needs_submit = true;
+                        }
+                        Err(err) => {
+                            error!(opcode, error = ?err, "queue ctrl cmd failed");
                         }
                     }
+                }
 
+                if needs_submit {
                     if let Err(e) = ring.submitter().submit() {
-                        error!("submit ctrl SQE failed: {}", e);
-                        send_completion(Err(e));
-                        return;
+                        error!("submit ctrl SQEs failed: {}", e);
                     }
+                    needs_submit = false;
+                }
 
-                    trace!("submitting sqe");
-                    let mut completion: Option<Result<i32, io::Error>> = None;
-                    while completion.is_none() {
-                        if let Err(e) = ring.submitter().submit_and_wait(1) {
-                            error!("submit_and_wait failed: {}", e);
-                            completion = Some(Err(e));
+                // Process completions
+                let mut saw_completion = false;
+                let mut pending_cancels: Vec<(u64, u64)> = Vec::new();
+                while let Some(cqe) = ring.completion().next() {
+                    saw_completion = true;
+                    let user_data = cqe.user_data();
+                    let res = cqe.result();
+                    if let Some(pending_cmd) = pending.remove(&user_data) {
+                        clear_lookup(user_data, &mut timeout_lookup, &mut cancel_lookup);
+                        pending_cmd.resolve(res);
+                        continue;
+                    }
+                    if let Some(cmd_user_data) = timeout_lookup.remove(&user_data) {
+                        trace!(cmd_user_data, res, "ctrl timeout completion");
+                        if let Some(pending_cmd) = pending.remove(&cmd_user_data) {
+                            let cancel_ud = pending_cmd.cancel_user_data();
+                            if let Some(cancel_ud) = cancel_ud {
+                                pending_cancels.push((cmd_user_data, cancel_ud));
+                                cancel_lookup.insert(cancel_ud, cmd_user_data);
+                            }
+                            pending_cmd.resolve(-libc::ETIME);
+                        }
+                        continue;
+                    }
+                    if let Some(cmd_user_data) = cancel_lookup.remove(&user_data) {
+                        trace!(cmd_user_data, res, "ctrl cancel completion");
+                        continue;
+                    }
+                    trace!(user_data, res, "ctrl extra completion");
+                }
+                for (target_ud, cancel_ud) in pending_cancels.drain(..) {
+                    if let Err(err) = submit_ctrl_cancel(&mut ring, target_ud, cancel_ud) {
+                        warn!(target_ud, error = ?err, "ctrl cancel submit failed");
+                    }
+                }
+
+                if receiver.is_closed() && pending.is_empty() {
+                    info!("smoo-gadget-ublk ctrl loop shutting down");
+                    break;
+                }
+
+                // Avoid tight spinning when pending but no completions
+                if pending.is_empty() {
+                    match receiver.recv_blocking() {
+                        Ok((opcode, cmd, reply, timeout)) => {
+                            let cmd_id = next_cmd_id;
+                            next_cmd_id = next_cmd_id.wrapping_add(1);
+                            if let Err(err) = queue_ctrl_cmd(
+                                &mut ring,
+                                &mut pending,
+                                &mut timeout_lookup,
+                                cmd_id,
+                                opcode,
+                                cmd,
+                                reply,
+                                timeout,
+                                ublk_ctrl.as_raw_fd(),
+                            ) {
+                                error!(opcode, error = ?err, "queue ctrl cmd failed");
+                            } else {
+                                needs_submit = true;
+                            }
+                        }
+                        Err(RecvError) => {
+                            info!("smoo-gadget-ublk ctrl loop shutting down");
                             break;
                         }
-                        let mut timeout_triggered = None;
-                        while let Some(cqe) = ring.completion().next() {
-                            let user_data = cqe.user_data();
-                            if user_data == cmd_user_data {
-                                completion = Some(Ok(cqe.result()));
-                                break;
-                            } else if timeout.is_some() && user_data == timeout_user_data {
-                                timeout_triggered = Some(cqe.result());
-                                break;
-                            } else if timeout.is_some() && user_data == cancel_user_data {
-                                trace!(res = cqe.result(), "ctrl cancel completion");
-                            } else {
-                                trace!(
-                                    user_data = user_data,
-                                    res = cqe.result(),
-                                    "ctrl extra completion"
-                                );
-                            }
-                        }
-                        if let Some(res) = timeout_triggered {
-                            trace!(res = res, "ctrl timeout completion");
-                            if let Err(err) =
-                                submit_ctrl_cancel(&mut ring, cmd_user_data, cancel_user_data)
-                            {
-                                warn!("ctrl cancel submit failed: {}", err);
-                            }
-                            completion = Some(Err(io::Error::from_raw_os_error(libc::ETIME)));
-                        }
                     }
-
-                    while let Some(cqe) = ring.completion().next() {
-                        trace!(
-                            user_data = cqe.user_data(),
-                            res = cqe.result(),
-                            "drain ctrl cqe"
-                        );
-                    }
-
-                    let completion = completion
-                        .unwrap_or_else(|| Err(io::Error::other("ctrl completion missing result")));
-                    let completion_code = match &completion {
-                        Ok(res) => *res,
-                        Err(err) => -err.raw_os_error().unwrap_or(libc::EIO),
-                    };
-                    trace!(result = completion_code, "ctrl completion");
-                    let final_result = match completion {
-                        Ok(0) => Ok(()),
-                        Ok(res) => Err(io::Error::from_raw_os_error(-res)),
-                        Err(err) => Err(err),
-                    };
-                    send_completion(final_result);
-                });
+                } else if !saw_completion {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
             }
         });
 
@@ -1195,6 +1196,88 @@ fn decode_op(op_flags: u32) -> UblkOp {
         UBLK_IO_OP_DISCARD => UblkOp::Discard,
         other => UblkOp::Unknown(other),
     }
+}
+
+fn send_ctrl_reply(reply: Sender<Result<(), io::Error>>, result: Result<(), io::Error>) {
+    if let Err(e) = reply.send_blocking(result) {
+        trace!("ctrl reply receiver dropped: {}", e);
+    }
+}
+
+fn clear_lookup(
+    cmd_user_data: u64,
+    timeout_lookup: &mut HashMap<u64, u64>,
+    cancel_lookup: &mut HashMap<u64, u64>,
+) {
+    timeout_lookup.retain(|_, v| *v != cmd_user_data);
+    cancel_lookup.retain(|_, v| *v != cmd_user_data);
+}
+
+fn queue_ctrl_cmd(
+    ring: &mut IoUring<io_uring::squeue::Entry128, cqueue::Entry>,
+    pending: &mut HashMap<u64, PendingCtrl>,
+    timeout_lookup: &mut HashMap<u64, u64>,
+    cmd_id: u64,
+    opcode: u32,
+    cmd: ublksrv_ctrl_cmd,
+    reply: Sender<Result<(), io::Error>>,
+    timeout: Option<Duration>,
+    fd: i32,
+) -> anyhow::Result<()> {
+    let cmd_bytes_len = size_of::<sys::ublksrv_ctrl_cmd>();
+    assert!(cmd_bytes_len <= 80, "ublksrv_ctrl_cmd larger than 80 bytes");
+    let mut cmd_buf = [0u8; 80];
+    let raw_cmd = unsafe {
+        std::slice::from_raw_parts(
+            (&cmd as *const sys::ublksrv_ctrl_cmd).cast::<u8>(),
+            cmd_bytes_len,
+        )
+    };
+    cmd_buf[..cmd_bytes_len].copy_from_slice(raw_cmd);
+
+    let cmd_user_data = cmd_id << 2;
+    let timeout_user_data = cmd_user_data | 1;
+    let cancel_user_data = cmd_user_data | 2;
+
+    let mut cmd_entry = io_uring::opcode::UringCmd80::new(io_uring::types::Fd(fd), opcode)
+        .cmd(cmd_buf)
+        .build()
+        .user_data(cmd_user_data);
+
+    if timeout.is_some() {
+        cmd_entry = cmd_entry.flags(squeue::Flags::IO_LINK);
+    }
+
+    if let Err(e) = push_ctrl_entry(ring, &cmd_entry) {
+        let err = io::Error::from_raw_os_error(e.raw_os_error().unwrap_or(libc::EIO));
+        send_ctrl_reply(reply, Err(err));
+        return Ok(());
+    }
+
+    if let Some(duration) = timeout {
+        let ts = types::Timespec::from(duration);
+        let timeout_entry = squeue::Entry128::from(
+            io_uring::opcode::LinkTimeout::new(&ts)
+                .build()
+                .user_data(timeout_user_data),
+        );
+        if let Err(e) = push_ctrl_entry(ring, &timeout_entry) {
+            let err = io::Error::from_raw_os_error(e.raw_os_error().unwrap_or(libc::EIO));
+            send_ctrl_reply(reply, Err(err));
+            return Ok(());
+        }
+        timeout_lookup.insert(timeout_user_data, cmd_user_data);
+    }
+
+    let pending_ctrl = PendingCtrl {
+        reply: reply.clone(),
+        _opcode: opcode,
+        _cmd_user_data: cmd_user_data,
+        _timeout_user_data: timeout.map(|_| timeout_user_data),
+        cancel_user_data: timeout.map(|_| cancel_user_data),
+    };
+    pending.insert(cmd_user_data, pending_ctrl);
+    Ok(())
 }
 
 async fn submit_ctrl_command(

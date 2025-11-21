@@ -247,15 +247,6 @@ async fn run_session(
                 return Ok(SessionEnd::TransportLost);
             }
         };
-    // ensure!(
-    //     initial_status.export_active(),
-    //     "gadget reports no active export after CONFIG_EXPORTS"
-    // );
-    // ensure!(
-    //     initial_status.export_count >= 1,
-    //     "gadget export count invalid ({})",
-    //     initial_status.export_count
-    // );
     match expected_session_id {
         Some(expected) => {
             let recorded = *expected;
@@ -566,7 +557,6 @@ fn infer_interface_endpoints<T: UsbContext>(
 #[derive(Debug, Clone)]
 enum HeartbeatFailure {
     SessionChanged { previous: u64, current: u64 },
-    ExportInactive,
     TransferFailed(String),
 }
 
@@ -577,7 +567,6 @@ impl fmt::Display for HeartbeatFailure {
                 f,
                 "gadget session changed (0x{previous:016x} → 0x{current:016x})"
             ),
-            HeartbeatFailure::ExportInactive => write!(f, "gadget reports no active export"),
             HeartbeatFailure::TransferFailed(err) => {
                 write!(f, "heartbeat control transfer failed: {err}")
             }
@@ -606,9 +595,6 @@ async fn run_heartbeat(
                         previous: initial_session_id,
                         current: status.session_id,
                     });
-                }
-                if !status.export_active() {
-                    return Err(HeartbeatFailure::ExportInactive);
                 }
             }
             Err(err) => {
