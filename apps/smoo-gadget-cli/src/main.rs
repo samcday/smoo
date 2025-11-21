@@ -397,14 +397,7 @@ async fn run_event_loop(
         }
     }
 
-    for controller in runtime.exports.values_mut() {
-        if let Some(device) = controller.take_device() {
-            info!(dev_id = device.dev_id(), "stopping ublk device");
-            ublk.stop_dev(device, true)
-                .await
-                .context("stop ublk device")?;
-        }
-    }
+    cleanup_ublk_devices(ublk, &mut runtime).await?;
     runtime.status().set_export_count(0).await;
 
     // Clean shutdown: remove the state file to avoid retaining stale session info.
@@ -925,6 +918,65 @@ fn open_endpoint_fd(path: PathBuf) -> Result<OwnedFd> {
 fn to_owned_fd(file: File) -> OwnedFd {
     let raw = file.into_raw_fd();
     unsafe { OwnedFd::from_raw_fd(raw) }
+}
+
+async fn cleanup_ublk_devices(ublk: &mut SmooUblk, runtime: &mut RuntimeState) -> Result<()> {
+    let mut force_remove_ids = Vec::new();
+    for controller in runtime.exports.values_mut() {
+        if let Some(device) = controller.take_device() {
+            let dev_id = device.dev_id();
+            info!(dev_id, "stopping ublk device");
+            if let Err(err) = ublk.stop_dev(device, true).await {
+                warn!(
+                    dev_id,
+                    error = ?err,
+                    "graceful stop failed; will force-remove"
+                );
+                force_remove_ids.push(dev_id);
+            }
+        } else if let Some(dev_id) = controller.dev_id() {
+            force_remove_ids.push(dev_id);
+        }
+    }
+
+    for dev_id in force_remove_ids {
+        force_remove_with_retry(ublk, dev_id).await?;
+    }
+    Ok(())
+}
+
+async fn force_remove_with_retry(ublk: &mut SmooUblk, dev_id: u32) -> Result<()> {
+    let mut attempt: u32 = 0;
+    loop {
+        attempt = attempt.wrapping_add(1);
+        match ublk.force_remove_device(dev_id).await {
+            Ok(()) => {
+                info!(dev_id, attempt, "force-removed ublk device");
+                break;
+            }
+            Err(err) => {
+                if error_is_errno(&err, libc::ENOENT) {
+                    info!(dev_id, attempt, "ublk device already absent");
+                    break;
+                }
+                warn!(
+                    dev_id,
+                    attempt,
+                    error = ?err,
+                    "force-remove ublk device failed; retrying"
+                );
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    Ok(())
+}
+
+fn error_is_errno(err: &anyhow::Error, code: i32) -> bool {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .and_then(|io_err| io_err.raw_os_error())
+        == Some(code)
 }
 
 fn export_state_tag(controller: &ExportController) -> &'static str {
