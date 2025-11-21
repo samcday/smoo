@@ -17,6 +17,7 @@ It is implemented in async-first Rust, mostly by robots.
 # This project does not yet have a tagged release.
 # You must build it from source. Twice.
 # Once on the host computer, and once on the device connected over USB.
+# (you might be missing some dependencies, see below)
 cargo build
 
 # On the device side:
@@ -33,6 +34,11 @@ sudo ./target/debug/smoo-host-cli --file random.img
 # from host: sha256sum random.img
 # from gadget: dd if=/dev/ublkb0 | sha256sum
 ```
+
+### Development prerequisites
+
+ * Alpine: `apk add linux-headers clang-dev`
+ * Others: idk pls expand here
 
 ## Status
 
