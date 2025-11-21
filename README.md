@@ -14,14 +14,24 @@ It is implemented in async-first Rust, mostly by robots.
 ## Quickstart
 
 ```
-# from a computer with a UDC
-cargo run --bin=smoo-gadget-cli
+# This project does not yet have a tagged release.
+# You must build it from source. Twice.
+# Once on the host computer, and once on the device connected over USB.
+cargo build
 
-# from another computer connected to the one with a UDC
+# On the device side:
+sudo modprobe ublk-drv
+sudo ./target/debug/smoo-gadget-cli --no-dma-buf
+
+# on the host side
 dd if=/dev/urandom of=random.img bs=4096 count=512
-cargo run --bin=smoo-host-cli -f random.img
+sudo ./target/debug/smoo-host-cli --file random.img
 
-# the UDC computer should now see a /dev/ublk0 that returns data matching random.img
+# the device will now see a /dev/ublkb0 device
+# it will return data matching the contents of random.img on the host.
+# you can confirm this easily:
+# from host: sha256sum random.img
+# from gadget: dd if=/dev/ublkb0 | sha256sum
 ```
 
 ## Status
