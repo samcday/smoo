@@ -1671,6 +1671,7 @@ dependencies = [
  "async-trait",
  "clap",
  "rusb",
+ "smoo-host-blocksource-cached",
  "smoo-host-blocksource-http",
  "smoo-host-blocksources",
  "smoo-host-core",
