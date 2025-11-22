@@ -48,6 +48,12 @@ pub struct StateStore {
     records: Vec<PersistedExportRecord>,
 }
 
+impl Default for StateStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StateStore {
     /// Construct a fresh, in-memory store with a new session ID.
     pub fn new() -> Self {

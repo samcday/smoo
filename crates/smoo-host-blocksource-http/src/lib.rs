@@ -161,7 +161,7 @@ impl HttpClient {
     fn new() -> BlockSourceResult<Self> {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            return Ok(HttpClient::Native(native::Client::new()?));
+            Ok(HttpClient::Native(native::Client::new()?))
         }
         #[cfg(target_arch = "wasm32")]
         {

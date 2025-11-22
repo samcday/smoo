@@ -66,15 +66,12 @@ mod tests {
 
     #[test]
     fn config_exports_single_encodes_fields() {
-        let mut entries = heapless::Vec::new();
-        entries
-            .push(smoo_proto::ConfigExport {
-                export_id: 5,
-                block_size: 4096,
-                size_bytes: 8192,
-            })
-            .unwrap();
-        let payload = ConfigExportsV0::new(entries).unwrap();
+        let entries = vec![smoo_proto::ConfigExport {
+            export_id: 5,
+            block_size: 4096,
+            size_bytes: 8192,
+        }];
+        let payload = ConfigExportsV0::from_slice(&entries).unwrap();
         let encoded = payload.encode();
         assert_eq!(
             encoded.len(),
@@ -82,7 +79,7 @@ mod tests {
         );
         assert_eq!(&encoded[2..4], &[1, 0]);
         assert_eq!(&encoded[8..12], &5u32.to_le_bytes());
-        assert_eq!(&encoded[8..12], &4096u32.to_le_bytes());
-        assert_eq!(&encoded[12..20], &8192u64.to_le_bytes());
+        assert_eq!(&encoded[12..16], &4096u32.to_le_bytes());
+        assert_eq!(&encoded[16..24], &8192u64.to_le_bytes());
     }
 }

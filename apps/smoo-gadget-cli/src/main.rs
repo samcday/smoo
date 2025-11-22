@@ -1017,7 +1017,7 @@ fn validate_persisted_record(record: &PersistedExportRecord) -> Result<()> {
         "persisted export size_bytes must be non-zero"
     );
     ensure!(
-        record.spec.size_bytes % block_size as u64 == 0,
+        record.spec.size_bytes.is_multiple_of(block_size as u64),
         "persisted export size_bytes must be multiple of block_size"
     );
     let blocks = record
@@ -1056,7 +1056,7 @@ fn build_spec_from_export(export: ConfigExport) -> Result<ExportSpec> {
         "CONFIG_EXPORTS size_bytes must be non-zero"
     );
     ensure!(
-        export.size_bytes % block_size as u64 == 0,
+        export.size_bytes.is_multiple_of(block_size as u64),
         "CONFIG_EXPORTS size_bytes must be multiple of block_size"
     );
     let blocks = export

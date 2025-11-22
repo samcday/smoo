@@ -264,33 +264,6 @@ impl TryFrom<&[u8]> for Response {
     }
 }
 
-fn encode_common(op: OpCode, lba: u64, byte_len: u32, flags: u32) -> [u8; REQUEST_LEN] {
-    let mut buf = [0u8; REQUEST_LEN];
-    buf[0] = u8::from(op);
-    buf[1..4].fill(0);
-    buf[4..12].copy_from_slice(&lba.to_le_bytes());
-    buf[12..16].copy_from_slice(&byte_len.to_le_bytes());
-    buf[16..20].copy_from_slice(&flags.to_le_bytes());
-    buf
-}
-
-fn decode_common(bytes: [u8; REQUEST_LEN]) -> Result<(OpCode, u64, u32, u32)> {
-    let op = OpCode::try_from(bytes[0])?;
-    let mut lba_bytes = [0u8; 8];
-    lba_bytes.copy_from_slice(&bytes[4..12]);
-    let lba = u64::from_le_bytes(lba_bytes);
-
-    let mut len_bytes = [0u8; 4];
-    len_bytes.copy_from_slice(&bytes[12..16]);
-    let byte_len = u32::from_le_bytes(len_bytes);
-
-    let mut flag_bytes = [0u8; 4];
-    flag_bytes.copy_from_slice(&bytes[16..20]);
-    let flags = u32::from_le_bytes(flag_bytes);
-
-    Ok((op, lba, byte_len, flags))
-}
-
 /// Heartbeat/status payload returned by the gadget.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SmooStatusV0 {

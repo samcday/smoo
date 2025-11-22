@@ -305,7 +305,7 @@ impl MemoryCacheStore {
             ));
         }
         let data = vec![0u8; total_bytes as usize];
-        let valid = vec![0u8; ((total_blocks + 7) / 8) as usize];
+        let valid = vec![0u8; total_blocks.div_ceil(8) as usize];
         Ok(Self {
             block_size,
             total_blocks,

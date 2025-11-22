@@ -253,7 +253,7 @@ async fn run_session(
         minor = ident.minor,
         "gadget IDENT response"
     );
-    send_config_exports_v0(&control, &config_payload)
+    send_config_exports_v0(&control, config_payload)
         .await
         .context("CONFIG_EXPORTS control transfer")?;
     info!(

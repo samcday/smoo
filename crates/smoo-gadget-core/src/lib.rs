@@ -529,6 +529,7 @@ pub struct GadgetDataPlane {
 }
 
 impl GadgetDataPlane {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         interrupt_in: OwnedFd,
         interrupt_out: OwnedFd,
@@ -704,27 +705,28 @@ mod tests {
 
     #[test]
     fn config_exports_none() {
-        let payload = [0u8; ConfigExportsV0::ENCODED_LEN];
-        let parsed = ConfigExportsV0::decode(payload).expect("parse");
-        assert!(parsed.export().is_none());
+        let payload = [0u8; ConfigExportsV0::HEADER_LEN];
+        let parsed = ConfigExportsV0::try_from_slice(&payload).expect("parse");
+        assert!(parsed.entries().is_empty());
     }
 
     #[test]
     fn config_exports_single() {
-        let mut payload = [0u8; ConfigExportsV0::ENCODED_LEN];
-        payload[2] = 1;
-        payload[8..12].copy_from_slice(&4096u32.to_le_bytes());
-        payload[12..20].copy_from_slice(&(4096u64 * 8).to_le_bytes());
-        let parsed = ConfigExportsV0::decode(payload).expect("parse");
-        let export = parsed.export().expect("export");
+        let mut payload = [0u8; ConfigExportsV0::HEADER_LEN + ConfigExportsV0::ENTRY_LEN];
+        payload[2..4].copy_from_slice(&1u16.to_le_bytes());
+        payload[8..12].copy_from_slice(&1u32.to_le_bytes()); // export_id
+        payload[12..16].copy_from_slice(&4096u32.to_le_bytes());
+        payload[16..24].copy_from_slice(&(4096u64 * 8).to_le_bytes());
+        let parsed = ConfigExportsV0::try_from_slice(&payload).expect("parse");
+        let export = parsed.entries().first().expect("export");
         assert_eq!(export.block_size, 4096);
         assert_eq!(export.size_bytes, 4096 * 8);
     }
 
     #[test]
     fn config_exports_invalid_flags() {
-        let mut payload = [0u8; ConfigExportsV0::ENCODED_LEN];
+        let mut payload = [0u8; ConfigExportsV0::HEADER_LEN];
         payload[4] = 1;
-        assert!(ConfigExportsV0::decode(payload).is_err());
+        assert!(ConfigExportsV0::try_from_slice(&payload).is_err());
     }
 }

@@ -1213,6 +1213,7 @@ fn clear_lookup(
     cancel_lookup.retain(|_, v| *v != cmd_user_data);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn queue_ctrl_cmd(
     ring: &mut IoUring<io_uring::squeue::Entry128, cqueue::Entry>,
     pending: &mut HashMap<u64, PendingCtrl>,
