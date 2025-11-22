@@ -1664,6 +1664,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "smoo-host-cache-store-idb"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "js-sys",
+ "smoo-host-blocksource-cached",
+ "smoo-host-core",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
 name = "smoo-host-cli"
 version = "0.1.0"
 dependencies = [
