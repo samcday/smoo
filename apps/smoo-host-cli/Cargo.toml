@@ -12,6 +12,7 @@ clap = { version = "4.5.20", features = ["derive"] }
 rusb = "0.9.4"
 smoo-host-blocksources = { path = "../../crates/smoo-host-blocksources" }
 smoo-host-blocksource-http = { path = "../../crates/smoo-host-blocksource-http" }
+smoo-host-blocksource-cached = { path = "../../crates/smoo-host-blocksource-cached", features = ["std"] }
 smoo-host-core = { path = "../../crates/smoo-host-core" }
 smoo-host-rusb = { path = "../../crates/smoo-host-rusb" }
 smoo-proto = { path = "../../crates/smoo-proto" }
