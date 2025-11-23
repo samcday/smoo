@@ -8,7 +8,7 @@ use smoo_gadget_core::{
     SetupCommand, SetupPacket, SmooGadget, StateStore,
 };
 use smoo_gadget_ublk::{SmooUblk, SmooUblkDevice, UblkBuffer, UblkIoRequest, UblkOp};
-use smoo_proto::{Ident, OpCode, Request, Response};
+use smoo_proto::{Ident, OpCode, Request, Response, SMOO_STATUS_REQUEST, SMOO_STATUS_REQ_TYPE};
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
@@ -17,11 +17,11 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     signal,
-    sync::{mpsc, RwLock},
+    sync::{mpsc, watch, RwLock},
 };
 use tracing::{debug, info, trace, warn};
 use tracing_subscriber::prelude::*;
@@ -37,6 +37,8 @@ const SMOO_CLASS: u8 = 0xFF;
 const SMOO_SUBCLASS: u8 = 0x53;
 const SMOO_PROTOCOL: u8 = 0x4D;
 const DEFAULT_MAX_IO_BYTES: usize = 4 * 1024 * 1024;
+const STATUS_LIVENESS_TIMEOUT: Duration = Duration::from_secs(2);
+const OFFLINE_DRAIN_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Parser)]
 #[command(name = "smoo-gadget-cli")]
@@ -230,6 +232,7 @@ impl RuntimeState {
 
 enum ControlMessage {
     Config(ConfigExportsV0),
+    StatusPing,
 }
 
 fn build_initial_exports(state_store: &StateStore) -> HashMap<u32, ExportController> {
@@ -325,6 +328,7 @@ async fn run_event_loop(
     mut runtime: RuntimeState,
     mut control_rx: mpsc::Receiver<ControlMessage>,
 ) -> Result<()> {
+    let (host_tx, host_rx) = watch::channel(true);
     let shutdown = signal::ctrl_c();
     tokio::pin!(shutdown);
     let mut io_futs: FuturesUnordered<IoFuture> = FuturesUnordered::new();
@@ -332,6 +336,10 @@ async fn run_event_loop(
     tokio::pin!(idle_sleep);
 
     let mut io_error = None;
+    let mut last_status = Instant::now();
+    let mut host_online = true;
+    let offline_tick = tokio::time::sleep(OFFLINE_DRAIN_INTERVAL);
+    tokio::pin!(offline_tick);
     loop {
         idle_sleep
             .as_mut()
@@ -339,6 +347,17 @@ async fn run_event_loop(
         let reconcile_needed = runtime.exports.values().any(|ctrl| ctrl.needs_reconcile());
         if reconcile_needed {
             reconcile_exports(ublk, &mut runtime).await?;
+        }
+        if host_online && last_status.elapsed() > STATUS_LIVENESS_TIMEOUT {
+            warn!(
+                since_ms = last_status.elapsed().as_millis(),
+                "SMOO_STATUS heartbeat missing; assuming host disconnected"
+            );
+            host_online = false;
+            let _ = host_tx.send(false);
+            offline_tick
+                .as_mut()
+                .reset(tokio::time::Instant::now() + OFFLINE_DRAIN_INTERVAL);
         }
         let active_count = runtime
             .exports
@@ -355,10 +374,21 @@ async fn run_event_loop(
             }
             maybe_msg = control_rx.recv() => {
                 if let Some(msg) = maybe_msg {
+                    if matches!(msg, ControlMessage::StatusPing) {
+                        last_status = Instant::now();
+                        if !host_online {
+                            host_online = true;
+                            let _ = host_tx.send(true);
+                        }
+                    }
                     process_control_message(msg, ublk, &mut runtime).await?;
                 } else {
                     break;
                 }
+            }
+            _ = &mut offline_tick, if !host_online => {
+                offline_tick.as_mut().reset(tokio::time::Instant::now() + OFFLINE_DRAIN_INTERVAL);
+                debug!("host offline; dropping queued I/O with EAGAIN");
             }
             next_io = io_futs.next(), if !io_futs.is_empty() => {
                 if let Some((export_id, kind, dev_id, req_res, device)) = next_io {
@@ -375,9 +405,14 @@ async fn run_event_loop(
                                     num_sectors = req.num_sectors,
                                     "dispatch ublk request to host"
                                 );
-                                if let Err(err) =
-                                    handle_request(&mut gadget, export_id, &device, req).await
-                                {
+                                if let Err(err) = handle_request(
+                                    &mut gadget,
+                                    export_id,
+                                    &device,
+                                    req,
+                                    host_rx.clone(),
+                                )
+                                .await {
                                     ctrl.fail_after_io(dev_id, format!("{err:#}"));
                                     io_error = Some(err);
                                     break;
@@ -421,6 +456,7 @@ async fn handle_request(
     export_id: u32,
     device: &SmooUblkDevice,
     req: UblkIoRequest,
+    host_online: watch::Receiver<bool>,
 ) -> Result<()> {
     let block_size = device.block_size();
     let req_len = match request_byte_len(&req, block_size) {
@@ -469,90 +505,144 @@ async fn handle_request(
     );
 
     let mut payload: Option<UblkBuffer<'_>> = None;
-    let result = async {
-        if matches!(opcode, OpCode::Read | OpCode::Write) && req_len > 0 {
-            let capacity = device.buffer_len();
-            if req_len > capacity {
-                warn!(
-                    queue = req.queue_id,
-                    tag = req.tag,
-                    req_bytes = req_len,
-                    buf_cap = capacity,
-                    "request exceeds buffer capacity"
-                );
-                device
-                    .complete_io(req, -libc::EINVAL)
-                    .context("complete oversized request")?;
-                return Ok(());
-            }
-            payload = Some(
-                device
-                    .checkout_buffer(req.queue_id, req.tag)
-                    .context("checkout bulk buffer")?,
-            );
-        }
+    if !*host_online.borrow() {
+        device
+            .complete_io(req, -libc::EAGAIN)
+            .context("complete request while host offline")?;
+        return Ok(());
+    }
 
-        let num_blocks = u32::try_from(req_len / block_size)
-            .context("request block count exceeds protocol limit")?;
-        let proto_req = Request::new(export_id, opcode, req.sector, num_blocks, 0);
-        trace!(
-            export_id,
-            dev_id = device.dev_id(),
-            queue = req.queue_id,
-            tag = req.tag,
-            op = ?opcode,
-            num_blocks,
-            req_bytes = req_len,
-            "sending smoo Request"
-        );
-        gadget
-            .send_request(proto_req)
-            .await
-            .context("send smoo request")?;
-        trace!(
-            export_id,
-            dev_id = device.dev_id(),
-            queue = req.queue_id,
-            tag = req.tag,
-            "smoo Request sent"
-        );
-
-        if opcode == OpCode::Read && req_len > 0 {
-            if let Some(buf) = payload.as_mut() {
-                gadget
-                    .read_bulk_buffer(&mut buf.as_mut_slice()[..req_len])
-                    .await
-                    .context("read bulk payload")?;
-            }
-        } else if opcode == OpCode::Write && req_len > 0 {
-            if let Some(buf) = payload.as_mut() {
-                gadget
-                    .write_bulk_buffer(&mut buf.as_mut_slice()[..req_len])
-                    .await
-                    .context("write bulk payload")?;
-            }
-        }
-
-        let response = gadget.read_response().await.context("read smoo response")?;
-
-        let status = response_status(&response, req_len, block_size)?;
-        if status >= 0 && (status as usize) != req_len {
+    if matches!(opcode, OpCode::Read | OpCode::Write) && req_len > 0 {
+        let capacity = device.buffer_len();
+        if req_len > capacity {
             warn!(
                 queue = req.queue_id,
                 tag = req.tag,
-                expected = req_len,
-                reported = status,
-                "response byte count mismatch"
+                req_bytes = req_len,
+                buf_cap = capacity,
+                "request exceeds buffer capacity"
             );
+            device
+                .complete_io(req, -libc::EINVAL)
+                .context("complete oversized request")?;
+            return Ok(());
         }
-        device
-            .complete_io(req, status)
-            .context("complete ublk request")?;
-        Ok(())
+        payload = Some(
+            device
+                .checkout_buffer(req.queue_id, req.tag)
+                .context("checkout bulk buffer")?,
+        );
     }
-    .await;
 
-    result
+    let num_blocks = u32::try_from(req_len / block_size)
+        .context("request block count exceeds protocol limit")?;
+    let proto_req = Request::new(export_id, opcode, req.sector, num_blocks, 0);
+    trace!(
+        export_id,
+        dev_id = device.dev_id(),
+        queue = req.queue_id,
+        tag = req.tag,
+        op = ?opcode,
+        num_blocks,
+        req_bytes = req_len,
+        "sending smoo Request"
+    );
+    if run_with_liveness(host_online.clone(), gadget.send_request(proto_req))
+        .await
+        .is_err()
+    {
+        device
+            .complete_io(req, -libc::EAGAIN)
+            .context("complete request while host offline")?;
+        return Ok(());
+    }
+    trace!(
+        export_id,
+        dev_id = device.dev_id(),
+        queue = req.queue_id,
+        tag = req.tag,
+        "smoo Request sent"
+    );
+
+    if opcode == OpCode::Read && req_len > 0 {
+        if let Some(buf) = payload.as_mut() {
+            if run_with_liveness(
+                host_online.clone(),
+                gadget.read_bulk_buffer(&mut buf.as_mut_slice()[..req_len]),
+            )
+            .await
+            .is_err()
+            {
+                device
+                    .complete_io(req, -libc::EAGAIN)
+                    .context("complete request while host offline")?;
+                return Ok(());
+            }
+        }
+    } else if opcode == OpCode::Write && req_len > 0 {
+        if let Some(buf) = payload.as_mut() {
+            if run_with_liveness(
+                host_online.clone(),
+                gadget.write_bulk_buffer(&mut buf.as_mut_slice()[..req_len]),
+            )
+            .await
+            .is_err()
+            {
+                device
+                    .complete_io(req, -libc::EAGAIN)
+                    .context("complete request while host offline")?;
+                return Ok(());
+            }
+        }
+    }
+
+    let response = match run_with_liveness(host_online.clone(), gadget.read_response()).await {
+        Ok(resp) => resp,
+        Err(_) => {
+            device
+                .complete_io(req, -libc::EAGAIN)
+                .context("complete request while host offline")?;
+            return Ok(());
+        }
+    };
+
+    let status = response_status(&response, req_len, block_size)?;
+    if status >= 0 && (status as usize) != req_len {
+        warn!(
+            queue = req.queue_id,
+            tag = req.tag,
+            expected = req_len,
+            reported = status,
+            "response byte count mismatch"
+        );
+    }
+    device
+        .complete_io(req, status)
+        .context("complete ublk request")?;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct HostOffline;
+
+async fn run_with_liveness<F, T>(
+    mut online: watch::Receiver<bool>,
+    fut: F,
+) -> Result<T, HostOffline>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    tokio::pin!(fut);
+    loop {
+        tokio::select! {
+            res = &mut fut => return res.map_err(|_| HostOffline),
+            changed = online.changed() => {
+                if changed.is_ok() && !*online.borrow() {
+                    return Err(HostOffline);
+                }
+            }
+        }
+    }
 }
 
 async fn control_loop(
@@ -590,9 +680,13 @@ async fn control_loop(
                 let report = status.report().await;
                 let setup = setup_from_ctrl_req(sender.ctrl_req());
                 let mut io = UsbControlIo::from_sender(sender);
+                let is_status = setup.request() == SMOO_STATUS_REQUEST
+                    && setup.request_type() == SMOO_STATUS_REQ_TYPE;
                 if let Err(err) = handler.handle_setup_packet(&mut io, setup, &report).await {
                     warn!(error = ?err, "vendor setup handling failed");
                     let _ = io.stall().await;
+                } else if is_status && tx.send(ControlMessage::StatusPing).await.is_err() {
+                    anyhow::bail!("control channel closed");
                 }
             }
             usb_gadget::function::custom::Event::SetupHostToDevice(receiver) => {
@@ -791,6 +885,7 @@ async fn process_control_message(
                 warn!(error = ?err, "CONFIG_EXPORTS application failed");
             }
         }
+        ControlMessage::StatusPing => {}
     }
     Ok(())
 }
