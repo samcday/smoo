@@ -353,6 +353,23 @@ async fn run_event_loop(
     let mut host_online = true;
     let offline_tick = tokio::time::sleep(OFFLINE_DRAIN_INTERVAL);
     tokio::pin!(offline_tick);
+    let mark_offline =
+        |last_status: Instant,
+         host_online: &mut bool,
+         host_tx: &watch::Sender<bool>,
+         gadget: &mut Option<SmooGadget>,
+         offline_tick: &mut Pin<&mut tokio::time::Sleep>| {
+            *host_online = false;
+            let _ = host_tx.send(false);
+            *gadget = None;
+            offline_tick
+                .as_mut()
+                .reset(tokio::time::Instant::now() + OFFLINE_DRAIN_INTERVAL);
+            warn!(
+                since_ms = last_status.elapsed().as_millis(),
+                "SMOO_STATUS heartbeat missing; assuming host disconnected"
+            );
+        };
     loop {
         idle_sleep
             .as_mut()
@@ -362,16 +379,13 @@ async fn run_event_loop(
             reconcile_exports(ublk, &mut runtime).await?;
         }
         if host_online && last_status.elapsed() > STATUS_LIVENESS_TIMEOUT {
-            warn!(
-                since_ms = last_status.elapsed().as_millis(),
-                "SMOO_STATUS heartbeat missing; assuming host disconnected"
+            mark_offline(
+                last_status,
+                &mut host_online,
+                &host_tx,
+                &mut gadget,
+                &mut offline_tick,
             );
-            host_online = false;
-            gadget = None;
-            let _ = host_tx.send(false);
-            offline_tick
-                .as_mut()
-                .reset(tokio::time::Instant::now() + OFFLINE_DRAIN_INTERVAL);
         }
         let active_count = runtime
             .exports
@@ -456,6 +470,15 @@ async fn run_event_loop(
                     if let Some(ctrl) = runtime.exports.get_mut(&export_id) {
                         match req_res {
                             Ok(req) => {
+                                if host_online && last_status.elapsed() > STATUS_LIVENESS_TIMEOUT {
+                                    mark_offline(
+                                        last_status,
+                                        &mut host_online,
+                                        &host_tx,
+                                        &mut gadget,
+                                        &mut offline_tick,
+                                    );
+                                }
                                 if !host_online || gadget.is_none() {
                                     let _ = device
                                         .complete_io(req, -libc::EAGAIN)
