@@ -9,15 +9,10 @@ use std::{
     cmp,
     fs::File as StdFile,
     io,
-    os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+    os::fd::{AsRawFd, OwnedFd, RawFd},
 };
-use tokio::{
-    fs::File,
-    io::unix::AsyncFd,
-    io::{AsyncReadExt, AsyncWriteExt, Interest},
-    task,
-};
-use tracing::{trace, warn};
+use tokio::{fs::File, io::AsyncReadExt, io::AsyncWriteExt, task};
+use tracing::trace;
 
 mod dma;
 mod runtime;
@@ -726,59 +721,27 @@ fn set_nonblocking(raw: RawFd) -> io::Result<()> {
 async fn read_exact_async(fd: &EndpointFd, buf: &mut [u8]) -> io::Result<()> {
     let mut offset = 0;
     while offset < buf.len() {
-        match fd {
-            EndpointFd::Async(fd) => {
-                let mut guard = fd.readable().await?;
-                match guard.try_io(|inner| {
-                    let fd = inner.get_ref().as_raw_fd();
-                    let dst = unsafe { buf.as_mut_ptr().add(offset) as *mut libc::c_void };
-                    let remaining = buf.len() - offset;
-                    let res = unsafe { libc::read(fd, dst, remaining) };
-                    if res < 0 {
-                        let err = io::Error::last_os_error();
-                        if err.kind() == io::ErrorKind::Interrupted {
-                            return Ok(0);
-                        }
-                        Err(err)
-                    } else {
-                        Ok(res as usize)
-                    }
-                }) {
-                    Ok(Ok(0)) => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "short read on FunctionFS endpoint",
-                        ));
-                    }
-                    Ok(Ok(read)) => offset += read,
-                    Ok(Err(err)) => return Err(err),
-                    Err(_would_block) => continue,
+        poll_endpoint(fd.raw_fd(), libc::POLLIN)?;
+        let dst = unsafe { buf.as_mut_ptr().add(offset) as *mut libc::c_void };
+        let remaining = buf.len() - offset;
+        let res = unsafe { libc::read(fd.raw_fd(), dst, remaining) };
+        if res < 0 {
+            let err = io::Error::last_os_error();
+            match err.kind() {
+                io::ErrorKind::WouldBlock => {
+                    tokio::task::yield_now().await;
+                    continue;
                 }
+                io::ErrorKind::Interrupted => continue,
+                _ => return Err(err),
             }
-            EndpointFd::Manual(fd_owned) => {
-                let fd_raw = fd_owned.as_raw_fd();
-                let dst = unsafe { buf.as_mut_ptr().add(offset) as *mut libc::c_void };
-                let remaining = buf.len() - offset;
-                let res = unsafe { libc::read(fd_raw, dst, remaining) };
-                if res < 0 {
-                    let err = io::Error::last_os_error();
-                    match err.kind() {
-                        io::ErrorKind::WouldBlock => {
-                            tokio::task::yield_now().await;
-                            continue;
-                        }
-                        io::ErrorKind::Interrupted => continue,
-                        _ => return Err(err),
-                    }
-                } else if res == 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "short read on FunctionFS endpoint",
-                    ));
-                } else {
-                    offset += res as usize;
-                }
-            }
+        } else if res == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "short read on FunctionFS endpoint",
+            ));
+        } else {
+            offset += res as usize;
         }
     }
     Ok(())
@@ -787,96 +750,71 @@ async fn read_exact_async(fd: &EndpointFd, buf: &mut [u8]) -> io::Result<()> {
 async fn write_all_async(fd: &EndpointFd, buf: &[u8]) -> io::Result<()> {
     let mut offset = 0;
     while offset < buf.len() {
-        match fd {
-            EndpointFd::Async(fd) => {
-                let mut guard = fd.writable().await?;
-                match guard.try_io(|inner| {
-                    let fd = inner.get_ref().as_raw_fd();
-                    let src = unsafe { buf.as_ptr().add(offset) as *const libc::c_void };
-                    let remaining = buf.len() - offset;
-                    let res = unsafe { libc::write(fd, src, remaining) };
-                    if res < 0 {
-                        let err = io::Error::last_os_error();
-                        if err.kind() == io::ErrorKind::Interrupted {
-                            return Ok(0);
-                        }
-                        Err(err)
-                    } else {
-                        Ok(res as usize)
-                    }
-                }) {
-                    Ok(Ok(written)) => offset += written,
-                    Ok(Err(err)) => return Err(err),
-                    Err(_would_block) => continue,
+        poll_endpoint(fd.raw_fd(), libc::POLLOUT)?;
+        let src = unsafe { buf.as_ptr().add(offset) as *const libc::c_void };
+        let remaining = buf.len() - offset;
+        let res = unsafe { libc::write(fd.raw_fd(), src, remaining) };
+        if res < 0 {
+            let err = io::Error::last_os_error();
+            match err.kind() {
+                io::ErrorKind::WouldBlock => {
+                    tokio::task::yield_now().await;
+                    continue;
                 }
+                io::ErrorKind::Interrupted => continue,
+                _ => return Err(err),
             }
-            EndpointFd::Manual(fd_owned) => {
-                let fd_raw = fd_owned.as_raw_fd();
-                let src = unsafe { buf.as_ptr().add(offset) as *const libc::c_void };
-                let remaining = buf.len() - offset;
-                let res = unsafe { libc::write(fd_raw, src, remaining) };
-                if res < 0 {
-                    let err = io::Error::last_os_error();
-                    match err.kind() {
-                        io::ErrorKind::WouldBlock => {
-                            tokio::task::yield_now().await;
-                            continue;
-                        }
-                        io::ErrorKind::Interrupted => continue,
-                        _ => return Err(err),
-                    }
-                } else {
-                    offset += res as usize;
-                }
-            }
+        } else {
+            offset += res as usize;
         }
     }
     Ok(())
 }
 
-enum EndpointFd {
-    Async(AsyncFd<OwnedFd>),
-    Manual(OwnedFd),
+fn poll_endpoint(fd: RawFd, events: libc::c_short) -> io::Result<()> {
+    let mut pfd = libc::pollfd {
+        fd,
+        events,
+        revents: 0,
+    };
+    loop {
+        let res = unsafe { libc::poll(&mut pfd, 1, 100) };
+        if res < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        } else if res == 0 {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
+        if pfd.revents & (libc::POLLERR | libc::POLLHUP) != 0 {
+            return Err(io::Error::from(io::ErrorKind::BrokenPipe));
+        }
+        return Ok(());
+    }
+}
+
+struct EndpointFd {
+    fd: OwnedFd,
 }
 
 impl EndpointFd {
     fn new(fd: OwnedFd, label: &'static str) -> io::Result<Self> {
-        set_nonblocking(fd.as_raw_fd()).map_err(|err| {
-            io::Error::new(
-                err.kind(),
-                format!("set_nonblocking failed for {label}: {err}"),
-            )
-        })?;
-        match dup_fd(&fd)
-            .and_then(|dup| AsyncFd::with_interest(dup, Interest::READABLE | Interest::WRITABLE))
-        {
-            Ok(async_fd) => Ok(Self::Async(async_fd)),
-            Err(err) => {
-                warn!(
-                    label,
-                    error = ?err,
-                    "AsyncFd registration failed; falling back to manual polling"
-                );
-                Ok(Self::Manual(fd))
-            }
+        if let Err(err) = set_nonblocking(fd.as_raw_fd()) {
+            trace!(
+                fd = fd.as_raw_fd(),
+                label,
+                error = ?err,
+                "set_nonblocking failed; continuing"
+            );
         }
+        Ok(Self { fd })
     }
 
     fn raw_fd(&self) -> RawFd {
-        match self {
-            EndpointFd::Async(fd) => fd.get_ref().as_raw_fd(),
-            EndpointFd::Manual(fd) => fd.as_raw_fd(),
-        }
+        self.fd.as_raw_fd()
     }
-}
-
-fn dup_fd(fd: &OwnedFd) -> io::Result<OwnedFd> {
-    let new_fd = unsafe { libc::dup(fd.as_raw_fd()) };
-    if new_fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // Safety: dup returns a new owned descriptor.
-    Ok(unsafe { OwnedFd::from_raw_fd(new_fd) })
 }
 
 #[cfg(test)]
