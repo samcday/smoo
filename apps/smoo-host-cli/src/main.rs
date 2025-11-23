@@ -3,7 +3,7 @@ use clap::{ArgGroup, Parser};
 use rusb::{Direction, TransferType, UsbContext};
 use smoo_host_blocksource_cached::{CachedBlockSource, MemoryCacheStore};
 use smoo_host_blocksource_http::HttpBlockSource;
-use smoo_host_blocksources::{DeviceBlockSource, FileBlockSource};
+use smoo_host_blocksources::{DeviceBlockSource, FileBlockSource, RandomBlockSource};
 use smoo_host_core::{
     control::{fetch_ident, read_status, send_config_exports_v0, ConfigExportsV0},
     BlockSource, BlockSourceResult, HostErrorKind, SmooHost, TransportError, TransportErrorKind,
@@ -30,7 +30,11 @@ const RECONNECT_PAUSE: Duration = Duration::from_secs(1);
     about = "Host shim for smoo gadgets",
     long_about = "Host shim for smoo gadgets. By default all visible USB devices are scanned and the first interface matching the vendor triple 0xFF/0x53/0x4D is selected."
 )]
-#[command(group = ArgGroup::new("backing").args(["files", "devices", "http", "cached_http"]).required(true))]
+#[command(
+    group = ArgGroup::new("backing")
+        .args(["files", "devices", "http", "cached_http", "random"])
+        .required(true)
+)]
 struct Args {
     /// Optional USB vendor ID filter (hex). Defaults to all vendors.
     #[arg(long, value_name = "HEX", value_parser = parse_hex_u16)]
@@ -50,6 +54,12 @@ struct Args {
     /// HTTP backing image(s) cached in memory. Repeatable; must be absolute URLs.
     #[arg(long = "cached-http", value_name = "URL")]
     cached_http: Vec<String>,
+    /// Synthetic random backing sized in blocks. Repeatable.
+    #[arg(long = "random", value_name = "BLOCKS")]
+    random: Vec<u64>,
+    /// Seed for random backing. When multiple --random entries are provided, each uses seed+index.
+    #[arg(long, default_value_t = 0)]
+    random_seed: u64,
     /// Logical block size exposed through the gadget (bytes)
     #[arg(long, default_value_t = 512)]
     block_size: u32,
@@ -63,6 +73,7 @@ enum HostSource {
     Device(DeviceBlockSource),
     Http(HttpBlockSource),
     CachedHttp(CachedBlockSource<HttpBlockSource, MemoryCacheStore>),
+    Random(RandomBlockSource),
 }
 
 #[derive(Clone)]
@@ -86,6 +97,7 @@ impl BlockSource for HostSource {
             HostSource::Device(inner) => inner.block_size(),
             HostSource::Http(inner) => inner.block_size(),
             HostSource::CachedHttp(inner) => inner.block_size(),
+            HostSource::Random(inner) => inner.block_size(),
         }
     }
 
@@ -95,6 +107,7 @@ impl BlockSource for HostSource {
             HostSource::Device(inner) => inner.total_blocks().await,
             HostSource::Http(inner) => inner.total_blocks().await,
             HostSource::CachedHttp(inner) => inner.total_blocks().await,
+            HostSource::Random(inner) => inner.total_blocks().await,
         }
     }
 
@@ -104,6 +117,7 @@ impl BlockSource for HostSource {
             HostSource::Device(inner) => inner.read_blocks(lba, buf).await,
             HostSource::Http(inner) => inner.read_blocks(lba, buf).await,
             HostSource::CachedHttp(inner) => inner.read_blocks(lba, buf).await,
+            HostSource::Random(inner) => inner.read_blocks(lba, buf).await,
         }
     }
 
@@ -113,6 +127,7 @@ impl BlockSource for HostSource {
             HostSource::Device(inner) => inner.write_blocks(lba, buf).await,
             HostSource::Http(inner) => inner.write_blocks(lba, buf).await,
             HostSource::CachedHttp(inner) => inner.write_blocks(lba, buf).await,
+            HostSource::Random(inner) => inner.write_blocks(lba, buf).await,
         }
     }
 
@@ -122,6 +137,7 @@ impl BlockSource for HostSource {
             HostSource::Device(inner) => inner.flush().await,
             HostSource::Http(inner) => inner.flush().await,
             HostSource::CachedHttp(inner) => inner.flush().await,
+            HostSource::Random(inner) => inner.flush().await,
         }
     }
 
@@ -131,6 +147,7 @@ impl BlockSource for HostSource {
             HostSource::Device(inner) => inner.discard(lba, num_blocks).await,
             HostSource::Http(inner) => inner.discard(lba, num_blocks).await,
             HostSource::CachedHttp(inner) => inner.discard(lba, num_blocks).await,
+            HostSource::Random(inner) => inner.discard(lba, num_blocks).await,
         }
     }
 }
@@ -503,9 +520,14 @@ async fn open_sources(args: &Args) -> Result<(BTreeMap<u32, SharedSource>, Confi
     let mut sources = BTreeMap::new();
     let mut entries: Vec<smoo_proto::ConfigExport> = Vec::new();
     let mut next_id: u32 = 1;
+    let block_size = args.block_size;
+    ensure!(
+        block_size.is_power_of_two(),
+        "block size must be a power of two"
+    );
+    ensure!(block_size > 0, "block size must be non-zero");
 
     for path in &args.files {
-        let block_size = args.block_size;
         let size_bytes = file_size_bytes(path)?;
         let source = SharedSource::new(HostSource::File(
             FileBlockSource::open(path, block_size).await?,
@@ -522,7 +544,6 @@ async fn open_sources(args: &Args) -> Result<(BTreeMap<u32, SharedSource>, Confi
     }
 
     for path in &args.devices {
-        let block_size = args.block_size;
         let size_bytes = file_size_bytes(path)?;
         let source = SharedSource::new(HostSource::Device(
             DeviceBlockSource::open(path, block_size).await?,
@@ -546,7 +567,6 @@ async fn open_sources(args: &Args) -> Result<(BTreeMap<u32, SharedSource>, Confi
             "unsupported URL scheme {}",
             url.scheme()
         );
-        let block_size = args.block_size;
         let source = HttpBlockSource::new(url.clone(), block_size)
             .await
             .context("init HTTP block source")?;
@@ -575,7 +595,6 @@ async fn open_sources(args: &Args) -> Result<(BTreeMap<u32, SharedSource>, Confi
             "unsupported URL scheme {}",
             url.scheme()
         );
-        let block_size = args.block_size;
         let source = HttpBlockSource::new(url.clone(), block_size)
             .await
             .context("init HTTP block source")?;
@@ -592,6 +611,26 @@ async fn open_sources(args: &Args) -> Result<(BTreeMap<u32, SharedSource>, Confi
             .context("init cached HTTP block source")?;
         let shared = SharedSource::new(HostSource::CachedHttp(cached));
         sources.insert(next_id, shared);
+        entries.push(smoo_proto::ConfigExport {
+            export_id: next_id,
+            block_size,
+            size_bytes,
+        });
+        next_id = next_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("export_id overflow"))?;
+    }
+
+    for (idx, blocks) in args.random.iter().copied().enumerate() {
+        ensure!(blocks > 0, "random backing requires block count > 0");
+        let size_bytes = blocks
+            .checked_mul(block_size as u64)
+            .ok_or_else(|| anyhow!("random backing size overflows u64"))?;
+        let seed = args.random_seed.wrapping_add(idx as u64);
+        let source = SharedSource::new(HostSource::Random(RandomBlockSource::new(
+            block_size, blocks, seed,
+        )?));
+        sources.insert(next_id, source);
         entries.push(smoo_proto::ConfigExport {
             export_id: next_id,
             block_size,
