@@ -14,7 +14,7 @@ use anyhow::{Context, ensure};
 use async_channel::{Receiver, RecvError, Sender};
 use io_uring::{IoUring, cqueue, squeue, types};
 use std::cmp;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io;
 use std::mem::{size_of, transmute};
@@ -32,6 +32,7 @@ use tracing::{Level, debug, error, info, trace, warn};
 pub struct SmooUblk {
     handle: Option<JoinHandle<()>>,
     sender: Sender<CtrlCommand>,
+    managed_devs: HashSet<u32>,
 }
 
 const CTRL_RING_DEPTH: u32 = 8;
@@ -249,6 +250,7 @@ impl SmooUblk {
         Ok(Self {
             handle: Some(handle),
             sender,
+            managed_devs: HashSet::new(),
         })
     }
 
@@ -400,6 +402,7 @@ impl SmooUblk {
         // ublksrv_ctrl_dev_info struct.
         let dev_id = info.dev_id as u32;
         cmd.dev_id = dev_id;
+        self.managed_devs.insert(dev_id);
 
         // Now we pass the ublk_params in a UBLK_CMD_SET_PARAMS to inform ublk of geometry/capacity.
         cmd.len = params.len as _;
@@ -638,6 +641,7 @@ impl SmooUblk {
             shutdown: false,
         };
 
+        self.managed_devs.insert(dev_id);
         Ok(device)
     }
 
@@ -722,10 +726,11 @@ impl SmooUblk {
             .await?;
         }
 
+        self.managed_devs.remove(&dev_id);
         Ok(())
     }
 
-    pub async fn force_remove_device(&self, dev_id: u32) -> anyhow::Result<()> {
+    pub async fn force_remove_device(&mut self, dev_id: u32) -> anyhow::Result<()> {
         let cmd = ublksrv_ctrl_cmd {
             dev_id,
             queue_id: u16::MAX,
@@ -746,18 +751,62 @@ impl SmooUblk {
         {
             warn!(dev_id, error = ?err, "force delete failed");
         }
+        self.managed_devs.remove(&dev_id);
         Ok(())
     }
 }
 
 impl Drop for SmooUblk {
     fn drop(&mut self) {
+        self.teardown_managed_devices();
         self.sender.close();
         if let Some(handle) = self.handle.take()
             && let Err(err) = handle.join()
         {
             warn!("smoo-gadget-ublk ctrl loop panicked: {:?}", err);
         }
+    }
+}
+
+impl SmooUblk {
+    fn teardown_managed_devices(&mut self) {
+        let dev_ids: Vec<u32> = self.managed_devs.drain().collect();
+        for dev_id in dev_ids {
+            if let Err(err) = self.stop_and_delete_blocking(dev_id) {
+                warn!(dev_id, error = ?err, "drop cleanup failed; ublk device may persist");
+            }
+        }
+    }
+
+    fn stop_and_delete_blocking(&self, dev_id: u32) -> anyhow::Result<()> {
+        let mut stop_err = None;
+        let mut del_err = None;
+
+        let stop_cmd = ublksrv_ctrl_cmd {
+            dev_id,
+            queue_id: u16::MAX,
+            ..Default::default()
+        };
+        if let Err(err) =
+            submit_ctrl_command_blocking(&self.sender, UBLK_CMD_STOP_DEV, stop_cmd, "stop device")
+        {
+            warn!(dev_id, error = ?err, "drop STOP_DEV failed");
+            stop_err = Some(err);
+        }
+
+        let del_cmd = ublksrv_ctrl_cmd {
+            dev_id,
+            queue_id: u16::MAX,
+            ..Default::default()
+        };
+        if let Err(err) =
+            submit_ctrl_command_blocking(&self.sender, UBLK_CMD_DEL_DEV, del_cmd, "delete device")
+        {
+            warn!(dev_id, error = ?err, "drop DEL_DEV failed");
+            del_err = Some(err);
+        }
+
+        stop_err.or(del_err).map_or(Ok(()), Err)
     }
 }
 
@@ -1323,6 +1372,14 @@ fn submit_ctrl_command_blocking(
     label: &'static str,
 ) -> anyhow::Result<()> {
     let (reply_tx, reply_rx) = async_channel::bounded::<Result<(), io::Error>>(1);
+    debug!(
+        opcode = opcode,
+        dev_id = cmd.dev_id,
+        queue_id = cmd.queue_id,
+        len = cmd.len,
+        addr = cmd.addr,
+        "{label} submitting"
+    );
     sender
         .send_blocking((opcode, cmd, reply_tx, None))
         .context("send ctrl command blocking")?;

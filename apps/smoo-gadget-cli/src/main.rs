@@ -397,6 +397,8 @@ async fn run_event_loop(
         }
     }
 
+    // Ensure any in-flight IO futures drop their devices before teardown.
+    drop(io_futs);
     cleanup_ublk_devices(ublk, &mut runtime).await?;
     runtime.status().set_export_count(0).await;
 
