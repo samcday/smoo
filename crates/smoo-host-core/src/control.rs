@@ -1,5 +1,5 @@
-use alloc::{format, string::String};
 use crate::{ControlTransport, TransportError, TransportErrorKind, TransportResult};
+use alloc::{format, string::String};
 use smoo_proto::{
     CONFIG_EXPORTS_REQ_TYPE, CONFIG_EXPORTS_REQUEST, IDENT_LEN, IDENT_REQUEST, Ident,
     SMOO_STATUS_LEN, SMOO_STATUS_REQ_TYPE, SMOO_STATUS_REQUEST, SmooStatusV0,

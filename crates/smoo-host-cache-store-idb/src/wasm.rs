@@ -26,15 +26,18 @@ impl IdbCacheStore {
         }
         let name = name.into();
         let window = web_sys::window().ok_or_else(|| {
-            BlockSourceError::with_message(BlockSourceErrorKind::Unsupported, "window not available")
+            BlockSourceError::with_message(
+                BlockSourceErrorKind::Unsupported,
+                "window not available",
+            )
         })?;
-        let factory = window
-            .indexed_db()
-            .map_err(js_io)?
-            .ok_or_else(|| BlockSourceError::with_message(BlockSourceErrorKind::Unsupported, "indexedDB unavailable"))?;
-        let request = factory
-            .open_with_u32(&name, 1)
-            .map_err(js_io)?;
+        let factory = window.indexed_db().map_err(js_io)?.ok_or_else(|| {
+            BlockSourceError::with_message(
+                BlockSourceErrorKind::Unsupported,
+                "indexedDB unavailable",
+            )
+        })?;
+        let request = factory.open_with_u32(&name, 1).map_err(js_io)?;
         {
             let on_upgrade = {
                 let request = request.clone();
@@ -58,12 +61,7 @@ impl IdbCacheStore {
                     {
                         let _ = db.create_object_store("blocks");
                     }
-                    if db
-                        .object_store_names()
-                        .to_vec()
-                        .iter()
-                        .all(|s| s != "meta")
-                    {
+                    if db.object_store_names().to_vec().iter().all(|s| s != "meta") {
                         let store = db
                             .create_object_store("meta")
                             .expect("create meta store succeeds");
@@ -77,16 +75,13 @@ impl IdbCacheStore {
                         let meta = meta_object(meta_block_size, meta_total_blocks);
                         let _ = store.put_with_key(&meta, &JsValue::from_str("meta"));
                     }
-                }) as Box<dyn FnMut(_)>)};
+                }) as Box<dyn FnMut(_)>)
+            };
             request.set_onupgradeneeded(Some(on_upgrade.as_ref().unchecked_ref()));
             on_upgrade.forget();
         }
         let _ = JsFuture::from(request.clone()).await.map_err(js_io)?;
-        let db: IdbDatabase = request
-            .result()
-            .map_err(js_io)?
-            .dyn_into()
-            .map_err(js_io)?;
+        let db: IdbDatabase = request.result().map_err(js_io)?.dyn_into().map_err(js_io)?;
         validate_meta(&db, block_size, total_blocks).await?;
         Ok(Self {
             db,
@@ -144,9 +139,9 @@ impl CacheStore for IdbCacheStore {
             ));
         }
         let blocks = (data.len() / self.block_size as usize) as u64;
-        let end = start_block
-            .checked_add(blocks)
-            .ok_or_else(|| BlockSourceError::with_message(BlockSourceErrorKind::OutOfRange, "block overflow"))?;
+        let end = start_block.checked_add(blocks).ok_or_else(|| {
+            BlockSourceError::with_message(BlockSourceErrorKind::OutOfRange, "block overflow")
+        })?;
         if end > self.total_blocks {
             return Err(BlockSourceError::with_message(
                 BlockSourceErrorKind::OutOfRange,
@@ -183,9 +178,7 @@ async fn validate_meta(
         .transaction_with_str_and_mode("meta", IdbTransactionMode::Readonly)
         .map_err(js_io)?;
     let store = tx.object_store("meta").map_err(js_io)?;
-    let request = store
-        .get(&JsValue::from_str("meta"))
-        .map_err(js_io)?;
+    let request = store.get(&JsValue::from_str("meta")).map_err(js_io)?;
     let value = JsFuture::from(request).await.map_err(js_io)?;
     if value.is_null() || value.is_undefined() {
         return Err(BlockSourceError::with_message(
@@ -197,13 +190,19 @@ async fn validate_meta(
         .map_err(js_io)?
         .as_f64()
         .ok_or_else(|| {
-            BlockSourceError::with_message(BlockSourceErrorKind::Io, "indexeddb meta missing block_size")
+            BlockSourceError::with_message(
+                BlockSourceErrorKind::Io,
+                "indexeddb meta missing block_size",
+            )
         })? as u32;
     let stored_total_blocks = js_sys::Reflect::get(&value, &JsValue::from_str("total_blocks"))
         .map_err(js_io)?
         .as_f64()
         .ok_or_else(|| {
-            BlockSourceError::with_message(BlockSourceErrorKind::Io, "indexeddb meta missing total_blocks")
+            BlockSourceError::with_message(
+                BlockSourceErrorKind::Io,
+                "indexeddb meta missing total_blocks",
+            )
         })? as u64;
     if stored_block_size != block_size || stored_total_blocks != total_blocks {
         return Err(BlockSourceError::with_message(

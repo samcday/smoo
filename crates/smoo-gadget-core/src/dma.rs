@@ -3,7 +3,7 @@ use dma_heap::HeapKind;
 use mmap::MemoryMap;
 use nix::{
     ioctl_readwrite, ioctl_write_ptr,
-    poll::{poll, PollFd, PollFlags, PollTimeout},
+    poll::{PollFd, PollFlags, PollTimeout, poll},
 };
 use std::{
     collections::VecDeque,
@@ -162,7 +162,6 @@ impl BufferHandle {
             BufferHandle::Copy(_) => Ok(()),
         }
     }
-
 }
 
 pub(crate) fn dmabuf_transfer_blocking(

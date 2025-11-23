@@ -87,9 +87,9 @@ where
     }
 
     fn validate_range(&self, lba: u64, blocks: u64) -> BlockSourceResult<()> {
-        let end = lba
-            .checked_add(blocks)
-            .ok_or_else(|| BlockSourceError::with_message(BlockSourceErrorKind::OutOfRange, "lba overflow"))?;
+        let end = lba.checked_add(blocks).ok_or_else(|| {
+            BlockSourceError::with_message(BlockSourceErrorKind::OutOfRange, "lba overflow")
+        })?;
         if end > self.total_blocks {
             return Err(BlockSourceError::with_message(
                 BlockSourceErrorKind::OutOfRange,
@@ -176,9 +176,9 @@ where
     async fn fetch_and_populate(&self, ranges: &[(u64, u64)]) -> BlockSourceResult<()> {
         let bs = self.block_size_usize();
         for (start_block, len_blocks) in ranges {
-            let expected_bytes = (*len_blocks as usize)
-                .checked_mul(bs)
-                .ok_or_else(|| BlockSourceError::with_message(BlockSourceErrorKind::OutOfRange, "range too large"))?;
+            let expected_bytes = (*len_blocks as usize).checked_mul(bs).ok_or_else(|| {
+                BlockSourceError::with_message(BlockSourceErrorKind::OutOfRange, "range too large")
+            })?;
             let mut buf = vec![0u8; expected_bytes];
             let read = self.inner.read_blocks(*start_block, &mut buf).await?;
             if read != expected_bytes {
@@ -297,7 +297,9 @@ impl MemoryCacheStore {
         }
         let total_bytes = (total_blocks as u128)
             .checked_mul(block_size as u128)
-            .ok_or_else(|| BlockSourceError::with_message(BlockSourceErrorKind::OutOfRange, "cache too large"))?;
+            .ok_or_else(|| {
+                BlockSourceError::with_message(BlockSourceErrorKind::OutOfRange, "cache too large")
+            })?;
         if total_bytes > usize::MAX as u128 {
             return Err(BlockSourceError::with_message(
                 BlockSourceErrorKind::OutOfRange,
@@ -326,7 +328,9 @@ impl MemoryCacheStore {
         }
         let byte_offset = (block_idx as usize)
             .checked_mul(self.block_size_usize())
-            .ok_or_else(|| BlockSourceError::with_message(BlockSourceErrorKind::OutOfRange, "offset overflow"))?;
+            .ok_or_else(|| {
+                BlockSourceError::with_message(BlockSourceErrorKind::OutOfRange, "offset overflow")
+            })?;
         Ok(byte_offset)
     }
 
