@@ -17,6 +17,7 @@ use std::{
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     pin::Pin,
+    sync::atomic::{AtomicU64, Ordering},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -139,6 +140,9 @@ async fn main() -> Result<()> {
 
     let control_handler = gadget.control_handler();
     let (control_tx, control_rx) = mpsc::channel(8);
+    let heartbeat_millis = Arc::new(AtomicU64::new(
+        tokio::time::Instant::now().elapsed().as_millis() as u64,
+    ));
 
     let exports = build_initial_exports(&state_store);
     let initial_export_count = exports
@@ -153,8 +157,10 @@ async fn main() -> Result<()> {
         custom,
         control_handler,
         status.clone(),
-        control_tx,
+        control_tx.clone(),
+        heartbeat_millis.clone(),
     ));
+    let watchdog_task = tokio::spawn(heartbeat_watchdog(control_tx, heartbeat_millis.clone()));
     let tunables = RuntimeTunables {
         queue_count: args.queue_count,
         queue_depth: args.queue_depth,
@@ -178,6 +184,8 @@ async fn main() -> Result<()> {
     .await;
     control_task.abort();
     let _ = control_task.await;
+    watchdog_task.abort();
+    let _ = watchdog_task.await;
     result
 }
 
@@ -244,6 +252,7 @@ enum ControlMessage {
     Config(ConfigExportsV0),
     StatusPing,
     HostDisconnected,
+    HeartbeatTimeout,
 }
 
 fn build_initial_exports(state_store: &StateStore) -> HashMap<u32, ExportController> {
@@ -431,6 +440,17 @@ async fn run_event_loop(
                                 &mut gadget,
                                 &mut offline_tick,
                             );
+                        }
+                        ControlMessage::HeartbeatTimeout => {
+                            if host_online {
+                                mark_offline(
+                                    last_status,
+                                    &mut host_online,
+                                    &host_tx,
+                                    &mut gadget,
+                                    &mut offline_tick,
+                                );
+                            }
                         }
                         _ => {}
                     }
@@ -755,6 +775,7 @@ async fn control_loop(
     handler: GadgetControl,
     status: GadgetStatusShared,
     tx: mpsc::Sender<ControlMessage>,
+    heartbeat_millis: Arc<AtomicU64>,
 ) -> Result<()> {
     loop {
         custom
@@ -798,6 +819,11 @@ async fn control_loop(
                     let _ = io.stall().await;
                 } else if is_status && tx.send(ControlMessage::StatusPing).await.is_err() {
                     anyhow::bail!("control channel closed");
+                } else if is_status {
+                    heartbeat_millis.store(
+                        tokio::time::Instant::now().elapsed().as_millis() as u64,
+                        Ordering::Relaxed,
+                    );
                 }
             }
             usb_gadget::function::custom::Event::SetupHostToDevice(receiver) => {
@@ -806,6 +832,10 @@ async fn control_loop(
                 let mut io = UsbControlIo::from_receiver(receiver);
                 match handler.handle_setup_packet(&mut io, setup, &report).await {
                     Ok(Some(SetupCommand::Config(payload))) => {
+                        heartbeat_millis.store(
+                            tokio::time::Instant::now().elapsed().as_millis() as u64,
+                            Ordering::Relaxed,
+                        );
                         if tx.send(ControlMessage::Config(payload)).await.is_err() {
                             anyhow::bail!("control channel closed");
                         }
@@ -998,8 +1028,23 @@ async fn process_control_message(
         }
         ControlMessage::StatusPing => {}
         ControlMessage::HostDisconnected => {}
+        ControlMessage::HeartbeatTimeout => {}
     }
     Ok(())
+}
+
+async fn heartbeat_watchdog(tx: mpsc::Sender<ControlMessage>, heartbeat_millis: Arc<AtomicU64>) {
+    let interval = STATUS_LIVENESS_TIMEOUT / 2;
+    loop {
+        tokio::time::sleep(interval).await;
+        let last = heartbeat_millis.load(Ordering::Relaxed);
+        let now = tokio::time::Instant::now().elapsed().as_millis() as u64;
+        if now.saturating_sub(last) > STATUS_LIVENESS_TIMEOUT.as_millis() as u64 {
+            if tx.send(ControlMessage::HeartbeatTimeout).await.is_err() {
+                break;
+            }
+        }
+    }
 }
 
 async fn apply_config(
