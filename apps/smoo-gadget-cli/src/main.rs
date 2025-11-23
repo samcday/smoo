@@ -14,6 +14,7 @@ use std::{
     fs::File,
     io,
     os::fd::{FromRawFd, IntoRawFd, OwnedFd},
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
@@ -95,7 +96,8 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     usb_gadget::remove_all().context("remove existing USB gadgets")?;
-    let (custom, endpoints, _gadget_guard) = setup_functionfs(&args).context("setup FunctionFS")?;
+    let (custom, endpoints, endpoint_paths, _gadget_guard) =
+        setup_functionfs(&args).context("setup FunctionFS")?;
 
     let mut ublk = SmooUblk::new().context("init ublk")?;
     let mut state_store = if let Some(path) = args.state_file.as_ref() {
@@ -165,7 +167,15 @@ async fn main() -> Result<()> {
         exports,
         tunables,
     };
-    let result = run_event_loop(&mut ublk, gadget, runtime, control_rx).await;
+    let result = run_event_loop(
+        &mut ublk,
+        gadget,
+        gadget_config,
+        endpoint_paths,
+        runtime,
+        control_rx,
+    )
+    .await;
     control_task.abort();
     let _ = control_task.await;
     result
@@ -324,11 +334,14 @@ fn enqueue_io(runtime: &mut RuntimeState, io_futs: &mut FuturesUnordered<IoFutur
 
 async fn run_event_loop(
     ublk: &mut SmooUblk,
-    mut gadget: SmooGadget,
+    gadget: SmooGadget,
+    gadget_config: GadgetConfig,
+    endpoint_paths: FunctionfsEndpointPaths,
     mut runtime: RuntimeState,
     mut control_rx: mpsc::Receiver<ControlMessage>,
 ) -> Result<()> {
     let (host_tx, host_rx) = watch::channel(true);
+    let mut gadget = Some(gadget);
     let shutdown = signal::ctrl_c();
     tokio::pin!(shutdown);
     let mut io_futs: FuturesUnordered<IoFuture> = FuturesUnordered::new();
@@ -354,6 +367,7 @@ async fn run_event_loop(
                 "SMOO_STATUS heartbeat missing; assuming host disconnected"
             );
             host_online = false;
+            gadget = None;
             let _ = host_tx.send(false);
             offline_tick
                 .as_mut()
@@ -379,6 +393,19 @@ async fn run_event_loop(
                         if !host_online {
                             host_online = true;
                             let _ = host_tx.send(true);
+                            if gadget.is_none() {
+                                match open_functionfs_endpoints(&endpoint_paths)
+                                    .and_then(|eps| SmooGadget::new(eps, gadget_config))
+                                {
+                                    Ok(new_gadget) => {
+                                        gadget = Some(new_gadget);
+                                        info!("FunctionFS endpoints reopened after host return");
+                                    }
+                                    Err(err) => {
+                                        warn!(error = ?err, "failed to reopen FunctionFS endpoints");
+                                    }
+                                }
+                            }
                         }
                     }
                     process_control_message(msg, ublk, &mut runtime).await?;
@@ -388,13 +415,54 @@ async fn run_event_loop(
             }
             _ = &mut offline_tick, if !host_online => {
                 offline_tick.as_mut().reset(tokio::time::Instant::now() + OFFLINE_DRAIN_INTERVAL);
-                debug!("host offline; dropping queued I/O with EAGAIN");
+                let pending: Vec<_> = runtime
+                    .exports
+                    .iter_mut()
+                    .filter_map(|(export_id, ctrl)| {
+                        if let Some((kind, dev_id, device)) = ctrl.take_device_for_io() {
+                            Some((*export_id, kind, dev_id, device))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                for (export_id, kind, dev_id, device) in pending {
+                    debug!(
+                        export_id,
+                        dev_id,
+                        kind = ?kind,
+                        "host offline; draining queued I/O with EAGAIN"
+                    );
+                    // Complete any outstanding request slot with EAGAIN to unblock queue workers.
+                    // We don't have the original request here, so we synthesize a minimal one with tag 0.
+                    let _ = device.complete_io(
+                        UblkIoRequest {
+                            dev_id,
+                            queue_id: 0,
+                            tag: 0,
+                            op: UblkOp::Read,
+                            sector: 0,
+                            num_sectors: 0,
+                        },
+                        -libc::EAGAIN,
+                    );
+                    if let Some(ctrl) = runtime.exports.get_mut(&export_id) {
+                        ctrl.restore_device_after_io(kind, dev_id, device);
+                    }
+                }
             }
             next_io = io_futs.next(), if !io_futs.is_empty() => {
                 if let Some((export_id, kind, dev_id, req_res, device)) = next_io {
                     if let Some(ctrl) = runtime.exports.get_mut(&export_id) {
                         match req_res {
                             Ok(req) => {
+                                if !host_online || gadget.is_none() {
+                                    let _ = device
+                                        .complete_io(req, -libc::EAGAIN)
+                                        .context("complete request while host offline");
+                                    ctrl.restore_device_after_io(kind, dev_id, device);
+                                    continue;
+                                }
                                 trace!(
                                     export_id,
                                     dev_id,
@@ -406,7 +474,9 @@ async fn run_event_loop(
                                     "dispatch ublk request to host"
                                 );
                                 if let Err(err) = handle_request(
-                                    &mut gadget,
+                                    gadget
+                                        .as_mut()
+                                        .expect("gadget present when host_online true"),
                                     export_id,
                                     &device,
                                     req,
@@ -943,7 +1013,21 @@ struct GadgetGuard {
     registration: RegGadget,
 }
 
-fn setup_functionfs(args: &Args) -> Result<(Custom, FunctionfsEndpoints, GadgetGuard)> {
+struct FunctionfsEndpointPaths {
+    interrupt_in: PathBuf,
+    interrupt_out: PathBuf,
+    bulk_in: PathBuf,
+    bulk_out: PathBuf,
+}
+
+fn setup_functionfs(
+    args: &Args,
+) -> Result<(
+    Custom,
+    FunctionfsEndpoints,
+    FunctionfsEndpointPaths,
+    GadgetGuard,
+)> {
     let builder = Custom::builder().with_interface(
         Interface::new(Class::vendor_specific(SMOO_SUBCLASS, SMOO_PROTOCOL), "smoo")
             .with_endpoint(interrupt_in_ep())
@@ -964,13 +1048,24 @@ fn setup_functionfs(args: &Args) -> Result<(Custom, FunctionfsEndpoints, GadgetG
     let ffs_dir = custom.ffs_dir().context("resolve FunctionFS dir")?;
     reg.bind(Some(&udc)).context("bind gadget to UDC")?;
 
-    let interrupt_in = open_endpoint_fd(ffs_dir.join("ep1")).context("open interrupt IN")?;
-    let interrupt_out = open_endpoint_fd(ffs_dir.join("ep2")).context("open interrupt OUT")?;
-    let bulk_in = open_endpoint_fd(ffs_dir.join("ep3")).context("open bulk IN")?;
-    let bulk_out = open_endpoint_fd(ffs_dir.join("ep4")).context("open bulk OUT")?;
-    let endpoints = FunctionfsEndpoints::new(interrupt_in, interrupt_out, bulk_in, bulk_out);
+    let paths = FunctionfsEndpointPaths {
+        interrupt_in: ffs_dir.join("ep1"),
+        interrupt_out: ffs_dir.join("ep2"),
+        bulk_in: ffs_dir.join("ep3"),
+        bulk_out: ffs_dir.join("ep4"),
+    };
+    let endpoints = open_functionfs_endpoints(&paths)?;
+    Ok((custom, endpoints, paths, GadgetGuard { registration: reg }))
+}
 
-    Ok((custom, endpoints, GadgetGuard { registration: reg }))
+fn open_functionfs_endpoints(paths: &FunctionfsEndpointPaths) -> Result<FunctionfsEndpoints> {
+    let interrupt_in = open_endpoint_fd(paths.interrupt_in.clone()).context("open interrupt IN")?;
+    let interrupt_out =
+        open_endpoint_fd(paths.interrupt_out.clone()).context("open interrupt OUT")?;
+    let bulk_in = open_endpoint_fd(paths.bulk_in.clone()).context("open bulk IN")?;
+    let bulk_out = open_endpoint_fd(paths.bulk_out.clone()).context("open bulk OUT")?;
+    let endpoints = FunctionfsEndpoints::new(interrupt_in, interrupt_out, bulk_in, bulk_out);
+    Ok(endpoints)
 }
 
 fn interrupt_in_ep() -> Endpoint {
@@ -1007,6 +1102,7 @@ fn open_endpoint_fd(path: PathBuf) -> Result<OwnedFd> {
     let file = File::options()
         .read(true)
         .write(true)
+        .custom_flags(libc::O_NONBLOCK)
         .open(&path)
         .with_context(|| format!("open {}", path.display()))?;
     Ok(to_owned_fd(file))

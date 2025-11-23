@@ -9,14 +9,15 @@ use std::{
     cmp,
     fs::File as StdFile,
     io,
-    os::fd::{AsRawFd, OwnedFd, RawFd},
+    os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
 };
 use tokio::{
     fs::File,
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::unix::AsyncFd,
+    io::{AsyncReadExt, AsyncWriteExt, Interest},
     task,
 };
-use tracing::trace;
+use tracing::{trace, warn};
 
 mod dma;
 mod runtime;
@@ -509,6 +510,11 @@ impl GadgetControl {
     }
 }
 
+fn to_tokio_file(fd: OwnedFd) -> io::Result<File> {
+    let std_file = StdFile::from(fd);
+    Ok(File::from_std(std_file))
+}
+
 /// Commands emitted by [`GadgetControl`] for the runtime to apply.
 #[derive(Clone, Debug)]
 pub enum SetupCommand {
@@ -521,10 +527,10 @@ pub enum SetupCommand {
 /// allows future work to multiplex multiple exports or schedule heavy work without
 /// blocking EP0.
 pub struct GadgetDataPlane {
-    interrupt_in: File,
-    interrupt_out: File,
-    bulk_in: File,
-    bulk_out: File,
+    interrupt_in: EndpointFd,
+    interrupt_out: EndpointFd,
+    bulk_in: EndpointFd,
+    bulk_out: EndpointFd,
     buffers: Option<BufferPool>,
 }
 
@@ -540,13 +546,19 @@ impl GadgetDataPlane {
         max_io_bytes: usize,
         dma_heap: Option<DmaHeap>,
     ) -> Result<Self> {
+        let interrupt_in = EndpointFd::new(interrupt_in, "interrupt_in")?;
+        let interrupt_out = EndpointFd::new(interrupt_out, "interrupt_out")?;
+        let bulk_in_fd_raw = bulk_in.as_raw_fd();
+        let bulk_out_fd_raw = bulk_out.as_raw_fd();
+        let bulk_in = EndpointFd::new(bulk_in, "bulk_in")?;
+        let bulk_out = EndpointFd::new(bulk_out, "bulk_out")?;
         let buffers = if let Some(heap) = dma_heap {
             let prealloc = queue_count as usize * queue_depth as usize;
             let cap = prealloc;
             Some(
                 BufferPool::new(
-                    bulk_in.as_raw_fd(),
-                    bulk_out.as_raw_fd(),
+                    bulk_in_fd_raw,
+                    bulk_out_fd_raw,
                     Some(heap.to_heap_kind()),
                     max_io_bytes,
                     prealloc,
@@ -558,10 +570,10 @@ impl GadgetDataPlane {
             None
         };
         Ok(Self {
-            interrupt_in: to_tokio_file(interrupt_in)?,
-            interrupt_out: to_tokio_file(interrupt_out)?,
-            bulk_in: to_tokio_file(bulk_in)?,
-            bulk_out: to_tokio_file(bulk_out)?,
+            interrupt_in,
+            interrupt_out,
+            bulk_in,
+            bulk_out,
             buffers,
         })
     }
@@ -569,14 +581,9 @@ impl GadgetDataPlane {
     pub async fn send_request(&mut self, request: Request) -> Result<()> {
         let encoded = request.encode();
         trace!(bytes = encoded.len(), "interrupt IN: sending Request");
-        self.interrupt_in
-            .write_all(&encoded)
+        write_all_async(&self.interrupt_in, &encoded)
             .await
             .context("write request to interrupt IN")?;
-        self.interrupt_in
-            .flush()
-            .await
-            .context("flush interrupt IN")?;
         trace!("interrupt IN: Request flushed");
         Ok(())
     }
@@ -584,8 +591,7 @@ impl GadgetDataPlane {
     pub async fn read_response(&mut self) -> Result<Response> {
         let mut buf = [0u8; RESPONSE_LEN];
         trace!(bytes = buf.len(), "interrupt OUT: reading Response");
-        self.interrupt_out
-            .read_exact(&mut buf)
+        read_exact_async(&self.interrupt_out, &mut buf)
             .await
             .context("read response from interrupt OUT")?;
         trace!("interrupt OUT: Response received");
@@ -597,8 +603,7 @@ impl GadgetDataPlane {
             return Ok(());
         }
         trace!(bytes = buf.len(), "bulk OUT: reading payload");
-        self.bulk_out
-            .read_exact(buf)
+        read_exact_async(&self.bulk_out, buf)
             .await
             .context("read payload from bulk OUT")?;
         trace!("bulk OUT: payload received");
@@ -610,11 +615,9 @@ impl GadgetDataPlane {
             return Ok(());
         }
         trace!(bytes = buf.len(), "bulk IN: writing payload");
-        self.bulk_in
-            .write_all(buf)
+        write_all_async(&self.bulk_in, buf)
             .await
-            .context("write payload to bulk IN")?;
-        self.bulk_in.flush().await.context("flush bulk IN")
+            .context("write payload to bulk IN")
     }
 
     pub async fn read_bulk_buffer(&mut self, buf: &mut [u8]) -> Result<()> {
@@ -628,7 +631,7 @@ impl GadgetDataPlane {
                 let mut handle = pool.checkout();
                 let result = match handle {
                     BufferHandle::Dma(_) => {
-                        self.queue_dmabuf_transfer(self.bulk_out.as_raw_fd(), handle.len(), &handle)
+                        self.queue_dmabuf_transfer(self.bulk_out.raw_fd(), handle.len(), &handle)
                             .await
                     }
                     BufferHandle::Copy(_) => self.read_bulk(handle.as_mut_slice()).await,
@@ -666,7 +669,7 @@ impl GadgetDataPlane {
                     .context("prepare buffer before device read")?;
                 let result = match handle {
                     BufferHandle::Dma(_) => self
-                        .queue_dmabuf_transfer(self.bulk_in.as_raw_fd(), handle.len(), &handle)
+                        .queue_dmabuf_transfer(self.bulk_in.raw_fd(), handle.len(), &handle)
                         .await
                         .context("FUNCTIONFS dmabuf transfer (IN)"),
                     BufferHandle::Copy(_) => self.write_bulk(handle.as_slice()).await,
@@ -707,9 +710,173 @@ enum ControlDirection {
     Out,
 }
 
-fn to_tokio_file(fd: OwnedFd) -> io::Result<File> {
-    let std_file = StdFile::from(fd);
-    Ok(File::from_std(std_file))
+fn set_nonblocking(raw: RawFd) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(raw, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let new_flags = flags | libc::O_NONBLOCK;
+    let res = unsafe { libc::fcntl(raw, libc::F_SETFL, new_flags) };
+    if res < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+async fn read_exact_async(fd: &EndpointFd, buf: &mut [u8]) -> io::Result<()> {
+    let mut offset = 0;
+    while offset < buf.len() {
+        match fd {
+            EndpointFd::Async(fd) => {
+                let mut guard = fd.readable().await?;
+                match guard.try_io(|inner| {
+                    let fd = inner.get_ref().as_raw_fd();
+                    let dst = unsafe { buf.as_mut_ptr().add(offset) as *mut libc::c_void };
+                    let remaining = buf.len() - offset;
+                    let res = unsafe { libc::read(fd, dst, remaining) };
+                    if res < 0 {
+                        let err = io::Error::last_os_error();
+                        if err.kind() == io::ErrorKind::Interrupted {
+                            return Ok(0);
+                        }
+                        Err(err)
+                    } else {
+                        Ok(res as usize)
+                    }
+                }) {
+                    Ok(Ok(0)) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "short read on FunctionFS endpoint",
+                        ));
+                    }
+                    Ok(Ok(read)) => offset += read,
+                    Ok(Err(err)) => return Err(err),
+                    Err(_would_block) => continue,
+                }
+            }
+            EndpointFd::Manual(fd_owned) => {
+                let fd_raw = fd_owned.as_raw_fd();
+                let dst = unsafe { buf.as_mut_ptr().add(offset) as *mut libc::c_void };
+                let remaining = buf.len() - offset;
+                let res = unsafe { libc::read(fd_raw, dst, remaining) };
+                if res < 0 {
+                    let err = io::Error::last_os_error();
+                    match err.kind() {
+                        io::ErrorKind::WouldBlock => {
+                            tokio::task::yield_now().await;
+                            continue;
+                        }
+                        io::ErrorKind::Interrupted => continue,
+                        _ => return Err(err),
+                    }
+                } else if res == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "short read on FunctionFS endpoint",
+                    ));
+                } else {
+                    offset += res as usize;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn write_all_async(fd: &EndpointFd, buf: &[u8]) -> io::Result<()> {
+    let mut offset = 0;
+    while offset < buf.len() {
+        match fd {
+            EndpointFd::Async(fd) => {
+                let mut guard = fd.writable().await?;
+                match guard.try_io(|inner| {
+                    let fd = inner.get_ref().as_raw_fd();
+                    let src = unsafe { buf.as_ptr().add(offset) as *const libc::c_void };
+                    let remaining = buf.len() - offset;
+                    let res = unsafe { libc::write(fd, src, remaining) };
+                    if res < 0 {
+                        let err = io::Error::last_os_error();
+                        if err.kind() == io::ErrorKind::Interrupted {
+                            return Ok(0);
+                        }
+                        Err(err)
+                    } else {
+                        Ok(res as usize)
+                    }
+                }) {
+                    Ok(Ok(written)) => offset += written,
+                    Ok(Err(err)) => return Err(err),
+                    Err(_would_block) => continue,
+                }
+            }
+            EndpointFd::Manual(fd_owned) => {
+                let fd_raw = fd_owned.as_raw_fd();
+                let src = unsafe { buf.as_ptr().add(offset) as *const libc::c_void };
+                let remaining = buf.len() - offset;
+                let res = unsafe { libc::write(fd_raw, src, remaining) };
+                if res < 0 {
+                    let err = io::Error::last_os_error();
+                    match err.kind() {
+                        io::ErrorKind::WouldBlock => {
+                            tokio::task::yield_now().await;
+                            continue;
+                        }
+                        io::ErrorKind::Interrupted => continue,
+                        _ => return Err(err),
+                    }
+                } else {
+                    offset += res as usize;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+enum EndpointFd {
+    Async(AsyncFd<OwnedFd>),
+    Manual(OwnedFd),
+}
+
+impl EndpointFd {
+    fn new(fd: OwnedFd, label: &'static str) -> io::Result<Self> {
+        set_nonblocking(fd.as_raw_fd()).map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!("set_nonblocking failed for {label}: {err}"),
+            )
+        })?;
+        match dup_fd(&fd)
+            .and_then(|dup| AsyncFd::with_interest(dup, Interest::READABLE | Interest::WRITABLE))
+        {
+            Ok(async_fd) => Ok(Self::Async(async_fd)),
+            Err(err) => {
+                warn!(
+                    label,
+                    error = ?err,
+                    "AsyncFd registration failed; falling back to manual polling"
+                );
+                Ok(Self::Manual(fd))
+            }
+        }
+    }
+
+    fn raw_fd(&self) -> RawFd {
+        match self {
+            EndpointFd::Async(fd) => fd.get_ref().as_raw_fd(),
+            EndpointFd::Manual(fd) => fd.as_raw_fd(),
+        }
+    }
+}
+
+fn dup_fd(fd: &OwnedFd) -> io::Result<OwnedFd> {
+    let new_fd = unsafe { libc::dup(fd.as_raw_fd()) };
+    if new_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // Safety: dup returns a new owned descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(new_fd) })
 }
 
 #[cfg(test)]
