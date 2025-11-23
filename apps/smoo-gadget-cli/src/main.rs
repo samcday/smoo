@@ -243,6 +243,7 @@ impl RuntimeState {
 enum ControlMessage {
     Config(ConfigExportsV0),
     StatusPing,
+    HostDisconnected,
 }
 
 fn build_initial_exports(state_store: &StateStore) -> HashMap<u32, ExportController> {
@@ -353,23 +354,22 @@ async fn run_event_loop(
     let mut host_online = true;
     let offline_tick = tokio::time::sleep(OFFLINE_DRAIN_INTERVAL);
     tokio::pin!(offline_tick);
-    let mark_offline =
-        |last_status: Instant,
-         host_online: &mut bool,
-         host_tx: &watch::Sender<bool>,
-         gadget: &mut Option<SmooGadget>,
-         offline_tick: &mut Pin<&mut tokio::time::Sleep>| {
-            *host_online = false;
-            let _ = host_tx.send(false);
-            *gadget = None;
-            offline_tick
-                .as_mut()
-                .reset(tokio::time::Instant::now() + OFFLINE_DRAIN_INTERVAL);
-            warn!(
-                since_ms = last_status.elapsed().as_millis(),
-                "SMOO_STATUS heartbeat missing; assuming host disconnected"
-            );
-        };
+    let mark_offline = |last_status: Instant,
+                        host_online: &mut bool,
+                        host_tx: &watch::Sender<bool>,
+                        gadget: &mut Option<SmooGadget>,
+                        offline_tick: &mut Pin<&mut tokio::time::Sleep>| {
+        *host_online = false;
+        let _ = host_tx.send(false);
+        *gadget = None;
+        offline_tick
+            .as_mut()
+            .reset(tokio::time::Instant::now() + OFFLINE_DRAIN_INTERVAL);
+        warn!(
+            since_ms = last_status.elapsed().as_millis(),
+            "SMOO_STATUS heartbeat missing; assuming host disconnected"
+        );
+    };
     loop {
         idle_sleep
             .as_mut()
@@ -402,25 +402,37 @@ async fn run_event_loop(
             }
             maybe_msg = control_rx.recv() => {
                 if let Some(msg) = maybe_msg {
-                    if matches!(msg, ControlMessage::StatusPing) {
-                        last_status = Instant::now();
-                        if !host_online {
-                            host_online = true;
-                            let _ = host_tx.send(true);
-                            if gadget.is_none() {
-                                match open_functionfs_endpoints(&endpoint_paths)
-                                    .and_then(|eps| SmooGadget::new(eps, gadget_config))
-                                {
-                                    Ok(new_gadget) => {
-                                        gadget = Some(new_gadget);
-                                        info!("FunctionFS endpoints reopened after host return");
-                                    }
-                                    Err(err) => {
-                                        warn!(error = ?err, "failed to reopen FunctionFS endpoints");
+                    match msg {
+                        ControlMessage::StatusPing => {
+                            last_status = Instant::now();
+                            if !host_online {
+                                host_online = true;
+                                let _ = host_tx.send(true);
+                                if gadget.is_none() {
+                                    match open_functionfs_endpoints(&endpoint_paths)
+                                        .and_then(|eps| SmooGadget::new(eps, gadget_config))
+                                    {
+                                        Ok(new_gadget) => {
+                                            gadget = Some(new_gadget);
+                                            info!("FunctionFS endpoints reopened after host return");
+                                        }
+                                        Err(err) => {
+                                            warn!(error = ?err, "failed to reopen FunctionFS endpoints");
+                                        }
                                     }
                                 }
                             }
                         }
+                        ControlMessage::HostDisconnected => {
+                            mark_offline(
+                                last_status,
+                                &mut host_online,
+                                &host_tx,
+                                &mut gadget,
+                                &mut offline_tick,
+                            );
+                        }
+                        _ => {}
                     }
                     process_control_message(msg, ublk, &mut runtime).await?;
                 } else {
@@ -755,13 +767,19 @@ async fn control_loop(
                 debug!("FunctionFS bind event (control loop)")
             }
             usb_gadget::function::custom::Event::Unbind => {
-                debug!("FunctionFS unbind event (control loop)")
+                debug!("FunctionFS unbind event (control loop)");
+                if tx.send(ControlMessage::HostDisconnected).await.is_err() {
+                    anyhow::bail!("control channel closed");
+                }
             }
             usb_gadget::function::custom::Event::Enable => {
                 debug!("FunctionFS enable event (control loop)")
             }
             usb_gadget::function::custom::Event::Disable => {
-                debug!("FunctionFS disable event (control loop)")
+                debug!("FunctionFS disable event (control loop)");
+                if tx.send(ControlMessage::HostDisconnected).await.is_err() {
+                    anyhow::bail!("control channel closed");
+                }
             }
             usb_gadget::function::custom::Event::Suspend => {
                 debug!("FunctionFS suspend event (control loop)")
@@ -979,6 +997,7 @@ async fn process_control_message(
             }
         }
         ControlMessage::StatusPing => {}
+        ControlMessage::HostDisconnected => {}
     }
     Ok(())
 }
