@@ -140,9 +140,7 @@ async fn main() -> Result<()> {
 
     let control_handler = gadget.control_handler();
     let (control_tx, control_rx) = mpsc::channel(8);
-    let heartbeat_millis = Arc::new(AtomicU64::new(
-        tokio::time::Instant::now().elapsed().as_millis() as u64,
-    ));
+    let heartbeat_millis = Arc::new(AtomicU64::new(now_millis()));
 
     let exports = build_initial_exports(&state_store);
     let initial_export_count = exports
@@ -160,7 +158,19 @@ async fn main() -> Result<()> {
         control_tx.clone(),
         heartbeat_millis.clone(),
     ));
-    let watchdog_task = tokio::spawn(heartbeat_watchdog(control_tx, heartbeat_millis.clone()));
+    let watchdog_heartbeat = heartbeat_millis.clone();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(STATUS_LIVENESS_TIMEOUT / 2);
+        let last = watchdog_heartbeat.load(Ordering::Relaxed);
+        let now = now_millis();
+        if now.saturating_sub(last) > STATUS_LIVENESS_TIMEOUT.as_millis() as u64 {
+            eprintln!(
+                "heartbeat watchdog fired; last SMOO_STATUS {} ms ago; terminating gadget",
+                now.saturating_sub(last)
+            );
+            std::process::exit(2);
+        }
+    });
     let tunables = RuntimeTunables {
         queue_count: args.queue_count,
         queue_depth: args.queue_depth,
@@ -184,8 +194,6 @@ async fn main() -> Result<()> {
     .await;
     control_task.abort();
     let _ = control_task.await;
-    watchdog_task.abort();
-    let _ = watchdog_task.await;
     result
 }
 
@@ -1034,17 +1042,8 @@ async fn process_control_message(
 }
 
 async fn heartbeat_watchdog(tx: mpsc::Sender<ControlMessage>, heartbeat_millis: Arc<AtomicU64>) {
-    let interval = STATUS_LIVENESS_TIMEOUT / 2;
-    loop {
-        tokio::time::sleep(interval).await;
-        let last = heartbeat_millis.load(Ordering::Relaxed);
-        let now = tokio::time::Instant::now().elapsed().as_millis() as u64;
-        if now.saturating_sub(last) > STATUS_LIVENESS_TIMEOUT.as_millis() as u64 {
-            if tx.send(ControlMessage::HeartbeatTimeout).await.is_err() {
-                break;
-            }
-        }
-    }
+    let _ = tx;
+    let _ = heartbeat_millis;
 }
 
 async fn apply_config(
@@ -1276,6 +1275,11 @@ fn export_state_tag(controller: &ExportController) -> &'static str {
 fn parse_hex_u16(input: &str) -> Result<u16, String> {
     let trimmed = input.trim_start_matches("0x").trim_start_matches("0X");
     u16::from_str_radix(trimmed, 16).map_err(|err| err.to_string())
+}
+
+fn now_millis() -> u64 {
+    let now = std::time::Instant::now();
+    now.elapsed().as_millis() as u64
 }
 
 fn validate_persisted_record(record: &PersistedExportRecord) -> Result<()> {
