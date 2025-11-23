@@ -22,7 +22,7 @@ mod dma;
 mod runtime;
 mod state_store;
 
-use crate::dma::{FunctionfsDmaScratch, dmabuf_transfer_blocking};
+use crate::dma::{BufferHandle, BufferPool, dmabuf_transfer_blocking};
 pub use runtime::{
     ExportController, ExportReconcileContext, ExportState, GadgetRuntime, IoStateKind,
     RuntimeTunables,
@@ -525,7 +525,7 @@ pub struct GadgetDataPlane {
     interrupt_out: File,
     bulk_in: File,
     bulk_out: File,
-    dma_scratch: Option<FunctionfsDmaScratch>,
+    buffers: Option<BufferPool>,
 }
 
 impl GadgetDataPlane {
@@ -540,17 +540,19 @@ impl GadgetDataPlane {
         max_io_bytes: usize,
         dma_heap: Option<DmaHeap>,
     ) -> Result<Self> {
-        let dma_scratch = if let Some(heap) = dma_heap {
-            let slots = queue_count as usize * queue_depth as usize;
+        let buffers = if let Some(heap) = dma_heap {
+            let prealloc = queue_count as usize * queue_depth as usize;
+            let cap = prealloc;
             Some(
-                FunctionfsDmaScratch::new(
+                BufferPool::new(
                     bulk_in.as_raw_fd(),
                     bulk_out.as_raw_fd(),
-                    slots,
+                    Some(heap.to_heap_kind()),
                     max_io_bytes,
-                    heap.to_heap_kind(),
+                    prealloc,
+                    cap,
                 )
-                .context("init DMA scratch buffers")?,
+                .context("init DMA buffer pool")?,
             )
         } else {
             None
@@ -560,7 +562,7 @@ impl GadgetDataPlane {
             interrupt_out: to_tokio_file(interrupt_out)?,
             bulk_in: to_tokio_file(bulk_in)?,
             bulk_out: to_tokio_file(bulk_out)?,
-            dma_scratch,
+            buffers,
         })
     }
 
@@ -620,29 +622,32 @@ impl GadgetDataPlane {
             return Ok(());
         }
         let len = buf.len();
-        if self.dma_scratch.is_some() {
-            trace!(bytes = len, "bulk OUT: reading payload via DMA-BUF");
-            let mut slot = {
-                let scratch = self.dma_scratch.as_mut().unwrap();
-                scratch
-                    .checkout_out()
-                    .context("checkout bulk OUT DMA buffer")?
-            };
-            let result = self
-                .queue_dmabuf_transfer(self.bulk_out.as_raw_fd(), slot.fd(), len)
-                .await;
-            if let Some(scratch) = self.dma_scratch.as_mut() {
+        match self.buffers.as_mut() {
+            Some(pool) => {
+                trace!(bytes = len, "bulk OUT: reading payload via buffer pool");
+                let mut handle = pool.checkout();
+                let result = match handle {
+                    BufferHandle::Dma(_) => {
+                        self.queue_dmabuf_transfer(self.bulk_out.as_raw_fd(), handle.len(), &handle)
+                            .await
+                    }
+                    BufferHandle::Copy(_) => self.read_bulk(handle.as_mut_slice()).await,
+                };
                 if result.is_ok() {
-                    slot.finish_device_write()
-                        .context("invalidate DMA buffer after device write")?;
-                    buf.copy_from_slice(&slot.as_slice()[..len]);
+                    handle
+                        .finish_device_write()
+                        .context("invalidate buffer after device write")?;
+                    buf.copy_from_slice(&handle.as_slice()[..len]);
                 }
-                scratch.checkin_out(slot);
+                if let Some(pool) = self.buffers.as_mut() {
+                    pool.checkin(handle);
+                }
+                result.context("bulk OUT buffered transfer")
             }
-            result
-        } else {
-            trace!(bytes = len, "bulk OUT: reading payload via read()");
-            self.read_bulk(buf).await.context("read bulk payload")
+            None => {
+                trace!(bytes = len, "bulk OUT: reading payload via read()");
+                self.read_bulk(buf).await.context("read bulk payload")
+            }
         }
     }
 
@@ -651,37 +656,45 @@ impl GadgetDataPlane {
             return Ok(());
         }
         let len = buf.len();
-        if self.dma_scratch.is_some() {
-            trace!(bytes = len, "bulk IN: writing payload via DMA-BUF");
-            let mut slot = {
-                let scratch = self.dma_scratch.as_mut().unwrap();
-                scratch
-                    .checkout_in()
-                    .context("checkout bulk IN DMA buffer")?
-            };
-            slot.as_mut_slice()[..len].copy_from_slice(&buf[..len]);
-            slot.prepare_device_read()
-                .context("flush DMA buffer before device read")?;
-            let result = self
-                .queue_dmabuf_transfer(self.bulk_in.as_raw_fd(), slot.fd(), len)
-                .await
-                .context("FUNCTIONFS dmabuf transfer (IN)");
-            if let Some(scratch) = self.dma_scratch.as_mut() {
-                scratch.checkin_in(slot);
+        match self.buffers.as_mut() {
+            Some(pool) => {
+                trace!(bytes = len, "bulk IN: writing payload via buffer pool");
+                let mut handle = pool.checkout();
+                handle.as_mut_slice()[..len].copy_from_slice(&buf[..len]);
+                handle
+                    .prepare_device_read()
+                    .context("prepare buffer before device read")?;
+                let result = match handle {
+                    BufferHandle::Dma(_) => self
+                        .queue_dmabuf_transfer(self.bulk_in.as_raw_fd(), handle.len(), &handle)
+                        .await
+                        .context("FUNCTIONFS dmabuf transfer (IN)"),
+                    BufferHandle::Copy(_) => self.write_bulk(handle.as_slice()).await,
+                };
+                if let Some(pool) = self.buffers.as_mut() {
+                    pool.checkin(handle);
+                }
+                result.context("bulk IN buffered transfer")
             }
-            result
-        } else {
-            trace!(bytes = len, "bulk IN: writing payload via write()");
-            self.write_bulk(buf).await.context("write bulk payload")
+            None => {
+                trace!(bytes = len, "bulk IN: writing payload via write()");
+                self.write_bulk(buf).await.context("write bulk payload")
+            }
         }
     }
 
     async fn queue_dmabuf_transfer(
         &self,
         endpoint_fd: RawFd,
-        buf_fd: RawFd,
         len: usize,
+        handle: &BufferHandle,
     ) -> Result<()> {
+        let buf_fd = match handle {
+            BufferHandle::Dma(h) => h.fd(),
+            BufferHandle::Copy(_) => {
+                return Err(anyhow!("attempted dma transfer with copy buffer"));
+            }
+        };
         task::spawn_blocking(move || dmabuf_transfer_blocking(endpoint_fd, buf_fd, len))
             .await
             .map_err(|err| anyhow!("dma-buf transfer task failed: {err}"))?

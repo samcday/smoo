@@ -3,9 +3,12 @@ use dma_heap::HeapKind;
 use mmap::MemoryMap;
 use nix::{
     ioctl_readwrite, ioctl_write_ptr,
-    poll::{PollFd, PollFlags, PollTimeout, poll},
+    poll::{poll, PollFd, PollFlags, PollTimeout},
 };
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::{
+    collections::VecDeque,
+    os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd},
+};
 use tracing::{trace, warn};
 
 const FUNCTIONFS_IOC_MAGIC: u8 = b'g';
@@ -71,46 +74,95 @@ const DMA_BUF_SYNC_WRITE_FLAG: u64 = 1 << 1;
 
 ioctl_write_ptr!(dma_buf_sync, b'b', DMA_BUF_SYNC_NR, DmaBufSync);
 
-/// Scratch DMA-BUF pools for FunctionFS bulk endpoints.
-pub(crate) struct FunctionfsDmaScratch {
-    bulk_in: DmaEndpointPool,
-    bulk_out: DmaEndpointPool,
+/// Unified pool that hands out DMA-BUF-backed buffers where available, falling back to
+/// copy buffers when DMA allocation/attachment fails. Buffers are held for the gadget
+/// lifetime; preallocation is attempted but the pool can grow up to `cap`.
+pub(crate) struct BufferPool {
+    dma: DmaPool,
+    copy: CopyPool,
 }
 
-impl FunctionfsDmaScratch {
+impl BufferPool {
     pub(crate) fn new(
         bulk_in_fd: RawFd,
         bulk_out_fd: RawFd,
-        slot_count: usize,
+        heap_kind: Option<HeapKind>,
         buf_len: usize,
-        heap_kind: HeapKind,
+        prealloc: usize,
+        cap: usize,
     ) -> Result<Self> {
-        let bulk_in = DmaEndpointPool::new(slot_count, buf_len, heap_kind.clone(), bulk_in_fd)
-            .context("init bulk IN DMA scratch")?;
-        let bulk_out = DmaEndpointPool::new(slot_count, buf_len, heap_kind, bulk_out_fd)
-            .context("init bulk OUT DMA scratch")?;
-        Ok(Self { bulk_in, bulk_out })
+        ensure!(buf_len > 0, "buffer length must be positive");
+        ensure!(cap > 0, "buffer pool cap must be positive");
+        ensure!(prealloc <= cap, "prealloc cannot exceed cap");
+        let dma = DmaPool::new(bulk_in_fd, bulk_out_fd, heap_kind, buf_len, prealloc, cap)
+            .context("init DMA pool")?;
+        let copy = CopyPool::new(buf_len, cap.saturating_sub(dma.len()));
+        Ok(Self { dma, copy })
     }
 
-    pub(crate) fn checkout_in(&mut self) -> Result<DmaEndpointSlot> {
-        self.bulk_in
-            .checkout()
-            .context("checkout bulk IN scratch buffer")
+    pub(crate) fn checkout(&mut self) -> BufferHandle {
+        if let Some(handle) = self.dma.checkout() {
+            return BufferHandle::Dma(handle);
+        }
+        if let Some(handle) = self.copy.checkout() {
+            return BufferHandle::Copy(handle);
+        }
+        // As a last resort, try to grow DMA then copy.
+        if let Some(handle) = self.dma.grow_one() {
+            return BufferHandle::Dma(handle);
+        }
+        BufferHandle::Copy(self.copy.fallback())
     }
 
-    pub(crate) fn checkin_in(&mut self, slot: DmaEndpointSlot) {
-        self.bulk_in.checkin(slot);
+    pub(crate) fn checkin(&mut self, handle: BufferHandle) {
+        match handle {
+            BufferHandle::Dma(buf) => self.dma.checkin(buf),
+            BufferHandle::Copy(buf) => self.copy.checkin(buf),
+        }
+    }
+}
+
+pub(crate) enum BufferHandle {
+    Dma(DmaBufferHandle),
+    Copy(CopyBuffer),
+}
+
+impl BufferHandle {
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            BufferHandle::Dma(h) => h.len(),
+            BufferHandle::Copy(h) => h.buf.len(),
+        }
     }
 
-    pub(crate) fn checkout_out(&mut self) -> Result<DmaEndpointSlot> {
-        self.bulk_out
-            .checkout()
-            .context("checkout bulk OUT scratch buffer")
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
+        match self {
+            BufferHandle::Dma(h) => h.as_mut_slice(),
+            BufferHandle::Copy(h) => &mut h.buf,
+        }
     }
 
-    pub(crate) fn checkin_out(&mut self, slot: DmaEndpointSlot) {
-        self.bulk_out.checkin(slot);
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        match self {
+            BufferHandle::Dma(h) => h.as_slice(),
+            BufferHandle::Copy(h) => &h.buf,
+        }
     }
+
+    pub(crate) fn prepare_device_read(&mut self) -> Result<()> {
+        match self {
+            BufferHandle::Dma(h) => h.prepare_device_read(),
+            BufferHandle::Copy(_) => Ok(()),
+        }
+    }
+
+    pub(crate) fn finish_device_write(&mut self) -> Result<()> {
+        match self {
+            BufferHandle::Dma(h) => h.finish_device_write(),
+            BufferHandle::Copy(_) => Ok(()),
+        }
+    }
+
 }
 
 pub(crate) fn dmabuf_transfer_blocking(
@@ -180,62 +232,154 @@ fn wait_for_dmabuf_completion(dmabuf_fd: RawFd) -> Result<()> {
     Ok(())
 }
 
-struct DmaEndpointPool {
-    slots: Vec<Option<DmaBuffer>>,
-    _attachments: EndpointAttachments,
+struct DmaPool {
+    heap: Option<dma_heap::Heap>,
+    bulk_in_fd: RawFd,
+    bulk_out_fd: RawFd,
+    buf_len: usize,
+    cap: usize,
+    available: VecDeque<DmaBuffer>,
+    allocated: usize,
+    dma_disabled: bool,
 }
 
-impl DmaEndpointPool {
+impl DmaPool {
     fn new(
-        slot_count: usize,
+        bulk_in_fd: RawFd,
+        bulk_out_fd: RawFd,
+        heap_kind: Option<HeapKind>,
         buf_len: usize,
-        heap_kind: HeapKind,
-        endpoint_fd: RawFd,
+        prealloc: usize,
+        cap: usize,
     ) -> Result<Self> {
-        ensure!(slot_count > 0, "DMA scratch slot count must be positive");
-        ensure!(buf_len > 0, "DMA scratch buffer length must be positive");
-        let heap = dma_heap::Heap::new(heap_kind).context("open DMA heap")?;
-        let mut slots = Vec::with_capacity(slot_count);
-        for _ in 0..slot_count {
-            let fd = heap.allocate(buf_len).context("allocate DMA buffer")?;
-            slots.push(Some(DmaBuffer::new(fd, buf_len).context("map DMA buffer")?));
+        let heap = match heap_kind {
+            Some(kind) => Some(dma_heap::Heap::new(kind).context("open DMA heap")?),
+            None => None,
+        };
+        let mut pool = Self {
+            heap,
+            bulk_in_fd,
+            bulk_out_fd,
+            buf_len,
+            cap,
+            available: VecDeque::new(),
+            allocated: 0,
+            dma_disabled: false,
+        };
+        for _ in 0..prealloc {
+            if let Some(buf) = pool.try_allocate_buf() {
+                pool.available.push_back(buf);
+            } else {
+                break;
+            }
         }
-        let mut attachments = EndpointAttachments::new(endpoint_fd);
-        for buf in slots.iter().flatten() {
-            attachments
-                .attach(buf.raw_fd())
-                .with_context(|| format!("attach dma-buf {} to endpoint", buf.raw_fd()))?;
-        }
-        Ok(Self {
-            slots,
-            _attachments: attachments,
-        })
+        Ok(pool)
     }
 
-    fn checkout(&mut self) -> Result<DmaEndpointSlot> {
-        let (idx, buf) = self
-            .slots
-            .iter_mut()
-            .enumerate()
-            .find_map(|(idx, slot)| slot.take().map(|buf| (idx, buf)))
-            .context("no DMA scratch buffers available")?;
-        Ok(DmaEndpointSlot { idx, buf })
+    fn len(&self) -> usize {
+        self.allocated
     }
 
-    fn checkin(&mut self, slot: DmaEndpointSlot) {
-        let previous = self.slots[slot.idx].replace(slot.buf);
-        debug_assert!(previous.is_none(), "DMA scratch slot double freed");
+    fn checkout(&mut self) -> Option<DmaBufferHandle> {
+        if self.dma_disabled {
+            return None;
+        }
+        self.available
+            .pop_front()
+            .map(|buf| DmaBufferHandle { buf })
+    }
+
+    fn checkin(&mut self, handle: DmaBufferHandle) {
+        self.available.push_back(handle.buf);
+    }
+
+    fn grow_one(&mut self) -> Option<DmaBufferHandle> {
+        if self.dma_disabled {
+            return None;
+        }
+        if let Some(buf) = self.try_allocate_buf() {
+            return Some(DmaBufferHandle { buf });
+        }
+        None
+    }
+
+    fn try_allocate_buf(&mut self) -> Option<DmaBuffer> {
+        if self.allocated >= self.cap || self.heap.is_none() {
+            return None;
+        }
+        let heap = self.heap.as_ref()?;
+        let fd = match heap.allocate(self.buf_len) {
+            Ok(fd) => fd,
+            Err(err) => {
+                warn!(error = %err, "dma-heap allocation failed, disabling dma");
+                self.dma_disabled = true;
+                return None;
+            }
+        };
+        match DmaBuffer::new(fd, self.buf_len, self.bulk_in_fd, self.bulk_out_fd) {
+            Ok(buf) => {
+                self.allocated += 1;
+                Some(buf)
+            }
+            Err(err) => {
+                warn!(error = %err, "dma buffer init failed, disabling dma");
+                self.dma_disabled = true;
+                None
+            }
+        }
     }
 }
 
-pub(crate) struct DmaEndpointSlot {
-    idx: usize,
+struct DmaBuffer {
+    fd: OwnedFd,
+    map: MemoryMap,
+    len: usize,
+}
+
+impl DmaBuffer {
+    fn new(fd: OwnedFd, len: usize, bulk_in_fd: RawFd, bulk_out_fd: RawFd) -> Result<Self> {
+        let raw_fd = fd.as_raw_fd();
+        let map = MemoryMap::new(
+            len,
+            &[
+                mmap::MapOption::MapReadable,
+                mmap::MapOption::MapWritable,
+                mmap::MapOption::MapFd(raw_fd),
+                mmap::MapOption::MapNonStandardFlags(libc::MAP_SHARED),
+            ],
+        )
+        .map_err(|err| anyhow!("map DMA buffer: {err}"))?;
+        let mut attachments = EndpointAttachments::new(bulk_in_fd);
+        attachments.attach(raw_fd)?;
+        let mut out_attachments = EndpointAttachments::new(bulk_out_fd);
+        out_attachments.attach(raw_fd)?;
+        Ok(Self { fd, map, len })
+    }
+
+    fn raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.map.data(), self.len) }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.map.data(), self.len) }
+    }
+}
+
+pub(crate) struct DmaBufferHandle {
     buf: DmaBuffer,
 }
 
-impl DmaEndpointSlot {
+impl DmaBufferHandle {
     pub(crate) fn fd(&self) -> RawFd {
         self.buf.raw_fd()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.buf.len
     }
 
     pub(crate) fn as_slice(&self) -> &[u8] {
@@ -257,39 +401,40 @@ impl DmaEndpointSlot {
     }
 }
 
-struct DmaBuffer {
-    fd: OwnedFd,
-    map: MemoryMap,
-    len: usize,
+struct CopyPool {
+    buf_len: usize,
+    available: VecDeque<CopyBuffer>,
+    cap: usize,
 }
 
-impl DmaBuffer {
-    fn new(fd: OwnedFd, len: usize) -> Result<Self> {
-        let raw_fd = fd.as_raw_fd();
-        let map = MemoryMap::new(
-            len,
-            &[
-                mmap::MapOption::MapReadable,
-                mmap::MapOption::MapWritable,
-                mmap::MapOption::MapFd(raw_fd),
-                mmap::MapOption::MapNonStandardFlags(libc::MAP_SHARED),
-            ],
-        )
-        .map_err(|err| anyhow!("map DMA buffer: {err}"))?;
-        Ok(Self { fd, map, len })
+impl CopyPool {
+    fn new(buf_len: usize, cap: usize) -> Self {
+        Self {
+            buf_len,
+            available: VecDeque::new(),
+            cap,
+        }
     }
 
-    fn raw_fd(&self) -> RawFd {
-        self.fd.as_raw_fd()
+    fn checkout(&mut self) -> Option<CopyBuffer> {
+        self.available.pop_front()
     }
 
-    fn as_slice(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.map.data(), self.len) }
+    fn checkin(&mut self, buf: CopyBuffer) {
+        if self.available.len() < self.cap {
+            self.available.push_back(buf);
+        }
     }
 
-    fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.map.data(), self.len) }
+    fn fallback(&self) -> CopyBuffer {
+        CopyBuffer {
+            buf: vec![0u8; self.buf_len],
+        }
     }
+}
+
+pub(crate) struct CopyBuffer {
+    buf: Vec<u8>,
 }
 
 struct EndpointAttachments {
