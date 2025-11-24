@@ -5,6 +5,10 @@ edition = "2024"
 rust-version = "1.87"
 license = "GPL-3.0-only"
 
+[features]
+default = []
+apkbuild = ["io-uring/bindgen"]
+
 [dependencies]
 anyhow = "1.0.100"
 async-channel = "2.5.0"

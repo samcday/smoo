@@ -5,9 +5,9 @@ use smoo_gadget_core::{
     ConfigExport, ConfigExportsV0, ControlIo, DmaHeap, ExportController, ExportFlags,
     ExportReconcileContext, ExportSpec, ExportState, FunctionfsEndpoints, GadgetConfig,
     GadgetControl, GadgetStatusReport, IoStateKind, PersistedExportRecord, RuntimeTunables,
-    SetupCommand, SetupPacket, SmooGadget, StateStore,
+    SetupCommand, SetupPacket, SmooGadget, SmooUblk, SmooUblkDevice, StateStore, UblkBuffer,
+    UblkIoRequest, UblkOp,
 };
-use smoo_gadget_ublk::{SmooUblk, SmooUblkDevice, UblkBuffer, UblkIoRequest, UblkOp};
 use smoo_proto::{Ident, OpCode, Request, Response};
 use std::{
     collections::{HashMap, HashSet},
