@@ -54,9 +54,9 @@ struct Args {
     /// Depth of each ublk queue.
     #[arg(long, default_value_t = 16)]
     queue_depth: u16,
-    /// Disable the DMA-BUF fast path even if the kernel advertises support.
+    /// Opt-in to the experimental DMA-BUF fast path when supported by the kernel.
     #[arg(long)]
-    no_dma_buf: bool,
+    experimental_dma_buf: bool,
     /// DMA-HEAP to allocate from when DMA-BUF mode is enabled.
     #[arg(long, value_enum, default_value_t = DmaHeapSelection::System)]
     dma_heap: DmaHeapSelection,
@@ -112,11 +112,7 @@ async fn main() -> Result<()> {
 
     initialize_session(&mut ublk, &mut state_store).await?;
     let ident = Ident::new(0, 1);
-    let dma_heap = if args.no_dma_buf {
-        None
-    } else {
-        Some(args.dma_heap.into())
-    };
+    let dma_heap = args.experimental_dma_buf.then(|| args.dma_heap.into());
     let gadget_config = GadgetConfig::new(
         ident,
         args.queue_count,
