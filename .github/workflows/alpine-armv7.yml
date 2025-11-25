@@ -1,9 +1,6 @@
-name: Alpine packages
+name: Alpine (armv7)
 
 on:
-  push:
-    branches: [ main ]
-  pull_request:
   workflow_dispatch:
 
 concurrency:
@@ -14,14 +11,8 @@ permissions:
   contents: read
 
 jobs:
-  alpine:
-    runs-on: ubuntu-24.04${{ matrix.arch == 'aarch64' && '-arm' || '' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        arch:
-          - aarch64
-          - armv7
+  alpine-armv7:
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -29,7 +20,7 @@ jobs:
       - uses: samcday/setup-alpine@main
         id: alpine
         with:
-          arch: ${{ matrix.arch }}
+          arch: armv7
           branch: edge
           packages: alpine-sdk
 
@@ -41,7 +32,7 @@ jobs:
         shell: alpine.sh --root {0}
 
       - name: set git revision for prerelease builds
-        if: ${{ github.event_name != 'release' }}
+        if: github.event_name != 'release'
         run: |
           sed -i -e "s/^_gitrev=main$/_gitrev=$GITHUB_SHA/" APKBUILD
         shell: alpine.sh --root {0}
@@ -53,17 +44,17 @@ jobs:
           abuild -F -P /packages
           mv APKBUILD /packages
           chmod -R 777 /packages
-          for f in /packages/smoo/${{ matrix.arch }}/*.apk; do
-            mv "$f" "${f%.apk}-${{ matrix.arch }}.apk"
+          for f in /packages/smoo/armv7/*.apk; do
+            mv "$f" "${f%.apk}-armv7.apk"
           done
         shell: alpine.sh --root {0}
 
       - uses: actions/upload-artifact@v4
         with:
-          name: APKBUILD-${{ matrix.arch }}
+          name: APKBUILD
           path: ${{ steps.alpine.outputs.root-path }}/packages/APKBUILD
 
       - uses: actions/upload-artifact@v4
         with:
-          name: packages-${{ matrix.arch }}
-          path: ${{ steps.alpine.outputs.root-path }}/packages/smoo/${{ matrix.arch }}/*.apk
+          name: packages-armv7
+          path: ${{ steps.alpine.outputs.root-path }}/packages/smoo/armv7/*.apk
