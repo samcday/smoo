@@ -39,7 +39,7 @@ const SMOO_PROTOCOL: u8 = 0x4D;
 const DEFAULT_MAX_IO_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Parser)]
-#[command(name = "smoo-gadget-cli")]
+#[command(name = "smoo-gadget-cli", version)]
 #[command(about = "Expose a smoo gadget backed by FunctionFS + ublk", long_about = None)]
 struct Args {
     /// USB vendor ID for the gadget (hex).

@@ -25,7 +25,7 @@ const STATUS_RETRY_ATTEMPTS: usize = 5;
 const RECONNECT_PAUSE: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Parser)]
-#[command(name = "smoo-host-cli")]
+#[command(name = "smoo-host-cli", version)]
 #[command(
     about = "Host shim for smoo gadgets",
     long_about = "Host shim for smoo gadgets. By default all visible USB devices are scanned and the first interface matching the vendor triple 0xFF/0x53/0x4D is selected."
