@@ -19,10 +19,12 @@ use tokio::{
 use tracing::trace;
 
 mod dma;
+mod link;
 mod runtime;
 mod state_store;
 
 use crate::dma::{BufferHandle, BufferPool, dmabuf_transfer_blocking};
+pub use link::{LinkCommand, LinkController, LinkState};
 pub use runtime::{
     ExportController, ExportReconcileContext, ExportState, GadgetRuntime, IoStateKind,
     RuntimeTunables,

@@ -5,10 +5,11 @@ use crate::buffers::{BufferGuard, QueueBuffers};
 use crate::sys::{
     UBLK_CMD_ADD_DEV, UBLK_CMD_DEL_DEV, UBLK_CMD_END_USER_RECOVERY, UBLK_CMD_GET_DEV_INFO,
     UBLK_CMD_GET_DEV_INFO2, UBLK_CMD_GET_PARAMS, UBLK_CMD_SET_PARAMS, UBLK_CMD_START_DEV,
-    UBLK_CMD_START_USER_RECOVERY, UBLK_CMD_STOP_DEV, UBLK_F_USER_RECOVERY, UBLK_IO_OP_DISCARD,
-    UBLK_IO_OP_FLUSH, UBLK_IO_OP_READ, UBLK_IO_OP_WRITE, UBLK_PARAM_TYPE_BASIC,
-    UBLK_U_IO_COMMIT_AND_FETCH_REQ, UBLK_U_IO_FETCH_REQ, ublk_param_basic, ublk_params,
-    ublksrv_ctrl_cmd, ublksrv_ctrl_dev_info, ublksrv_io_cmd, ublksrv_io_desc,
+    UBLK_CMD_START_USER_RECOVERY, UBLK_CMD_STOP_DEV, UBLK_F_USER_RECOVERY,
+    UBLK_F_USER_RECOVERY_REISSUE, UBLK_IO_OP_DISCARD, UBLK_IO_OP_FLUSH, UBLK_IO_OP_READ,
+    UBLK_IO_OP_WRITE, UBLK_PARAM_TYPE_BASIC, UBLK_U_IO_COMMIT_AND_FETCH_REQ, UBLK_U_IO_FETCH_REQ,
+    ublk_param_basic, ublk_params, ublksrv_ctrl_cmd, ublksrv_ctrl_dev_info, ublksrv_io_cmd,
+    ublksrv_io_desc,
 };
 use anyhow::{Context, ensure};
 use async_channel::{Receiver, RecvError, Sender};
@@ -33,6 +34,7 @@ pub struct SmooUblk {
     handle: Option<JoinHandle<()>>,
     sender: Sender<CtrlCommand>,
     managed_devs: HashSet<u32>,
+    preserve_on_drop: bool,
 }
 
 const CTRL_RING_DEPTH: u32 = 8;
@@ -123,6 +125,16 @@ pub type UblkBuffer<'a> = BufferGuard<'a>;
 impl SmooUblk {
     pub fn max_io_bytes_hint(block_size: usize, queue_depth: u16) -> anyhow::Result<usize> {
         compute_max_io_bytes(block_size, queue_depth)
+    }
+
+    /// Request that Drop skips issuing STOP/DEL so user-recovery can proceed.
+    pub fn preserve_devices_on_drop(&mut self) {
+        self.preserve_on_drop = true;
+    }
+
+    pub async fn owner_pid(&self, dev_id: u32) -> anyhow::Result<i32> {
+        let info = self.get_device_info(dev_id).await?;
+        Ok(info.ublksrv_pid)
     }
 
     pub fn new() -> anyhow::Result<Self> {
@@ -251,6 +263,7 @@ impl SmooUblk {
             handle: Some(handle),
             sender,
             managed_devs: HashSet::new(),
+            preserve_on_drop: false,
         })
     }
 
@@ -366,7 +379,7 @@ impl SmooUblk {
             ublksrv_pid: unsafe { libc::getpid() } as i32,
             ..Default::default()
         };
-        info.flags |= UBLK_F_USER_RECOVERY as u64;
+        info.flags |= (UBLK_F_USER_RECOVERY | UBLK_F_USER_RECOVERY_REISSUE) as u64;
 
         // ublk_params is passed in ublksrv_ctrl_dev_info during UBLK_CMD_SET_PARAMS
         let mut params = ublk_params {
@@ -572,7 +585,10 @@ impl SmooUblk {
         let buffers = QueueBuffers::new(queue_count, queue_depth, max_io_bytes)
             .context("allocate ublk buffers")?;
         let queue_buf_ptrs = buffers.raw_ptrs();
-        self.start_user_recovery(dev_id).await?;
+        if let Err(err) = self.start_user_recovery(dev_id).await {
+            // Surface EBUSY as-is for the caller to retry when the previous server is still alive.
+            return Err(err);
+        }
         let cdev_path = format!("/dev/ublkc{}", dev_id);
         let base_cdev = File::options()
             .read(true)
@@ -669,7 +685,7 @@ impl SmooUblk {
         Ok(())
     }
 
-    async fn start_user_recovery(&self, dev_id: u32) -> anyhow::Result<()> {
+    pub async fn start_user_recovery(&self, dev_id: u32) -> anyhow::Result<()> {
         let mut cmd = ublksrv_ctrl_cmd {
             dev_id,
             queue_id: u16::MAX,
@@ -758,7 +774,9 @@ impl SmooUblk {
 
 impl Drop for SmooUblk {
     fn drop(&mut self) {
-        self.teardown_managed_devices();
+        if !self.preserve_on_drop {
+            self.teardown_managed_devices();
+        }
         self.sender.close();
         if let Some(handle) = self.handle.take()
             && let Err(err) = handle.join()

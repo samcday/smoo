@@ -60,6 +60,13 @@ pub struct ExportReconcileContext<'a> {
     pub tunables: RuntimeTunables,
 }
 
+fn error_is_missing(err: &anyhow::Error) -> bool {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .and_then(|io_err| io_err.raw_os_error())
+        .map_or(false, |code| code == libc::ENOENT || code == libc::EINVAL)
+}
+
 pub struct ExportController {
     pub export_id: u32,
     pub spec: ExportSpec,
@@ -207,6 +214,13 @@ impl ExportController {
         )
     }
 
+    pub fn is_active_for_status(&self) -> bool {
+        matches!(
+            self.state,
+            ExportState::Online { .. } | ExportState::IoInFlight { .. }
+        )
+    }
+
     pub async fn reconcile(&mut self, cx: &mut ExportReconcileContext<'_>) -> Result<()> {
         match std::mem::replace(&mut self.state, ExportState::New) {
             ExportState::New => {
@@ -243,16 +257,20 @@ impl ExportController {
                         self.state = ExportState::Recovering { dev_id, device };
                     }
                     Err(err) => {
-                        cx.state_store
-                            .update_record(self.export_id, |record| record.assigned_dev_id = None)
-                            .ok();
-                        cx.state_store.persist().ok();
-                        self.state = ExportState::Failed {
-                            dev_id: Some(dev_id),
-                            device: None,
-                            last_error: format!("recover device {dev_id} failed: {err:#}"),
-                            retry_at: Instant::now() + self.retry_backoff,
-                        };
+                        if error_is_missing(&err) {
+                            cx.state_store
+                                .update_record(self.export_id, |record| record.assigned_dev_id = None)
+                                .ok();
+                            cx.state_store.persist().ok();
+                            self.state = ExportState::New;
+                        } else {
+                            self.state = ExportState::Failed {
+                                dev_id: Some(dev_id),
+                                device: None,
+                                last_error: format!("recover device {dev_id} failed: {err:#}"),
+                                retry_at: Instant::now() + self.retry_backoff,
+                            };
+                        }
                     }
                 }
             }

@@ -2,13 +2,13 @@ use anyhow::{anyhow, ensure, Context, Result};
 use clap::{Parser, ValueEnum};
 use futures::{stream::FuturesUnordered, StreamExt};
 use smoo_gadget_core::{
-    ConfigExport, ConfigExportsV0, ControlIo, DmaHeap, ExportController, ExportFlags,
+    ConfigExport, ConfigExportsV0, ControlIo, DmaHeap, Ep0Event, ExportController, ExportFlags,
     ExportReconcileContext, ExportSpec, ExportState, FunctionfsEndpoints, GadgetConfig,
-    GadgetControl, GadgetStatusReport, IoStateKind, PersistedExportRecord, RuntimeTunables,
-    SetupCommand, SetupPacket, SmooGadget, SmooUblk, SmooUblkDevice, StateStore, UblkBuffer,
-    UblkIoRequest, UblkOp,
+    GadgetControl, GadgetStatusReport, IoStateKind, LinkCommand, LinkController, LinkState,
+    PersistedExportRecord, RuntimeTunables, SetupCommand, SetupPacket, SmooGadget, SmooUblk,
+    SmooUblkDevice, StateStore, UblkBuffer, UblkIoRequest, UblkOp,
 };
-use smoo_proto::{Ident, OpCode, Request, Response};
+use smoo_proto::{Ident, OpCode, Request, Response, SMOO_STATUS_REQUEST, SMOO_STATUS_REQ_TYPE};
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
@@ -17,10 +17,11 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     signal,
+    signal::unix::{signal as unix_signal, SignalKind},
     sync::{mpsc, RwLock},
 };
 use tracing::{debug, info, trace, warn};
@@ -63,6 +64,9 @@ struct Args {
     /// Path to the recovery state file. When unset, crash recovery is disabled.
     #[arg(long, value_name = "PATH")]
     state_file: Option<PathBuf>,
+    /// Adopt existing ublk devices via user recovery.
+    #[arg(long)]
+    adopt: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -92,9 +96,6 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    usb_gadget::remove_all().context("remove existing USB gadgets")?;
-    let (custom, endpoints, _gadget_guard) = setup_functionfs(&args).context("setup FunctionFS")?;
-
     let mut ublk = SmooUblk::new().context("init ublk")?;
     let mut state_store = if let Some(path) = args.state_file.as_ref() {
         info!(path = ?path, "state file configured");
@@ -111,6 +112,14 @@ async fn main() -> Result<()> {
     };
 
     initialize_session(&mut ublk, &mut state_store).await?;
+    if args.adopt {
+        adopt_prepare(&mut ublk, &mut state_store).await?;
+    }
+
+    usb_gadget::remove_all().context("remove existing USB gadgets")?;
+    let (custom, endpoints, _gadget_guard, ffs_dir) =
+        setup_functionfs(&args).context("setup FunctionFS")?;
+
     let ident = Ident::new(0, 1);
     let dma_heap = args.experimental_dma_buf.then(|| args.dma_heap.into());
     let gadget_config = GadgetConfig::new(
@@ -133,10 +142,7 @@ async fn main() -> Result<()> {
     let (control_tx, control_rx) = mpsc::channel(8);
 
     let exports = build_initial_exports(&state_store);
-    let initial_export_count = exports
-        .values()
-        .filter(|ctrl| ctrl.device().is_some())
-        .count() as u32;
+    let initial_export_count = count_active_exports(&exports);
     let status = GadgetStatusShared::new(GadgetStatus::new(
         state_store.session_id(),
         initial_export_count,
@@ -153,13 +159,17 @@ async fn main() -> Result<()> {
         max_io_bytes: DEFAULT_MAX_IO_BYTES,
         dma_heap,
     };
+    let link = LinkController::new(Duration::from_secs(3));
     let runtime = RuntimeState {
         state_store,
         status,
         exports,
         tunables,
+        gadget: Some(gadget),
+        gadget_config,
+        ffs_dir,
     };
-    let result = run_event_loop(&mut ublk, gadget, runtime, control_rx).await;
+    let result = run_event_loop(&mut ublk, runtime, control_rx, link).await;
     control_task.abort();
     let _ = control_task.await;
     result
@@ -212,6 +222,9 @@ struct RuntimeState {
     status: GadgetStatusShared,
     exports: HashMap<u32, ExportController>,
     tunables: RuntimeTunables,
+    gadget: Option<SmooGadget>,
+    gadget_config: GadgetConfig,
+    ffs_dir: PathBuf,
 }
 
 impl RuntimeState {
@@ -226,6 +239,8 @@ impl RuntimeState {
 
 enum ControlMessage {
     Config(ConfigExportsV0),
+    Ep0Event(Ep0Event),
+    StatusPing,
 }
 
 fn build_initial_exports(state_store: &StateStore) -> HashMap<u32, ExportController> {
@@ -317,30 +332,33 @@ fn enqueue_io(runtime: &mut RuntimeState, io_futs: &mut FuturesUnordered<IoFutur
 
 async fn run_event_loop(
     ublk: &mut SmooUblk,
-    mut gadget: SmooGadget,
     mut runtime: RuntimeState,
     mut control_rx: mpsc::Receiver<ControlMessage>,
+    mut link: LinkController,
 ) -> Result<()> {
     let shutdown = signal::ctrl_c();
     tokio::pin!(shutdown);
     let mut io_futs: FuturesUnordered<IoFuture> = FuturesUnordered::new();
     let idle_sleep = tokio::time::sleep(Duration::from_millis(10));
     tokio::pin!(idle_sleep);
+    let mut liveness_tick = tokio::time::interval(Duration::from_millis(500));
+    let mut outstanding: HashMap<u32, HashMap<(u16, u16), UblkIoRequest>> = HashMap::new();
+    let mut hup = unix_signal(SignalKind::hangup()).context("install SIGHUP handler")?;
 
     let mut io_error = None;
+    let mut recovery_exit = false;
     loop {
         idle_sleep
             .as_mut()
             .reset(tokio::time::Instant::now() + Duration::from_millis(10));
+        link.tick(Instant::now());
+        process_link_commands(&mut runtime, &mut link).await?;
+        drain_outstanding(&mut runtime, &mut link, &mut outstanding).await?;
         let reconcile_needed = runtime.exports.values().any(|ctrl| ctrl.needs_reconcile());
         if reconcile_needed {
             reconcile_exports(ublk, &mut runtime).await?;
         }
-        let active_count = runtime
-            .exports
-            .values()
-            .filter(|ctrl| ctrl.dev_id().is_some())
-            .count() as u32;
+        let active_count = count_active_exports(&runtime.exports);
         runtime.status().set_export_count(active_count).await;
         enqueue_io(&mut runtime, &mut io_futs);
 
@@ -349,9 +367,27 @@ async fn run_event_loop(
                 info!("shutdown signal received");
                 break;
             }
+            Some(_) = hup.recv() => {
+                info!("SIGHUP received; initiating user recovery");
+                begin_user_recovery(ublk, &mut runtime).await?;
+                recovery_exit = true;
+                break;
+            }
+            _ = liveness_tick.tick() => {
+                link.tick(Instant::now());
+                trace!(state = ?link.state(), outstanding_exports = outstanding.len(), "liveness tick");
+                process_link_commands(&mut runtime, &mut link).await?;
+                drain_outstanding(&mut runtime, &mut link, &mut outstanding).await?;
+            }
             maybe_msg = control_rx.recv() => {
                 if let Some(msg) = maybe_msg {
-                    process_control_message(msg, ublk, &mut runtime).await?;
+                    if matches!(msg, ControlMessage::Config(_)) {
+                        // Drop any parked I/O when exports are being reconfigured.
+                        outstanding.clear();
+                    }
+                    process_control_message(msg, ublk, &mut runtime, &mut link).await?;
+                    process_link_commands(&mut runtime, &mut link).await?;
+                    drain_outstanding(&mut runtime, &mut link, &mut outstanding).await?;
                 } else {
                     break;
                 }
@@ -361,6 +397,12 @@ async fn run_event_loop(
                     if let Some(ctrl) = runtime.exports.get_mut(&export_id) {
                         match req_res {
                             Ok(req) => {
+                                if link.state() != LinkState::Online || runtime.gadget.is_none() {
+                                    trace!(export_id, queue = req.queue_id, tag = req.tag, "link not online; parking IO");
+                                    park_request(&mut outstanding, export_id, req);
+                                    ctrl.restore_device_after_io(kind, dev_id, device);
+                                    continue;
+                                }
                                 trace!(
                                     export_id,
                                     dev_id,
@@ -371,14 +413,26 @@ async fn run_event_loop(
                                     num_sectors = req.num_sectors,
                                     "dispatch ublk request to host"
                                 );
-                                if let Err(err) =
-                                    handle_request(&mut gadget, export_id, &device, req).await
-                                {
-                                    ctrl.fail_after_io(dev_id, format!("{err:#}"));
-                                    io_error = Some(err);
-                                    break;
+                                let result = handle_request(
+                                    runtime.gadget.as_mut().expect("gadget present"),
+                                    export_id,
+                                    &device,
+                                    req,
+                                )
+                                .await;
+                                match result {
+                                    Ok(()) => {
+                                        ctrl.restore_device_after_io(kind, dev_id, device);
+                                    }
+                                    Err(err) => {
+                                        let io_err = io_error_from_anyhow(&err);
+                                        link.on_io_error(&io_err);
+                                        park_request(&mut outstanding, export_id, req);
+                                        ctrl.restore_device_after_io(kind, dev_id, device);
+                                        warn!(export_id, queue = req.queue_id, tag = req.tag, error = ?err, "link error handling request; parked for retry");
+                                        process_link_commands(&mut runtime, &mut link).await?;
+                                    }
                                 }
-                                ctrl.restore_device_after_io(kind, dev_id, device);
                             }
                             Err(err) => {
                                 ctrl.fail_after_io(dev_id, format!("{err:#}"));
@@ -390,15 +444,19 @@ async fn run_event_loop(
                     }
                 }
             }
+            _ = &mut idle_sleep => {}
         }
     }
 
     // Ensure any in-flight IO futures drop their devices before teardown.
     drop(io_futs);
+    if recovery_exit {
+        return Ok(());
+    }
     cleanup_ublk_devices(ublk, &mut runtime).await?;
     runtime.status().set_export_count(0).await;
 
-    // Clean shutdown: remove the state file to avoid retaining stale session info.
+    // Clean shutdown: remove the state file after teardown to avoid retaining stale session info.
     if let Err(err) = runtime.state_store().remove_file() {
         warn!(error = ?err, "failed to remove state file on shutdown");
     } else {
@@ -565,22 +623,28 @@ async fn control_loop(
         let event = custom.event().context("read FunctionFS event")?;
         match event {
             usb_gadget::function::custom::Event::Bind => {
-                debug!("FunctionFS bind event (control loop)")
+                debug!("FunctionFS bind event (control loop)");
+                let _ = tx.send(ControlMessage::Ep0Event(Ep0Event::Bind)).await;
             }
             usb_gadget::function::custom::Event::Unbind => {
-                debug!("FunctionFS unbind event (control loop)")
+                debug!("FunctionFS unbind event (control loop)");
+                let _ = tx.send(ControlMessage::Ep0Event(Ep0Event::Unbind)).await;
             }
             usb_gadget::function::custom::Event::Enable => {
-                debug!("FunctionFS enable event (control loop)")
+                debug!("FunctionFS enable event (control loop)");
+                let _ = tx.send(ControlMessage::Ep0Event(Ep0Event::Enable)).await;
             }
             usb_gadget::function::custom::Event::Disable => {
-                debug!("FunctionFS disable event (control loop)")
+                debug!("FunctionFS disable event (control loop)");
+                let _ = tx.send(ControlMessage::Ep0Event(Ep0Event::Disable)).await;
             }
             usb_gadget::function::custom::Event::Suspend => {
-                debug!("FunctionFS suspend event (control loop)")
+                debug!("FunctionFS suspend event (control loop)");
+                let _ = tx.send(ControlMessage::Ep0Event(Ep0Event::Suspend)).await;
             }
             usb_gadget::function::custom::Event::Resume => {
-                debug!("FunctionFS resume event (control loop)")
+                debug!("FunctionFS resume event (control loop)");
+                let _ = tx.send(ControlMessage::Ep0Event(Ep0Event::Resume)).await;
             }
             usb_gadget::function::custom::Event::SetupDeviceToHost(sender) => {
                 let report = status.report().await;
@@ -589,6 +653,8 @@ async fn control_loop(
                 if let Err(err) = handler.handle_setup_packet(&mut io, setup, &report).await {
                     warn!(error = ?err, "vendor setup handling failed");
                     let _ = io.stall().await;
+                } else if is_status_setup(&setup) {
+                    let _ = tx.send(ControlMessage::StatusPing).await;
                 }
             }
             usb_gadget::function::custom::Event::SetupHostToDevice(receiver) => {
@@ -601,7 +667,11 @@ async fn control_loop(
                             anyhow::bail!("control channel closed");
                         }
                     }
-                    Ok(None) => {}
+                    Ok(None) => {
+                        if is_status_setup(&setup) {
+                            let _ = tx.send(ControlMessage::StatusPing).await;
+                        }
+                    }
                     Err(err) => {
                         warn!(error = ?err, "vendor setup handling failed");
                         let _ = io.stall().await;
@@ -664,6 +734,10 @@ fn setup_from_ctrl_req(ctrl: &CtrlReq) -> SetupPacket {
         ctrl.index,
         ctrl.length,
     )
+}
+
+fn is_status_setup(setup: &SetupPacket) -> bool {
+    setup.request() == SMOO_STATUS_REQUEST && setup.request_type() == SMOO_STATUS_REQ_TYPE
 }
 
 enum UsbControlInner<'a> {
@@ -768,6 +842,103 @@ async fn initialize_session(_ublk: &mut SmooUblk, state_store: &mut StateStore) 
     Ok(())
 }
 
+async fn adopt_prepare(ublk: &mut SmooUblk, state_store: &mut StateStore) -> Result<()> {
+    let mut dev_ids = Vec::new();
+    let mut owner_pids = HashSet::new();
+    let mut stale_devices = false;
+    for record in state_store.records() {
+        if let Some(dev_id) = record.assigned_dev_id {
+            dev_ids.push(dev_id);
+            match ublk.owner_pid(dev_id).await {
+                Ok(pid) => {
+                    let alive = pid_is_alive(pid);
+                    debug!(dev_id, pid, alive, "queried ublk owner");
+                    if pid > 0 && pid != unsafe { libc::getpid() } && alive {
+                        owner_pids.insert(pid);
+                    } else if pid > 0 && !alive {
+                        stale_devices = true;
+                    }
+                }
+                Err(err) => {
+                    let missing = error_is_missing(&err);
+                    warn!(dev_id, error = ?err, missing, "query owner pid failed");
+                    if missing {
+                        stale_devices = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if stale_devices && owner_pids.is_empty() {
+        warn!("no surviving owners and stale devices detected; resetting state for fresh session");
+        reset_state_store(state_store);
+        if let Err(err) = state_store.persist() {
+            warn!(error = ?err, "persist state reset failed");
+        }
+        return Ok(());
+    }
+
+    if owner_pids.len() > 1 {
+        warn!(
+            owners = ?owner_pids,
+            "multiple ublk owners detected; resetting state for clean session"
+        );
+        reset_state_store(state_store);
+        if let Err(err) = state_store.persist() {
+            warn!(error = ?err, "persist state reset failed");
+        }
+        anyhow::bail!("multiple ublk owners detected during adopt");
+    }
+
+    if let Some(pid) = owner_pids.into_iter().next() {
+        info!(pid, "signaling existing smoo-gadget owner for recovery");
+        unsafe {
+            libc::kill(pid, libc::SIGHUP);
+        }
+        info!(pid, "waiting for prior owner to exit before adopting");
+        wait_for_owner_exit(ublk, &dev_ids, pid, Duration::from_secs(3)).await?;
+    }
+
+    Ok(())
+}
+
+async fn wait_for_owner_exit(
+    ublk: &mut SmooUblk,
+    dev_ids: &[u32],
+    target_pid: i32,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut still_owned = false;
+        for dev_id in dev_ids {
+            match ublk.owner_pid(*dev_id).await {
+                Ok(pid) => {
+                    debug!(dev_id, pid, target_pid, "owner check during adopt wait");
+                    if pid == target_pid {
+                        still_owned = true;
+                    } else if pid > 0 && pid != target_pid {
+                        anyhow::bail!(
+                            "device {dev_id} now owned by unexpected pid {pid} during adopt"
+                        );
+                    }
+                }
+                Err(err) => {
+                    warn!(dev_id, error = ?err, "owner pid query failed during adopt wait");
+                }
+            }
+        }
+        if !still_owned {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("owner pid {target_pid} still active after adopt wait");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 fn reset_state_store(state_store: &mut StateStore) {
     let path = state_store.path().map(Path::to_path_buf);
     *state_store = match path {
@@ -776,16 +947,30 @@ fn reset_state_store(state_store: &mut StateStore) {
     };
 }
 
+fn count_active_exports(exports: &HashMap<u32, ExportController>) -> u32 {
+    exports
+        .values()
+        .filter(|ctrl| ctrl.is_active_for_status())
+        .count() as u32
+}
+
 async fn process_control_message(
     msg: ControlMessage,
     ublk: &mut SmooUblk,
     runtime: &mut RuntimeState,
+    link: &mut LinkController,
 ) -> Result<()> {
     match msg {
         ControlMessage::Config(config) => {
             if let Err(err) = apply_config(ublk, runtime, config).await {
                 warn!(error = ?err, "CONFIG_EXPORTS application failed");
             }
+        }
+        ControlMessage::Ep0Event(event) => {
+            link.on_ep0_event(event);
+        }
+        ControlMessage::StatusPing => {
+            link.on_status_ping();
         }
     }
     Ok(())
@@ -834,7 +1019,7 @@ async fn apply_config(
     }
     runtime
         .status()
-        .set_export_count(runtime.exports.len() as u32)
+        .set_export_count(count_active_exports(&runtime.exports))
         .await;
     Ok(())
 }
@@ -844,7 +1029,7 @@ struct GadgetGuard {
     registration: RegGadget,
 }
 
-fn setup_functionfs(args: &Args) -> Result<(Custom, FunctionfsEndpoints, GadgetGuard)> {
+fn setup_functionfs(args: &Args) -> Result<(Custom, FunctionfsEndpoints, GadgetGuard, PathBuf)> {
     let builder = Custom::builder().with_interface(
         Interface::new(Class::vendor_specific(SMOO_SUBCLASS, SMOO_PROTOCOL), "smoo")
             .with_endpoint(interrupt_in_ep())
@@ -865,13 +1050,27 @@ fn setup_functionfs(args: &Args) -> Result<(Custom, FunctionfsEndpoints, GadgetG
     let ffs_dir = custom.ffs_dir().context("resolve FunctionFS dir")?;
     reg.bind(Some(&udc)).context("bind gadget to UDC")?;
 
+    let endpoints = open_data_endpoints(&ffs_dir)?;
+
+    Ok((
+        custom,
+        endpoints,
+        GadgetGuard { registration: reg },
+        ffs_dir,
+    ))
+}
+
+fn open_data_endpoints(ffs_dir: &Path) -> Result<FunctionfsEndpoints> {
     let interrupt_in = open_endpoint_fd(ffs_dir.join("ep1")).context("open interrupt IN")?;
     let interrupt_out = open_endpoint_fd(ffs_dir.join("ep2")).context("open interrupt OUT")?;
     let bulk_in = open_endpoint_fd(ffs_dir.join("ep3")).context("open bulk IN")?;
     let bulk_out = open_endpoint_fd(ffs_dir.join("ep4")).context("open bulk OUT")?;
-    let endpoints = FunctionfsEndpoints::new(interrupt_in, interrupt_out, bulk_in, bulk_out);
-
-    Ok((custom, endpoints, GadgetGuard { registration: reg }))
+    Ok(FunctionfsEndpoints::new(
+        interrupt_in,
+        interrupt_out,
+        bulk_in,
+        bulk_out,
+    ))
 }
 
 fn interrupt_in_ep() -> Endpoint {
@@ -970,11 +1169,191 @@ async fn force_remove_with_retry(ublk: &mut SmooUblk, dev_id: u32) -> Result<()>
     Ok(())
 }
 
+async fn begin_user_recovery(ublk: &mut SmooUblk, runtime: &mut RuntimeState) -> Result<()> {
+    ublk.preserve_devices_on_drop();
+    let mut dev_ids = Vec::new();
+    for ctrl in runtime.exports.values_mut() {
+        if let Some(device) = ctrl.take_device() {
+            dev_ids.push(device.dev_id());
+            drop(device);
+        } else if let Some(dev_id) = ctrl.dev_id() {
+            dev_ids.push(dev_id);
+        }
+    }
+    for dev_id in dev_ids {
+        if let Err(err) = ublk.start_user_recovery(dev_id).await {
+            warn!(dev_id, error = ?err, "start user recovery failed");
+        }
+    }
+    Ok(())
+}
+
+async fn process_link_commands(
+    runtime: &mut RuntimeState,
+    link: &mut LinkController,
+) -> Result<()> {
+    while let Some(cmd) = link.take_command() {
+        match cmd {
+            LinkCommand::DropLink => {
+                runtime.gadget = None;
+                debug!("link controller requested drop; data plane closed");
+            }
+            LinkCommand::Reopen => {
+                if runtime.gadget.is_some() {
+                    continue;
+                }
+                match open_data_endpoints(&runtime.ffs_dir) {
+                    Ok(endpoints) => match SmooGadget::new(endpoints, runtime.gadget_config) {
+                        Ok(gadget) => {
+                            runtime.gadget = Some(gadget);
+                            debug!("link controller reopened data plane");
+                        }
+                        Err(err) => {
+                            warn!(error = ?err, "reopen data plane failed");
+                        }
+                    },
+                    Err(err) => {
+                        warn!(error = ?err, "open endpoints failed during reopen");
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn park_request(
+    outstanding: &mut HashMap<u32, HashMap<(u16, u16), UblkIoRequest>>,
+    export_id: u32,
+    req: UblkIoRequest,
+) {
+    let entry = outstanding.entry(export_id).or_default();
+    entry.insert((req.queue_id, req.tag), req);
+}
+
+async fn drain_outstanding(
+    runtime: &mut RuntimeState,
+    link: &mut LinkController,
+    outstanding: &mut HashMap<u32, HashMap<(u16, u16), UblkIoRequest>>,
+) -> Result<()> {
+    if outstanding.is_empty() {
+        return Ok(());
+    }
+    if link.state() != LinkState::Online {
+        trace!(
+            outstanding_exports = outstanding.len(),
+            "link not online; deferring outstanding IO drain"
+        );
+        return Ok(());
+    }
+    let Some(gadget) = runtime.gadget.as_mut() else {
+        trace!(
+            outstanding_exports = outstanding.len(),
+            "no gadget endpoints available; deferring outstanding IO drain"
+        );
+        return Ok(());
+    };
+    loop {
+        let next = {
+            let mut next = None;
+            for (export_id, reqs) in outstanding.iter() {
+                if let Some((&(queue_id, tag), _)) = reqs.iter().next() {
+                    next = Some((*export_id, queue_id, tag));
+                    break;
+                }
+            }
+            next
+        };
+        let Some((export_id, queue_id, tag)) = next else {
+            break;
+        };
+        let req = {
+            let map = outstanding.get_mut(&export_id);
+            let req = map.and_then(|m| m.remove(&(queue_id, tag)));
+            if let Some(map) = outstanding.get(&export_id) {
+                if map.is_empty() {
+                    outstanding.remove(&export_id);
+                }
+            }
+            req
+        };
+        let Some(req) = req else {
+            continue;
+        };
+        let Some(ctrl) = runtime.exports.get_mut(&export_id) else {
+            continue;
+        };
+        let Some((kind, dev_id, device)) = ctrl.take_device_for_io() else {
+            park_request(outstanding, export_id, req);
+            trace!(export_id, queue = req.queue_id, tag = req.tag, "controller busy; re-parked outstanding IO");
+            break;
+        };
+        trace!(
+            export_id,
+            dev_id,
+            queue = req.queue_id,
+            tag = req.tag,
+            "replaying outstanding IO to host"
+        );
+        let result = handle_request(gadget, export_id, &device, req).await;
+        match result {
+            Ok(()) => {
+                ctrl.restore_device_after_io(kind, dev_id, device);
+            }
+            Err(err) => {
+                let io_err = io_error_from_anyhow(&err);
+                link.on_io_error(&io_err);
+                park_request(outstanding, export_id, req);
+                ctrl.restore_device_after_io(kind, dev_id, device);
+                warn!(
+                    export_id,
+                    queue = req.queue_id,
+                    tag = req.tag,
+                    error = ?err,
+                    "link error replaying outstanding IO; parked again"
+                );
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn io_error_from_anyhow(err: &anyhow::Error) -> io::Error {
+    if let Some(cause) = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<io::Error>())
+    {
+        io::Error::new(cause.kind(), cause.to_string())
+    } else {
+        io::Error::new(io::ErrorKind::Other, err.to_string())
+    }
+}
+
 fn error_is_errno(err: &anyhow::Error, code: i32) -> bool {
     err.chain()
         .find_map(|cause| cause.downcast_ref::<std::io::Error>())
         .and_then(|io_err| io_err.raw_os_error())
         == Some(code)
+}
+
+fn error_is_missing(err: &anyhow::Error) -> bool {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .and_then(|io_err| io_err.raw_os_error())
+        .map_or(false, |code| code == libc::ENOENT || code == libc::EINVAL)
+}
+
+fn pid_is_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    let res = unsafe { libc::kill(pid, 0) };
+    if res == 0 {
+        return true;
+    }
+    let err = std::io::Error::last_os_error();
+    !matches!(err.raw_os_error(), Some(libc::ESRCH))
 }
 
 fn export_state_tag(controller: &ExportController) -> &'static str {
