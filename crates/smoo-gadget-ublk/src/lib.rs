@@ -18,7 +18,7 @@ use std::cmp;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io;
-use std::mem::{size_of, transmute};
+use std::mem::{ManuallyDrop, size_of, transmute};
 use std::os::fd::AsRawFd;
 use std::ptr;
 use std::sync::{
@@ -69,6 +69,23 @@ impl PendingCtrl {
 }
 
 pub struct SmooUblkDevice {
+    ctrl: UblkCtrlHandle,
+    queues: Arc<UblkQueueRuntime>,
+}
+
+pub struct UblkCtrlHandle {
+    dev_id: u32,
+    queue_count: u16,
+    queue_depth: u16,
+    ioctl_encode: bool,
+    recovery_pending: bool,
+    completion_txs: Vec<Sender<QueueCompletion>>,
+    workers: Vec<QueueWorkerHandle>,
+    start_handle: Option<JoinHandle<()>>,
+    shutdown: bool,
+}
+
+pub struct UblkQueueRuntime {
     dev_id: u32,
     queue_count: u16,
     queue_depth: u16,
@@ -76,13 +93,9 @@ pub struct SmooUblkDevice {
     block_count: usize,
     max_io_bytes: usize,
     ioctl_encode: bool,
-    recovery_pending: bool,
     buffers: QueueBuffers,
-    request_rx: Receiver<UblkIoRequest>,
+    request_rxs: Vec<Receiver<UblkIoRequest>>,
     completion_txs: Vec<Sender<QueueCompletion>>,
-    workers: Vec<QueueWorkerHandle>,
-    start_handle: Option<JoinHandle<()>>,
-    shutdown: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -429,12 +442,14 @@ impl SmooUblk {
             .write(true)
             .open(&cdev_path)
             .with_context(|| format!("open {}", cdev_path))?;
-        let (request_tx, request_rx) = async_channel::unbounded::<UblkIoRequest>();
+        let mut request_rxs = Vec::with_capacity(queue_count as usize);
         let mut completion_txs = Vec::with_capacity(queue_count as usize);
         let mut workers = Vec::with_capacity(queue_count as usize);
         let mut ready_rxs = Vec::with_capacity(queue_count as usize);
 
         for queue_id in 0..queue_count {
+            let (request_tx, request_rx) = async_channel::unbounded::<UblkIoRequest>();
+            request_rxs.push(request_rx);
             let (complete_tx, complete_rx) = async_channel::unbounded::<QueueCompletion>();
             let stop = Arc::new(AtomicBool::new(false));
             let (ready_tx, ready_rx) = mpsc::channel();
@@ -450,7 +465,7 @@ impl SmooUblk {
                 queue_depth,
                 ioctl_encode,
                 buf_ptrs,
-                request_tx: request_tx.clone(),
+                request_tx,
                 completion_rx: complete_rx,
                 stop: stop.clone(),
                 cdev,
@@ -472,7 +487,7 @@ impl SmooUblk {
             );
         }
 
-        let device = SmooUblkDevice {
+        let queues = Arc::new(UblkQueueRuntime {
             dev_id,
             queue_count,
             queue_depth,
@@ -480,9 +495,17 @@ impl SmooUblk {
             block_count,
             max_io_bytes,
             ioctl_encode,
-            recovery_pending: false,
             buffers,
-            request_rx,
+            request_rxs,
+            completion_txs: completion_txs.clone(),
+        });
+
+        let mut ctrl = UblkCtrlHandle {
+            dev_id,
+            queue_count,
+            queue_depth,
+            ioctl_encode,
+            recovery_pending: false,
             completion_txs,
             workers,
             start_handle: None,
@@ -511,9 +534,8 @@ impl SmooUblk {
             })
             .context("spawn start_dev thread")?;
 
-        let mut device = device;
-        device.start_handle = Some(start_thread);
-        Ok(device)
+        ctrl.start_handle = Some(start_thread);
+        Ok(SmooUblkDevice { ctrl, queues })
     }
 
     /// Attempt to recover a previously configured ublk device using kernel-queryable metadata.
@@ -595,12 +617,14 @@ impl SmooUblk {
             .write(true)
             .open(&cdev_path)
             .with_context(|| format!("open {}", cdev_path))?;
-        let (request_tx, request_rx) = async_channel::unbounded::<UblkIoRequest>();
+        let mut request_rxs = Vec::with_capacity(queue_count as usize);
         let mut completion_txs = Vec::with_capacity(queue_count as usize);
         let mut workers = Vec::with_capacity(queue_count as usize);
         let mut ready_rxs = Vec::with_capacity(queue_count as usize);
 
         for queue_id in 0..queue_count {
+            let (request_tx, request_rx) = async_channel::unbounded::<UblkIoRequest>();
+            request_rxs.push(request_rx);
             let (complete_tx, complete_rx) = async_channel::unbounded::<QueueCompletion>();
             let stop = Arc::new(AtomicBool::new(false));
             let (ready_tx, ready_rx) = mpsc::channel();
@@ -616,7 +640,7 @@ impl SmooUblk {
                 queue_depth,
                 ioctl_encode,
                 buf_ptrs,
-                request_tx: request_tx.clone(),
+                request_tx,
                 completion_rx: complete_rx,
                 stop: stop.clone(),
                 cdev,
@@ -640,7 +664,7 @@ impl SmooUblk {
             );
         }
 
-        let device = SmooUblkDevice {
+        let queues = Arc::new(UblkQueueRuntime {
             dev_id,
             queue_count,
             queue_depth,
@@ -648,13 +672,24 @@ impl SmooUblk {
             block_count,
             max_io_bytes,
             ioctl_encode,
-            recovery_pending: true,
             buffers,
-            request_rx,
-            completion_txs,
-            workers,
-            start_handle: None,
-            shutdown: false,
+            request_rxs,
+            completion_txs: completion_txs.clone(),
+        });
+
+        let device = SmooUblkDevice {
+            ctrl: UblkCtrlHandle {
+                dev_id,
+                queue_count,
+                queue_depth,
+                ioctl_encode,
+                recovery_pending: true,
+                completion_txs,
+                workers,
+                start_handle: None,
+                shutdown: false,
+            },
+            queues,
         };
 
         self.managed_devs.insert(dev_id);
@@ -830,6 +865,141 @@ impl SmooUblk {
 
 impl SmooUblkDevice {
     pub fn dev_id(&self) -> u32 {
+        self.ctrl.dev_id()
+    }
+
+    pub fn queue_count(&self) -> u16 {
+        self.ctrl.queue_count()
+    }
+
+    pub fn queue_depth(&self) -> u16 {
+        self.ctrl.queue_depth()
+    }
+
+    pub fn block_size(&self) -> usize {
+        self.queues.block_size()
+    }
+
+    pub fn block_count(&self) -> usize {
+        self.queues.block_count()
+    }
+
+    pub fn max_io_bytes(&self) -> usize {
+        self.queues.max_io_bytes()
+    }
+
+    pub fn buffer_len(&self) -> usize {
+        self.queues.buffer_len()
+    }
+
+    pub fn recovery_pending(&self) -> bool {
+        self.ctrl.recovery_pending()
+    }
+
+    fn mark_recovery_complete(&mut self) {
+        self.ctrl.mark_recovery_complete();
+    }
+
+    pub fn ioctl_encode(&self) -> bool {
+        self.ctrl.ioctl_encode()
+    }
+
+    pub fn checkout_buffer(&self, queue_id: u16, tag: u16) -> anyhow::Result<UblkBuffer<'_>> {
+        self.queues.checkout_buffer(queue_id, tag)
+    }
+
+    pub async fn next_io(&self, queue_id: u16) -> anyhow::Result<UblkIoRequest> {
+        self.queues.next_io(queue_id).await
+    }
+
+    pub fn complete_io(&self, request: UblkIoRequest, result: i32) -> anyhow::Result<()> {
+        self.queues.complete_io(request, result)
+    }
+
+    pub fn queues(&self) -> Arc<UblkQueueRuntime> {
+        self.queues.clone()
+    }
+
+    pub fn into_parts(self) -> (UblkCtrlHandle, Arc<UblkQueueRuntime>) {
+        let mut this = ManuallyDrop::new(self);
+        // Safe because ManuallyDrop prevents Drop; we take ownership of the fields.
+        let ctrl = unsafe { std::ptr::read(&mut this.ctrl) };
+        let queues = unsafe { std::ptr::read(&mut this.queues) };
+        (ctrl, queues)
+    }
+
+    pub fn from_parts(ctrl: UblkCtrlHandle, queues: Arc<UblkQueueRuntime>) -> Self {
+        Self { ctrl, queues }
+    }
+
+    fn shutdown(&mut self) {
+        self.ctrl.shutdown();
+    }
+}
+
+impl Drop for SmooUblkDevice {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+impl UblkCtrlHandle {
+    pub fn dev_id(&self) -> u32 {
+        self.dev_id
+    }
+
+    pub fn queue_count(&self) -> u16 {
+        self.queue_count
+    }
+
+    pub fn queue_depth(&self) -> u16 {
+        self.queue_depth
+    }
+
+    pub fn recovery_pending(&self) -> bool {
+        self.recovery_pending
+    }
+
+    pub fn ioctl_encode(&self) -> bool {
+        self.ioctl_encode
+    }
+
+    pub fn mark_recovery_complete(&mut self) {
+        self.recovery_pending = false;
+    }
+
+    pub fn shutdown(&mut self) {
+        if self.shutdown {
+            return;
+        }
+        self.shutdown = true;
+        for worker in &self.workers {
+            worker.stop.store(true, Ordering::SeqCst);
+        }
+        for sender in &self.completion_txs {
+            sender.close();
+        }
+        for worker in self.workers.drain(..) {
+            if let Err(e) = worker.thread.join() {
+                error!("queue worker join failed: {:?}", e);
+            }
+        }
+        if let Some(handle) = self.start_handle.take()
+            && let Err(err) = handle.join()
+        {
+            error!("start_dev thread join failed: {:?}", err);
+        }
+    }
+}
+
+impl Drop for UblkCtrlHandle {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+impl UblkQueueRuntime {
+    pub fn dev_id(&self) -> u32 {
         self.dev_id
     }
 
@@ -857,14 +1027,6 @@ impl SmooUblkDevice {
         self.buffers.buffer_len()
     }
 
-    pub fn recovery_pending(&self) -> bool {
-        self.recovery_pending
-    }
-
-    fn mark_recovery_complete(&mut self) {
-        self.recovery_pending = false;
-    }
-
     pub fn ioctl_encode(&self) -> bool {
         self.ioctl_encode
     }
@@ -875,9 +1037,12 @@ impl SmooUblkDevice {
             .context("checkout ublk buffer")
     }
 
-    pub async fn next_io(&self) -> anyhow::Result<UblkIoRequest> {
-        let req = self
-            .request_rx
+    pub async fn next_io(&self, queue_id: u16) -> anyhow::Result<UblkIoRequest> {
+        let receiver = self
+            .request_rxs
+            .get(queue_id as usize)
+            .context("invalid queue id")?;
+        let req = receiver
             .recv()
             .await
             .context("smoo-gadget-ublk device channel closed")?;
@@ -912,35 +1077,6 @@ impl SmooUblkDevice {
                 result,
             })
             .context("complete queue command")
-    }
-
-    fn shutdown(&mut self) {
-        if self.shutdown {
-            return;
-        }
-        self.shutdown = true;
-        for worker in &self.workers {
-            worker.stop.store(true, Ordering::SeqCst);
-        }
-        for sender in &self.completion_txs {
-            sender.close();
-        }
-        for worker in self.workers.drain(..) {
-            if let Err(e) = worker.thread.join() {
-                error!("queue worker join failed: {:?}", e);
-            }
-        }
-        if let Some(handle) = self.start_handle.take()
-            && let Err(err) = handle.join()
-        {
-            error!("start_dev thread join failed: {:?}", err);
-        }
-    }
-}
-
-impl Drop for SmooUblkDevice {
-    fn drop(&mut self) {
-        self.shutdown();
     }
 }
 

@@ -1,11 +1,11 @@
 use crate::{ExportSpec, PersistedExportRecord, StateStore};
 use anyhow::{Result, anyhow, ensure};
-use smoo_gadget_ublk::SmooUblk;
-use smoo_gadget_ublk::SmooUblkDevice;
+use smoo_gadget_ublk::{SmooUblk, SmooUblkDevice, UblkCtrlHandle, UblkQueueRuntime};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct RuntimeTunables {
     pub queue_count: u16,
     pub queue_depth: u16,
@@ -15,43 +15,97 @@ pub struct RuntimeTunables {
 
 pub enum ExportState {
     New,
-    RecoveringPending {
-        dev_id: u32,
-    },
-    Recovering {
-        dev_id: u32,
-        device: SmooUblkDevice,
-    },
-    Starting {
-        dev_id: u32,
-        device: SmooUblkDevice,
-    },
-    Online {
-        dev_id: u32,
-        device: SmooUblkDevice,
-    },
-    ShuttingDown {
-        dev_id: u32,
-        device: SmooUblkDevice,
-    },
-    IoInFlight {
-        dev_id: u32,
-        kind: IoStateKind,
-    },
-    Failed {
-        dev_id: Option<u32>,
-        device: Option<SmooUblkDevice>,
-        last_error: String,
-        retry_at: Instant,
-    },
+    RecoveringPending { dev_id: u32 },
+    Device(DeviceHandle),
     Deleted,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub enum IoStateKind {
-    Recovering,
-    Starting,
-    Online,
+pub enum DeviceHandle {
+    Starting {
+        dev_id: u32,
+        ctrl: UblkCtrlHandle,
+        queues: Arc<UblkQueueRuntime>,
+    },
+    Online {
+        dev_id: u32,
+        ctrl: UblkCtrlHandle,
+        queues: Arc<UblkQueueRuntime>,
+    },
+    ShuttingDown {
+        dev_id: u32,
+        ctrl: UblkCtrlHandle,
+        queues: Arc<UblkQueueRuntime>,
+    },
+    Failed {
+        dev_id: u32,
+        ctrl: Option<UblkCtrlHandle>,
+        queues: Option<Arc<UblkQueueRuntime>>,
+        last_error: String,
+    },
+}
+
+impl DeviceHandle {
+    pub fn dev_id(&self) -> u32 {
+        match self {
+            DeviceHandle::Starting { dev_id, .. }
+            | DeviceHandle::Online { dev_id, .. }
+            | DeviceHandle::ShuttingDown { dev_id, .. }
+            | DeviceHandle::Failed { dev_id, .. } => *dev_id,
+        }
+    }
+
+    pub fn queues(&self) -> Option<Arc<UblkQueueRuntime>> {
+        match self {
+            DeviceHandle::Starting { queues, .. }
+            | DeviceHandle::Online { queues, .. }
+            | DeviceHandle::ShuttingDown { queues, .. } => Some(queues.clone()),
+            DeviceHandle::Failed { queues, .. } => queues.clone(),
+        }
+    }
+
+    pub fn ctrl_mut(&mut self) -> Option<&mut UblkCtrlHandle> {
+        match self {
+            DeviceHandle::Starting { ctrl, .. }
+            | DeviceHandle::Online { ctrl, .. }
+            | DeviceHandle::ShuttingDown { ctrl, .. } => Some(ctrl),
+            DeviceHandle::Failed { ctrl, .. } => ctrl.as_mut(),
+        }
+    }
+
+    pub fn ctrl(&self) -> Option<&UblkCtrlHandle> {
+        match self {
+            DeviceHandle::Starting { ctrl, .. }
+            | DeviceHandle::Online { ctrl, .. }
+            | DeviceHandle::ShuttingDown { ctrl, .. } => Some(ctrl),
+            DeviceHandle::Failed { ctrl, .. } => ctrl.as_ref(),
+        }
+    }
+
+    pub fn is_online(&self) -> bool {
+        matches!(self, DeviceHandle::Online { .. })
+    }
+
+    pub fn recovery_pending(&self) -> bool {
+        self.ctrl()
+            .map(|ctrl| ctrl.recovery_pending())
+            .unwrap_or(false)
+    }
+
+    pub fn into_device(self) -> Option<SmooUblkDevice> {
+        match self {
+            DeviceHandle::Starting { ctrl, queues, .. }
+            | DeviceHandle::Online { ctrl, queues, .. }
+            | DeviceHandle::ShuttingDown { ctrl, queues, .. } => {
+                Some(SmooUblkDevice::from_parts(ctrl, queues))
+            }
+            DeviceHandle::Failed {
+                ctrl: Some(ctrl),
+                queues: Some(queues),
+                ..
+            } => Some(SmooUblkDevice::from_parts(ctrl, queues)),
+            _ => None,
+        }
+    }
 }
 
 pub struct ExportReconcileContext<'a> {
@@ -72,6 +126,7 @@ pub struct ExportController {
     pub spec: ExportSpec,
     pub state: ExportState,
     pub retry_backoff: Duration,
+    pub next_retry_at: Option<Instant>,
 }
 
 impl ExportController {
@@ -81,148 +136,137 @@ impl ExportController {
             spec,
             state,
             retry_backoff: Duration::from_secs(1),
-        }
-    }
-
-    pub fn device(&self) -> Option<&SmooUblkDevice> {
-        match &self.state {
-            ExportState::RecoveringPending { .. } => None,
-            ExportState::Recovering { device, .. }
-            | ExportState::Starting { device, .. }
-            | ExportState::Online { device, .. }
-            | ExportState::ShuttingDown { device, .. } => Some(device),
-            ExportState::Failed { device, .. } => device.as_ref(),
-            _ => None,
-        }
-    }
-
-    pub fn device_mut(&mut self) -> Option<&mut SmooUblkDevice> {
-        match &mut self.state {
-            ExportState::RecoveringPending { .. } => None,
-            ExportState::Recovering { device, .. }
-            | ExportState::Starting { device, .. }
-            | ExportState::Online { device, .. }
-            | ExportState::ShuttingDown { device, .. } => Some(device),
-            ExportState::Failed { device, .. } => device.as_mut(),
-            _ => None,
+            next_retry_at: None,
         }
     }
 
     pub fn dev_id(&self) -> Option<u32> {
         match &self.state {
-            ExportState::RecoveringPending { dev_id }
-            | ExportState::Recovering { dev_id, .. }
-            | ExportState::Starting { dev_id, .. }
-            | ExportState::Online { dev_id, .. }
-            | ExportState::ShuttingDown { dev_id, .. } => Some(*dev_id),
-            ExportState::Failed { dev_id, .. } => *dev_id,
+            ExportState::RecoveringPending { dev_id } => Some(*dev_id),
+            ExportState::Device(handle) => Some(handle.dev_id()),
             _ => None,
         }
     }
 
-    pub fn take_device(&mut self) -> Option<SmooUblkDevice> {
-        let mut result = None;
+    pub fn device_handle(&self) -> Option<&DeviceHandle> {
+        match &self.state {
+            ExportState::Device(handle) => Some(handle),
+            _ => None,
+        }
+    }
+
+    pub fn device_handle_mut(&mut self) -> Option<&mut DeviceHandle> {
+        match &mut self.state {
+            ExportState::Device(handle) => Some(handle),
+            _ => None,
+        }
+    }
+
+    pub fn take_device_handles(&mut self) -> Option<(UblkCtrlHandle, Arc<UblkQueueRuntime>)> {
+        let mut handles = None;
         self.state = match std::mem::replace(&mut self.state, ExportState::New) {
-            ExportState::Recovering { device, .. }
-            | ExportState::Starting { device, .. }
-            | ExportState::Online { device, .. }
-            | ExportState::ShuttingDown { device, .. } => {
-                result = Some(device);
+            ExportState::Device(handle) => {
+                match handle {
+                    DeviceHandle::Starting { ctrl, queues, .. }
+                    | DeviceHandle::Online { ctrl, queues, .. }
+                    | DeviceHandle::ShuttingDown { ctrl, queues, .. } => {
+                        handles = Some((ctrl, queues));
+                    }
+                    DeviceHandle::Failed {
+                        ctrl: Some(ctrl),
+                        queues: Some(queues),
+                        ..
+                    } => handles = Some((ctrl, queues)),
+                    _ => {}
+                }
                 ExportState::Deleted
             }
-            ExportState::Failed {
-                dev_id,
-                device,
-                last_error,
-                retry_at,
-            } => {
-                result = device;
-                ExportState::Failed {
-                    dev_id,
-                    device: None,
-                    last_error,
-                    retry_at,
-                }
-            }
             other => other,
         };
-        result
+        handles
     }
 
-    pub fn take_device_for_io(&mut self) -> Option<(IoStateKind, u32, SmooUblkDevice)> {
-        let mut result = None;
+    pub fn fail_device(&mut self, message: String) {
         self.state = match std::mem::replace(&mut self.state, ExportState::New) {
-            ExportState::Recovering { dev_id, device } => {
-                result = Some((IoStateKind::Recovering, dev_id, device));
-                ExportState::IoInFlight {
+            ExportState::Device(handle) => match handle {
+                DeviceHandle::Starting {
                     dev_id,
-                    kind: IoStateKind::Recovering,
+                    ctrl,
+                    queues,
                 }
-            }
-            ExportState::Starting { dev_id, device } => {
-                result = Some((IoStateKind::Starting, dev_id, device));
-                ExportState::IoInFlight {
+                | DeviceHandle::Online {
                     dev_id,
-                    kind: IoStateKind::Starting,
+                    ctrl,
+                    queues,
                 }
-            }
-            ExportState::Online { dev_id, device } => {
-                result = Some((IoStateKind::Online, dev_id, device));
-                ExportState::IoInFlight {
+                | DeviceHandle::ShuttingDown {
                     dev_id,
-                    kind: IoStateKind::Online,
-                }
-            }
-            ExportState::ShuttingDown { dev_id, device } => {
-                result = Some((IoStateKind::Online, dev_id, device));
-                ExportState::IoInFlight {
+                    ctrl,
+                    queues,
+                } => ExportState::Device(DeviceHandle::Failed {
                     dev_id,
-                    kind: IoStateKind::Online,
-                }
+                    ctrl: Some(ctrl),
+                    queues: Some(queues),
+                    last_error: message,
+                }),
+                DeviceHandle::Failed {
+                    dev_id,
+                    ctrl,
+                    queues,
+                    ..
+                } => ExportState::Device(DeviceHandle::Failed {
+                    dev_id,
+                    ctrl,
+                    queues,
+                    last_error: message,
+                }),
+            },
+            ExportState::RecoveringPending { dev_id } => {
+                ExportState::Device(DeviceHandle::Failed {
+                    dev_id,
+                    ctrl: None,
+                    queues: None,
+                    last_error: message,
+                })
             }
             other => other,
         };
-        result
+        self.next_retry_at = Some(Instant::now() + self.retry_backoff);
     }
 
-    pub fn restore_device_after_io(
-        &mut self,
-        kind: IoStateKind,
-        dev_id: u32,
-        device: SmooUblkDevice,
-    ) {
-        self.state = match kind {
-            IoStateKind::Recovering => ExportState::Recovering { dev_id, device },
-            IoStateKind::Starting => ExportState::Starting { dev_id, device },
-            IoStateKind::Online => ExportState::Online { dev_id, device },
-        };
-    }
-
-    pub fn fail_after_io(&mut self, dev_id: u32, err: String) {
-        self.state = ExportState::Failed {
-            dev_id: Some(dev_id),
-            device: None,
-            last_error: err,
-            retry_at: Instant::now() + self.retry_backoff,
-        };
-    }
-
-    pub fn needs_reconcile(&self) -> bool {
-        !matches!(
-            self.state,
-            ExportState::Online { .. } | ExportState::IoInFlight { .. }
-        )
+    pub fn needs_reconcile(&self, now: Instant) -> bool {
+        match &self.state {
+            ExportState::New | ExportState::RecoveringPending { .. } => true,
+            ExportState::Device(handle) => match handle {
+                DeviceHandle::Online { .. } => false,
+                DeviceHandle::Failed { .. } => {
+                    self.next_retry_at.map_or(true, |retry_at| now >= retry_at)
+                }
+                _ => true,
+            },
+            ExportState::Deleted => false,
+        }
     }
 
     pub fn is_active_for_status(&self) -> bool {
-        matches!(
-            self.state,
-            ExportState::Online { .. } | ExportState::IoInFlight { .. }
-        )
+        matches!(self.state, ExportState::Device(DeviceHandle::Online { .. }))
+    }
+
+    pub fn take_handle(&mut self) -> Option<DeviceHandle> {
+        let mut handle = None;
+        self.state = match std::mem::replace(&mut self.state, ExportState::New) {
+            ExportState::Device(inner) => {
+                handle = Some(inner);
+                ExportState::Deleted
+            }
+            other => other,
+        };
+        handle
     }
 
     pub async fn reconcile(&mut self, cx: &mut ExportReconcileContext<'_>) -> Result<()> {
-        match std::mem::replace(&mut self.state, ExportState::New) {
+        let now = Instant::now();
+        self.state = match std::mem::replace(&mut self.state, ExportState::New) {
             ExportState::New => {
                 let block_size = self.spec.block_size as usize;
                 let blocks = self
@@ -249,85 +293,137 @@ impl ExportController {
                     assigned_dev_id: Some(dev_id),
                 });
                 cx.state_store.persist()?;
-                self.state = ExportState::Starting { dev_id, device };
+                let (ctrl, queues) = device.into_parts();
+                self.next_retry_at = None;
+                ExportState::Device(DeviceHandle::Starting {
+                    dev_id,
+                    ctrl,
+                    queues,
+                })
             }
             ExportState::RecoveringPending { dev_id } => {
                 match cx.ublk.recover_existing_device(dev_id).await {
                     Ok(device) => {
-                        self.state = ExportState::Recovering { dev_id, device };
+                        let (ctrl, queues) = device.into_parts();
+                        self.next_retry_at = None;
+                        ExportState::Device(DeviceHandle::Starting {
+                            dev_id,
+                            ctrl,
+                            queues,
+                        })
                     }
                     Err(err) => {
                         if error_is_missing(&err) {
                             cx.state_store
-                                .update_record(self.export_id, |record| record.assigned_dev_id = None)
+                                .update_record(self.export_id, |record| {
+                                    record.assigned_dev_id = None
+                                })
                                 .ok();
                             cx.state_store.persist().ok();
-                            self.state = ExportState::New;
+                            self.next_retry_at = None;
+                            ExportState::New
                         } else {
-                            self.state = ExportState::Failed {
-                                dev_id: Some(dev_id),
-                                device: None,
+                            self.next_retry_at = Some(now + self.retry_backoff);
+                            ExportState::Device(DeviceHandle::Failed {
+                                dev_id,
+                                ctrl: None,
+                                queues: None,
                                 last_error: format!("recover device {dev_id} failed: {err:#}"),
-                                retry_at: Instant::now() + self.retry_backoff,
-                            };
+                            })
                         }
                     }
                 }
             }
-            ExportState::Recovering { dev_id, mut device } => {
-                if device.recovery_pending() {
-                    cx.ublk.finalize_recovery(&mut device).await?;
-                }
-                self.state = ExportState::Online { dev_id, device };
-            }
-            ExportState::Starting { dev_id, device } => {
-                self.state = ExportState::Online { dev_id, device };
-            }
-            ExportState::Online { dev_id, device } => {
-                self.state = ExportState::Online { dev_id, device };
-            }
-            ExportState::ShuttingDown { dev_id: _, device } => {
-                cx.ublk.stop_dev(device, true).await?;
-                cx.state_store
-                    .update_record(self.export_id, |record| record.assigned_dev_id = None)
-                    .ok();
-                cx.state_store.persist().ok();
-                self.state = ExportState::Deleted;
-            }
-            ExportState::IoInFlight { dev_id, kind } => {
-                // If reconcile runs while a device is temporarily out for IO, keep
-                // the placeholder so the main loop can restore it.
-                self.state = ExportState::IoInFlight { dev_id, kind };
-            }
-            ExportState::Failed {
-                dev_id,
-                device,
-                last_error,
-                retry_at,
-            } => {
-                let now = Instant::now();
-                if now < retry_at {
-                    self.state = ExportState::Failed {
-                        dev_id,
-                        device,
-                        last_error,
-                        retry_at,
-                    };
-                } else {
-                    if let Some(device) = device {
-                        let _ = cx.ublk.stop_dev(device, true).await;
+            ExportState::Device(handle) => match handle {
+                DeviceHandle::Starting {
+                    dev_id,
+                    ctrl,
+                    queues,
+                } => {
+                    let mut device = SmooUblkDevice::from_parts(ctrl, queues.clone());
+                    if device.recovery_pending() {
+                        cx.ublk.finalize_recovery(&mut device).await?;
                     }
+                    let (ctrl, queues) = device.into_parts();
+                    self.next_retry_at = None;
+                    ExportState::Device(DeviceHandle::Online {
+                        dev_id,
+                        ctrl,
+                        queues,
+                    })
+                }
+                DeviceHandle::Online {
+                    dev_id,
+                    ctrl,
+                    queues,
+                } => {
+                    self.next_retry_at = None;
+                    ExportState::Device(DeviceHandle::Online {
+                        dev_id,
+                        ctrl,
+                        queues,
+                    })
+                }
+                DeviceHandle::ShuttingDown {
+                    dev_id: _,
+                    ctrl,
+                    queues,
+                } => {
+                    cx.ublk
+                        .stop_dev(SmooUblkDevice::from_parts(ctrl, queues), true)
+                        .await?;
                     cx.state_store
                         .update_record(self.export_id, |record| record.assigned_dev_id = None)
                         .ok();
                     cx.state_store.persist().ok();
-                    self.state = ExportState::New;
+                    self.next_retry_at = None;
+                    ExportState::Deleted
                 }
-            }
-            ExportState::Deleted => {
-                self.state = ExportState::Deleted;
-            }
-        }
+                DeviceHandle::Failed {
+                    dev_id,
+                    mut ctrl,
+                    mut queues,
+                    last_error,
+                } => {
+                    if let Some(retry_at) = self.next_retry_at {
+                        if now < retry_at {
+                            self.next_retry_at = Some(retry_at);
+                            ExportState::Device(DeviceHandle::Failed {
+                                dev_id,
+                                ctrl,
+                                queues,
+                                last_error,
+                            })
+                        } else {
+                            if let (Some(ctrl_val), Some(queues_val)) = (ctrl.take(), queues.take())
+                            {
+                                let _ = cx
+                                    .ublk
+                                    .stop_dev(
+                                        SmooUblkDevice::from_parts(ctrl_val, queues_val),
+                                        true,
+                                    )
+                                    .await;
+                            } else if let Some(mut ctrl_val) = ctrl.take() {
+                                ctrl_val.shutdown();
+                            }
+                            cx.state_store
+                                .update_record(self.export_id, |record| {
+                                    record.assigned_dev_id = None
+                                })
+                                .ok();
+                            cx.state_store.persist().ok();
+                            self.next_retry_at = None;
+                            ExportState::New
+                        }
+                    } else {
+                        self.next_retry_at = None;
+                        ExportState::New
+                    }
+                }
+            },
+            ExportState::Deleted => ExportState::Deleted,
+        };
         Ok(())
     }
 }
@@ -351,8 +447,11 @@ impl GadgetRuntime {
         self.exports = records
             .into_iter()
             .map(|record| {
-                let controller =
-                    ExportController::new(record.export_id, record.spec, ExportState::New);
+                let state = match record.assigned_dev_id {
+                    Some(dev_id) => ExportState::RecoveringPending { dev_id },
+                    None => ExportState::New,
+                };
+                let controller = ExportController::new(record.export_id, record.spec, state);
                 (record.export_id, controller)
             })
             .collect();

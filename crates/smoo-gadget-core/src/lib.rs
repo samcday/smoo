@@ -26,10 +26,12 @@ mod state_store;
 use crate::dma::{BufferHandle, BufferPool, dmabuf_transfer_blocking};
 pub use link::{LinkCommand, LinkController, LinkState};
 pub use runtime::{
-    ExportController, ExportReconcileContext, ExportState, GadgetRuntime, IoStateKind,
+    DeviceHandle, ExportController, ExportReconcileContext, ExportState, GadgetRuntime,
     RuntimeTunables,
 };
-pub use smoo_gadget_ublk::{SmooUblk, SmooUblkDevice, UblkBuffer, UblkIoRequest, UblkOp};
+pub use smoo_gadget_ublk::{
+    SmooUblk, SmooUblkDevice, UblkBuffer, UblkIoRequest, UblkOp, UblkQueueRuntime,
+};
 pub use smoo_proto::{ConfigExport, ConfigExportsV0};
 pub use state_store::{ExportFlags, ExportSpec, PersistedExportRecord, StateStore};
 

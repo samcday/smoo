@@ -1,12 +1,11 @@
 use anyhow::{anyhow, ensure, Context, Result};
 use clap::{Parser, ValueEnum};
-use futures::{stream::FuturesUnordered, StreamExt};
 use smoo_gadget_core::{
-    ConfigExport, ConfigExportsV0, ControlIo, DmaHeap, Ep0Event, ExportController, ExportFlags,
-    ExportReconcileContext, ExportSpec, ExportState, FunctionfsEndpoints, GadgetConfig,
-    GadgetControl, GadgetStatusReport, IoStateKind, LinkCommand, LinkController, LinkState,
+    ConfigExport, ConfigExportsV0, ControlIo, DeviceHandle, DmaHeap, Ep0Event, ExportController,
+    ExportFlags, ExportReconcileContext, ExportSpec, ExportState, FunctionfsEndpoints,
+    GadgetConfig, GadgetControl, GadgetStatusReport, LinkCommand, LinkController, LinkState,
     PersistedExportRecord, RuntimeTunables, SetupCommand, SetupPacket, SmooGadget, SmooUblk,
-    SmooUblkDevice, StateStore, UblkBuffer, UblkIoRequest, UblkOp,
+    SmooUblkDevice, StateStore, UblkBuffer, UblkIoRequest, UblkOp, UblkQueueRuntime,
 };
 use smoo_proto::{Ident, OpCode, Request, Response, SMOO_STATUS_REQUEST, SMOO_STATUS_REQ_TYPE};
 use std::{
@@ -15,14 +14,14 @@ use std::{
     io,
     os::fd::{FromRawFd, IntoRawFd, OwnedFd},
     path::{Path, PathBuf},
-    pin::Pin,
     sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::{
     signal,
     signal::unix::{signal as unix_signal, SignalKind},
-    sync::{mpsc, RwLock},
+    sync::{mpsc, watch, RwLock},
+    task::JoinHandle,
 };
 use tracing::{debug, info, trace, warn};
 use tracing_subscriber::prelude::*;
@@ -164,6 +163,7 @@ async fn main() -> Result<()> {
         state_store,
         status,
         exports,
+        queue_tasks: HashMap::new(),
         tunables,
         gadget: Some(gadget),
         gadget_config,
@@ -221,6 +221,7 @@ struct RuntimeState {
     state_store: StateStore,
     status: GadgetStatusShared,
     exports: HashMap<u32, ExportController>,
+    queue_tasks: HashMap<u32, QueueTaskSet>,
     tunables: RuntimeTunables,
     gadget: Option<SmooGadget>,
     gadget_config: GadgetConfig,
@@ -235,6 +236,41 @@ impl RuntimeState {
     fn state_store(&mut self) -> &mut StateStore {
         &mut self.state_store
     }
+}
+
+type QueueSender = mpsc::UnboundedSender<QueueEvent>;
+
+struct QueueTaskSet {
+    stop: watch::Sender<bool>,
+    handles: Vec<JoinHandle<()>>,
+}
+
+impl QueueTaskSet {
+    async fn shutdown(self) {
+        let _ = self.stop.send(true);
+        for handle in self.handles {
+            let _ = handle.await;
+        }
+    }
+}
+
+enum QueueEvent {
+    Request {
+        export_id: u32,
+        dev_id: u32,
+        request: UblkIoRequest,
+        queues: Arc<UblkQueueRuntime>,
+    },
+    QueueError {
+        export_id: u32,
+        dev_id: u32,
+        error: anyhow::Error,
+    },
+}
+
+struct OutstandingRequest {
+    dev_id: u32,
+    request: UblkIoRequest,
 }
 
 enum ControlMessage {
@@ -273,7 +309,11 @@ async fn reconcile_exports(ublk: &mut SmooUblk, runtime: &mut RuntimeState) -> R
         ..
     } = runtime;
     let tunables = *tunables;
-    for controller in exports.values_mut().filter(|ctrl| ctrl.needs_reconcile()) {
+    let now = Instant::now();
+    for controller in exports
+        .values_mut()
+        .filter(|ctrl| ctrl.needs_reconcile(now))
+    {
         trace!(
             export_id = controller.export_id,
             state = export_state_tag(controller),
@@ -296,36 +336,91 @@ async fn reconcile_exports(ublk: &mut SmooUblk, runtime: &mut RuntimeState) -> R
     Ok(())
 }
 
-type IoFuture = Pin<
-    Box<
-        dyn std::future::Future<
-                Output = (
-                    u32,
-                    IoStateKind,
-                    u32,
-                    anyhow::Result<UblkIoRequest>,
-                    SmooUblkDevice,
-                ),
-            > + Send,
-    >,
->;
+fn spawn_queue_tasks(
+    export_id: u32,
+    dev_id: u32,
+    queues: Arc<UblkQueueRuntime>,
+    tx: QueueSender,
+) -> QueueTaskSet {
+    let (stop, stop_rx) = watch::channel(false);
+    let mut handles = Vec::new();
+    for queue_id in 0..queues.queue_count() {
+        let mut stop_rx = stop_rx.clone();
+        let queues = queues.clone();
+        let tx = tx.clone();
+        handles.push(tokio::spawn(async move {
+            queue_task_loop(export_id, dev_id, queue_id, queues, &mut stop_rx, tx).await;
+        }));
+    }
+    QueueTaskSet { stop, handles }
+}
 
-fn enqueue_io(runtime: &mut RuntimeState, io_futs: &mut FuturesUnordered<IoFuture>) {
-    for (export_id, controller) in runtime.exports.iter_mut() {
-        if let Some((kind, dev_id, device)) = controller.take_device_for_io() {
-            let export_id = *export_id;
-            trace!(
-                export_id,
-                dev_id,
-                queue_count = device.queue_count(),
-                queue_depth = device.queue_depth(),
-                kind = ?kind,
-                "enqueue ublk device for IO"
-            );
-            io_futs.push(Box::pin(async move {
-                let res = device.next_io().await;
-                (export_id, kind, dev_id, res, device)
-            }));
+async fn queue_task_loop(
+    export_id: u32,
+    dev_id: u32,
+    queue_id: u16,
+    queues: Arc<UblkQueueRuntime>,
+    stop: &mut watch::Receiver<bool>,
+    tx: QueueSender,
+) {
+    loop {
+        tokio::select! {
+            changed = stop.changed() => {
+                if changed.is_ok() {
+                    break;
+                } else {
+                    break;
+                }
+            }
+            req = queues.next_io(queue_id) => {
+                match req {
+                    Ok(request) => {
+                        if tx.send(QueueEvent::Request { export_id, dev_id, request, queues: queues.clone() }).is_err() {
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        if !*stop.borrow() {
+                            let _ = tx.send(QueueEvent::QueueError { export_id, dev_id, error: err });
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn sync_queue_tasks(runtime: &mut RuntimeState, queue_tx: &QueueSender) {
+    let mut to_stop: Vec<u32> = runtime
+        .queue_tasks
+        .keys()
+        .cloned()
+        .filter(|export_id| !runtime.exports.contains_key(export_id))
+        .collect();
+
+    for (&export_id, controller) in runtime.exports.iter() {
+        let should_run = controller
+            .device_handle()
+            .map(|h| h.is_online())
+            .unwrap_or(false);
+        let running = runtime.queue_tasks.contains_key(&export_id);
+        if should_run && !running {
+            if let Some(handle) = controller.device_handle() {
+                if let Some(queues) = handle.queues() {
+                    let tasks =
+                        spawn_queue_tasks(export_id, handle.dev_id(), queues, queue_tx.clone());
+                    runtime.queue_tasks.insert(export_id, tasks);
+                }
+            }
+        } else if !should_run && running {
+            to_stop.push(export_id);
+        }
+    }
+
+    for export_id in to_stop {
+        if let Some(tasks) = runtime.queue_tasks.remove(&export_id) {
+            tasks.shutdown().await;
         }
     }
 }
@@ -338,12 +433,12 @@ async fn run_event_loop(
 ) -> Result<()> {
     let shutdown = signal::ctrl_c();
     tokio::pin!(shutdown);
-    let mut io_futs: FuturesUnordered<IoFuture> = FuturesUnordered::new();
     let idle_sleep = tokio::time::sleep(Duration::from_millis(10));
     tokio::pin!(idle_sleep);
     let mut liveness_tick = tokio::time::interval(Duration::from_millis(500));
-    let mut outstanding: HashMap<u32, HashMap<(u16, u16), UblkIoRequest>> = HashMap::new();
+    let mut outstanding: HashMap<u32, HashMap<(u16, u16), OutstandingRequest>> = HashMap::new();
     let mut hup = unix_signal(SignalKind::hangup()).context("install SIGHUP handler")?;
+    let (queue_tx, mut queue_rx) = mpsc::unbounded_channel::<QueueEvent>();
 
     let mut io_error = None;
     let mut recovery_exit = false;
@@ -351,16 +446,20 @@ async fn run_event_loop(
         idle_sleep
             .as_mut()
             .reset(tokio::time::Instant::now() + Duration::from_millis(10));
-        link.tick(Instant::now());
+        let now = Instant::now();
+        link.tick(now);
         process_link_commands(&mut runtime, &mut link).await?;
         drain_outstanding(&mut runtime, &mut link, &mut outstanding).await?;
-        let reconcile_needed = runtime.exports.values().any(|ctrl| ctrl.needs_reconcile());
+        let reconcile_needed = runtime
+            .exports
+            .values()
+            .any(|ctrl| ctrl.needs_reconcile(now));
         if reconcile_needed {
             reconcile_exports(ublk, &mut runtime).await?;
         }
+        sync_queue_tasks(&mut runtime, &queue_tx).await;
         let active_count = count_active_exports(&runtime.exports);
         runtime.status().set_export_count(active_count).await;
-        enqueue_io(&mut runtime, &mut io_futs);
 
         tokio::select! {
             _ = &mut shutdown => {
@@ -378,6 +477,7 @@ async fn run_event_loop(
                 trace!(state = ?link.state(), outstanding_exports = outstanding.len(), "liveness tick");
                 process_link_commands(&mut runtime, &mut link).await?;
                 drain_outstanding(&mut runtime, &mut link, &mut outstanding).await?;
+                sync_queue_tasks(&mut runtime, &queue_tx).await;
             }
             maybe_msg = control_rx.recv() => {
                 if let Some(msg) = maybe_msg {
@@ -388,68 +488,25 @@ async fn run_event_loop(
                     process_control_message(msg, ublk, &mut runtime, &mut link).await?;
                     process_link_commands(&mut runtime, &mut link).await?;
                     drain_outstanding(&mut runtime, &mut link, &mut outstanding).await?;
+                    sync_queue_tasks(&mut runtime, &queue_tx).await;
                 } else {
                     break;
                 }
             }
-            next_io = io_futs.next(), if !io_futs.is_empty() => {
-                if let Some((export_id, kind, dev_id, req_res, device)) = next_io {
-                    if let Some(ctrl) = runtime.exports.get_mut(&export_id) {
-                        match req_res {
-                            Ok(req) => {
-                                if link.state() != LinkState::Online || runtime.gadget.is_none() {
-                                    trace!(export_id, queue = req.queue_id, tag = req.tag, "link not online; parking IO");
-                                    park_request(&mut outstanding, export_id, req);
-                                    ctrl.restore_device_after_io(kind, dev_id, device);
-                                    continue;
-                                }
-                                trace!(
-                                    export_id,
-                                    dev_id,
-                                    queue = req.queue_id,
-                                    tag = req.tag,
-                                    op = ?req.op,
-                                    sector = req.sector,
-                                    num_sectors = req.num_sectors,
-                                    "dispatch ublk request to host"
-                                );
-                                let result = handle_request(
-                                    runtime.gadget.as_mut().expect("gadget present"),
-                                    export_id,
-                                    &device,
-                                    req,
-                                )
-                                .await;
-                                match result {
-                                    Ok(()) => {
-                                        ctrl.restore_device_after_io(kind, dev_id, device);
-                                    }
-                                    Err(err) => {
-                                        let io_err = io_error_from_anyhow(&err);
-                                        link.on_io_error(&io_err);
-                                        park_request(&mut outstanding, export_id, req);
-                                        ctrl.restore_device_after_io(kind, dev_id, device);
-                                        warn!(export_id, queue = req.queue_id, tag = req.tag, error = ?err, "link error handling request; parked for retry");
-                                        process_link_commands(&mut runtime, &mut link).await?;
-                                    }
-                                }
-                            }
-                            Err(err) => {
-                                ctrl.fail_after_io(dev_id, format!("{err:#}"));
-                                ctrl.restore_device_after_io(kind, dev_id, device);
-                                io_error = Some(err.context("receive ublk io"));
-                                break;
-                            }
-                        }
+            maybe_evt = queue_rx.recv() => {
+                if let Some(evt) = maybe_evt {
+                    if let Err(err) = handle_queue_event(&mut runtime, &mut link, &mut outstanding, evt).await {
+                        io_error = Some(err);
+                        break;
                     }
+                } else {
+                    break;
                 }
             }
             _ = &mut idle_sleep => {}
         }
     }
 
-    // Ensure any in-flight IO futures drop their devices before teardown.
-    drop(io_futs);
     if recovery_exit {
         return Ok(());
     }
@@ -473,10 +530,10 @@ async fn run_event_loop(
 async fn handle_request(
     gadget: &mut SmooGadget,
     export_id: u32,
-    device: &SmooUblkDevice,
+    queues: &UblkQueueRuntime,
     req: UblkIoRequest,
 ) -> Result<()> {
-    let block_size = device.block_size();
+    let block_size = queues.block_size();
     let req_len = match request_byte_len(&req, block_size) {
         Ok(len) => len,
         Err(err) => {
@@ -488,7 +545,7 @@ async fn handle_request(
                 ?req.op,
                 "invalid request length: {err}"
             );
-            device
+            queues
                 .complete_io(req, -errno)
                 .context("complete invalid request")?;
             return Ok(());
@@ -504,7 +561,7 @@ async fn handle_request(
                 op = ?req.op,
                 "unsupported ublk opcode"
             );
-            device
+            queues
                 .complete_io(req, -libc::EOPNOTSUPP)
                 .context("complete unsupported opcode")?;
             return Ok(());
@@ -513,7 +570,7 @@ async fn handle_request(
 
     trace!(
         export_id,
-        dev_id = device.dev_id(),
+        dev_id = queues.dev_id(),
         queue = req.queue_id,
         tag = req.tag,
         op = ?req.op,
@@ -525,7 +582,7 @@ async fn handle_request(
     let mut payload: Option<UblkBuffer<'_>> = None;
     let result = async {
         if matches!(opcode, OpCode::Read | OpCode::Write) && req_len > 0 {
-            let capacity = device.buffer_len();
+            let capacity = queues.buffer_len();
             if req_len > capacity {
                 warn!(
                     queue = req.queue_id,
@@ -534,13 +591,13 @@ async fn handle_request(
                     buf_cap = capacity,
                     "request exceeds buffer capacity"
                 );
-                device
+                queues
                     .complete_io(req, -libc::EINVAL)
                     .context("complete oversized request")?;
                 return Ok(());
             }
             payload = Some(
-                device
+                queues
                     .checkout_buffer(req.queue_id, req.tag)
                     .context("checkout bulk buffer")?,
             );
@@ -551,7 +608,7 @@ async fn handle_request(
         let proto_req = Request::new(export_id, opcode, req.sector, num_blocks, 0);
         trace!(
             export_id,
-            dev_id = device.dev_id(),
+            dev_id = queues.dev_id(),
             queue = req.queue_id,
             tag = req.tag,
             op = ?opcode,
@@ -565,7 +622,7 @@ async fn handle_request(
             .context("send smoo request")?;
         trace!(
             export_id,
-            dev_id = device.dev_id(),
+            dev_id = queues.dev_id(),
             queue = req.queue_id,
             tag = req.tag,
             "smoo Request sent"
@@ -599,7 +656,7 @@ async fn handle_request(
                 "response byte count mismatch"
             );
         }
-        device
+        queues
             .complete_io(req, status)
             .context("complete ublk request")?;
         Ok(())
@@ -989,8 +1046,8 @@ async fn apply_config(
     };
 
     for controller in runtime.exports.values_mut() {
-        if let Some(device) = controller.take_device() {
-            ublk.stop_dev(device, true)
+        if let Some((ctrl, queues)) = controller.take_device_handles() {
+            ublk.stop_dev(SmooUblkDevice::from_parts(ctrl, queues), true)
                 .await
                 .context("stop ublk device before applying CONFIG_EXPORTS")?;
         }
@@ -1118,12 +1175,18 @@ fn to_owned_fd(file: File) -> OwnedFd {
 }
 
 async fn cleanup_ublk_devices(ublk: &mut SmooUblk, runtime: &mut RuntimeState) -> Result<()> {
+    for (_, tasks) in runtime.queue_tasks.drain() {
+        tasks.shutdown().await;
+    }
     let mut force_remove_ids = Vec::new();
     for controller in runtime.exports.values_mut() {
-        if let Some(device) = controller.take_device() {
-            let dev_id = device.dev_id();
+        if let Some((ctrl, queues)) = controller.take_device_handles() {
+            let dev_id = ctrl.dev_id();
             info!(dev_id, "stopping ublk device");
-            if let Err(err) = ublk.stop_dev(device, true).await {
+            if let Err(err) = ublk
+                .stop_dev(SmooUblkDevice::from_parts(ctrl, queues), true)
+                .await
+            {
                 warn!(
                     dev_id,
                     error = ?err,
@@ -1171,11 +1234,14 @@ async fn force_remove_with_retry(ublk: &mut SmooUblk, dev_id: u32) -> Result<()>
 
 async fn begin_user_recovery(ublk: &mut SmooUblk, runtime: &mut RuntimeState) -> Result<()> {
     ublk.preserve_devices_on_drop();
+    for (_, tasks) in runtime.queue_tasks.drain() {
+        tasks.shutdown().await;
+    }
     let mut dev_ids = Vec::new();
     for ctrl in runtime.exports.values_mut() {
-        if let Some(device) = ctrl.take_device() {
-            dev_ids.push(device.dev_id());
-            drop(device);
+        if let Some((ctrl, queues)) = ctrl.take_device_handles() {
+            dev_ids.push(ctrl.dev_id());
+            drop(SmooUblkDevice::from_parts(ctrl, queues));
         } else if let Some(dev_id) = ctrl.dev_id() {
             dev_ids.push(dev_id);
         }
@@ -1222,19 +1288,98 @@ async fn process_link_commands(
     Ok(())
 }
 
+async fn handle_queue_event(
+    runtime: &mut RuntimeState,
+    link: &mut LinkController,
+    outstanding: &mut HashMap<u32, HashMap<(u16, u16), OutstandingRequest>>,
+    event: QueueEvent,
+) -> Result<()> {
+    match event {
+        QueueEvent::Request {
+            export_id,
+            dev_id,
+            request,
+            queues,
+        } => {
+            let Some(ctrl) = runtime.exports.get_mut(&export_id) else {
+                return Ok(());
+            };
+            let Some(handle) = ctrl.device_handle() else {
+                park_request(outstanding, export_id, dev_id, request);
+                return Ok(());
+            };
+            if handle.dev_id() != dev_id {
+                trace!(export_id, dev_id, "dropping request for stale device id");
+                return Ok(());
+            }
+            if link.state() != LinkState::Online || runtime.gadget.is_none() || !handle.is_online()
+            {
+                trace!(
+                    export_id,
+                    queue = request.queue_id,
+                    tag = request.tag,
+                    "link not online; parking IO"
+                );
+                park_request(outstanding, export_id, dev_id, request);
+                return Ok(());
+            }
+            let Some(gadget) = runtime.gadget.as_mut() else {
+                park_request(outstanding, export_id, dev_id, request);
+                return Ok(());
+            };
+            trace!(
+                export_id,
+                dev_id,
+                queue = request.queue_id,
+                tag = request.tag,
+                op = ?request.op,
+                sector = request.sector,
+                num_sectors = request.num_sectors,
+                "dispatch ublk request to host"
+            );
+            let result = handle_request(gadget, export_id, queues.as_ref(), request).await;
+            if let Err(err) = result {
+                let io_err = io_error_from_anyhow(&err);
+                link.on_io_error(&io_err);
+                park_request(outstanding, export_id, dev_id, request);
+                warn!(export_id, queue = request.queue_id, tag = request.tag, error = ?err, "link error handling request; parked for retry");
+            }
+        }
+        QueueEvent::QueueError {
+            export_id,
+            dev_id,
+            error,
+        } => {
+            if let Some(ctrl) = runtime.exports.get_mut(&export_id) {
+                ctrl.fail_device(format!("device {dev_id} queue task error: {error:#}"));
+            }
+            outstanding.remove(&export_id);
+            link.on_io_error(&io::Error::new(io::ErrorKind::Other, "queue task error"));
+        }
+    }
+    Ok(())
+}
+
 fn park_request(
-    outstanding: &mut HashMap<u32, HashMap<(u16, u16), UblkIoRequest>>,
+    outstanding: &mut HashMap<u32, HashMap<(u16, u16), OutstandingRequest>>,
     export_id: u32,
+    dev_id: u32,
     req: UblkIoRequest,
 ) {
     let entry = outstanding.entry(export_id).or_default();
-    entry.insert((req.queue_id, req.tag), req);
+    entry.insert(
+        (req.queue_id, req.tag),
+        OutstandingRequest {
+            dev_id,
+            request: req,
+        },
+    );
 }
 
 async fn drain_outstanding(
     runtime: &mut RuntimeState,
     link: &mut LinkController,
-    outstanding: &mut HashMap<u32, HashMap<(u16, u16), UblkIoRequest>>,
+    outstanding: &mut HashMap<u32, HashMap<(u16, u16), OutstandingRequest>>,
 ) -> Result<()> {
     if outstanding.is_empty() {
         return Ok(());
@@ -1267,7 +1412,7 @@ async fn drain_outstanding(
         let Some((export_id, queue_id, tag)) = next else {
             break;
         };
-        let req = {
+        let pending = {
             let map = outstanding.get_mut(&export_id);
             let req = map.and_then(|m| m.remove(&(queue_id, tag)));
             if let Some(map) = outstanding.get(&export_id) {
@@ -1277,43 +1422,54 @@ async fn drain_outstanding(
             }
             req
         };
-        let Some(req) = req else {
+        let Some(pending) = pending else {
             continue;
         };
-        let Some(ctrl) = runtime.exports.get_mut(&export_id) else {
+        let Some(ctrl) = runtime.exports.get(&export_id) else {
             continue;
         };
-        let Some((kind, dev_id, device)) = ctrl.take_device_for_io() else {
-            park_request(outstanding, export_id, req);
-            trace!(export_id, queue = req.queue_id, tag = req.tag, "controller busy; re-parked outstanding IO");
+        let Some(handle) = ctrl.device_handle() else {
+            park_request(outstanding, export_id, pending.dev_id, pending.request);
             break;
         };
+        if handle.dev_id() != pending.dev_id {
+            trace!(
+                export_id,
+                stale_dev = pending.dev_id,
+                current_dev = handle.dev_id(),
+                "dropping outstanding for stale device"
+            );
+            continue;
+        }
+        if !handle.is_online() {
+            park_request(outstanding, export_id, pending.dev_id, pending.request);
+            break;
+        }
+        let Some(queues) = handle.queues() else {
+            park_request(outstanding, export_id, pending.dev_id, pending.request);
+            break;
+        };
+        let req = pending.request;
         trace!(
             export_id,
-            dev_id,
+            dev_id = pending.dev_id,
             queue = req.queue_id,
             tag = req.tag,
             "replaying outstanding IO to host"
         );
-        let result = handle_request(gadget, export_id, &device, req).await;
-        match result {
-            Ok(()) => {
-                ctrl.restore_device_after_io(kind, dev_id, device);
-            }
-            Err(err) => {
-                let io_err = io_error_from_anyhow(&err);
-                link.on_io_error(&io_err);
-                park_request(outstanding, export_id, req);
-                ctrl.restore_device_after_io(kind, dev_id, device);
-                warn!(
-                    export_id,
-                    queue = req.queue_id,
-                    tag = req.tag,
-                    error = ?err,
-                    "link error replaying outstanding IO; parked again"
-                );
-                break;
-            }
+        let result = handle_request(gadget, export_id, queues.as_ref(), req).await;
+        if let Err(err) = result {
+            let io_err = io_error_from_anyhow(&err);
+            link.on_io_error(&io_err);
+            park_request(outstanding, export_id, pending.dev_id, req);
+            warn!(
+                export_id,
+                queue = req.queue_id,
+                tag = req.tag,
+                error = ?err,
+                "link error replaying outstanding IO; parked again"
+            );
+            break;
         }
     }
     Ok(())
@@ -1357,15 +1513,15 @@ fn pid_is_alive(pid: i32) -> bool {
 }
 
 fn export_state_tag(controller: &ExportController) -> &'static str {
-    match controller.state {
+    match &controller.state {
         ExportState::New => "new",
         ExportState::RecoveringPending { .. } => "recovering_pending",
-        ExportState::Recovering { .. } => "recovering",
-        ExportState::Starting { .. } => "starting",
-        ExportState::Online { .. } => "online",
-        ExportState::ShuttingDown { .. } => "shutting_down",
-        ExportState::IoInFlight { .. } => "io_in_flight",
-        ExportState::Failed { .. } => "failed",
+        ExportState::Device(handle) => match handle {
+            DeviceHandle::Starting { .. } => "starting",
+            DeviceHandle::Online { .. } => "online",
+            DeviceHandle::ShuttingDown { .. } => "shutting_down",
+            DeviceHandle::Failed { .. } => "failed",
+        },
         ExportState::Deleted => "deleted",
     }
 }

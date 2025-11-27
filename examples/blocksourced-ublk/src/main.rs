@@ -14,11 +14,11 @@
 
 use anyhow::{Context, ensure};
 use clap::{ArgGroup, Parser};
-use smoo_gadget_ublk::{SmooUblk, UblkIoRequest, UblkOp};
+use smoo_gadget_ublk::{SmooUblk, SmooUblkDevice, UblkIoRequest, UblkOp, UblkQueueRuntime};
 use smoo_host_blocksources::{DeviceBlockSource, FileBlockSource};
 use smoo_host_core::BlockSource;
 use std::{io, path::PathBuf, sync::Arc};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, mpsc};
 use tracing::{debug, info, warn};
 use tracing_subscriber::prelude::*;
 
@@ -99,19 +99,67 @@ async fn main() -> anyhow::Result<()> {
         "ublk device configured"
     );
 
+    let (ctrl, queues) = device.into_parts();
+    let queues = queues.clone();
+    let (err_tx, mut err_rx) = mpsc::unbounded_channel::<anyhow::Error>();
+    let mut workers = Vec::new();
+    for queue_id in 0..queues.queue_count() {
+        let queues = queues.clone();
+        let source = source.clone();
+        let err_tx = err_tx.clone();
+        let shutdown = shutdown.clone();
+        workers.push(tokio::spawn(async move {
+            if let Err(err) = serve_queue(queue_id, queues, source.as_ref(), shutdown).await {
+                let _ = err_tx.send(err);
+            }
+        }));
+    }
+    drop(err_tx);
+
     let mut io_error = None;
+    tokio::select! {
+        _ = shutdown.notified() => {
+            info!("shutdown signal received");
+        }
+        err = err_rx.recv() => {
+            if let Some(err) = err {
+                io_error = Some(err);
+            }
+        }
+    }
+
+    shutdown.notify_waiters();
+    for worker in workers {
+        let _ = worker.await;
+    }
+
+    info!("stopping ublk device");
+    ublk.stop_dev(SmooUblkDevice::from_parts(ctrl, queues), true)
+        .await
+        .context("stop device")?;
+    if let Some(err) = io_error {
+        return Err(err);
+    }
+    Ok(())
+}
+
+async fn serve_queue(
+    queue_id: u16,
+    queues: Arc<UblkQueueRuntime>,
+    source: &dyn BlockSource,
+    shutdown: Arc<Notify>,
+) -> anyhow::Result<()> {
+    let block_size = queues.block_size();
     loop {
         tokio::select! {
             _ = shutdown.notified() => {
-                info!("shutdown signal received");
-                break;
+                return Ok(());
             }
-            req = device.next_io() => {
-                let req = match req {
+            req_res = queues.next_io(queue_id) => {
+                let req = match req_res {
                     Ok(req) => req,
                     Err(err) => {
-                        io_error = Some(err.context("receive ublk io"));
-                        break;
+                        return Err(err.context("receive ublk io"));
                     }
                 };
                 let req_len = match request_byte_len(&req, block_size) {
@@ -125,7 +173,7 @@ async fn main() -> anyhow::Result<()> {
                             ?req.op,
                             "invalid request length: {err}"
                         );
-                        device
+                        queues
                             .complete_io(req, -errno)
                             .context("complete invalid length")?;
                         continue;
@@ -143,20 +191,20 @@ async fn main() -> anyhow::Result<()> {
 
                 let result_bytes = match req.op {
                     UblkOp::Read => {
-                        if req_len > device.buffer_len() {
+                        if req_len > queues.buffer_len() {
                             warn!(
                                 queue = req.queue_id,
                                 tag = req.tag,
                                 req_bytes = req_len,
-                                buf_cap = device.buffer_len(),
+                                buf_cap = queues.buffer_len(),
                                 "read request exceeds buffer capacity"
                             );
-                            device
+                            queues
                                 .complete_io(req, -libc::EINVAL)
                                 .context("complete oversized request")?;
                             continue;
                         }
-                        let mut buf = device
+                        let mut buf = queues
                             .checkout_buffer(req.queue_id, req.tag)
                             .context("checkout buffer")?;
                         source
@@ -166,20 +214,20 @@ async fn main() -> anyhow::Result<()> {
                         req_len
                     }
                     UblkOp::Write => {
-                        if req_len > device.buffer_len() {
+                        if req_len > queues.buffer_len() {
                             warn!(
                                 queue = req.queue_id,
                                 tag = req.tag,
                                 req_bytes = req_len,
-                                buf_cap = device.buffer_len(),
+                                buf_cap = queues.buffer_len(),
                                 "write request exceeds buffer pool capacity"
                             );
-                            device
+                            queues
                                 .complete_io(req, -libc::EINVAL)
                                 .context("complete oversized request")?;
                             continue;
                         }
-                        let buf = device
+                        let buf = queues
                             .checkout_buffer(req.queue_id, req.tag)
                             .context("checkout buffer")?;
                         source
@@ -206,7 +254,7 @@ async fn main() -> anyhow::Result<()> {
                             code = code,
                             "unsupported operation"
                         );
-                        device
+                        queues
                             .complete_io(req, -libc::EOPNOTSUPP)
                             .context("complete unsupported op")?;
                         continue;
@@ -225,19 +273,10 @@ async fn main() -> anyhow::Result<()> {
                         -libc::EIO
                     }
                 };
-                device
-                    .complete_io(req, result_code)
-                    .context("complete io")?;
+                queues.complete_io(req, result_code).context("complete io")?;
             }
         }
     }
-
-    info!("stopping ublk device");
-    ublk.stop_dev(device, true).await.context("stop device")?;
-    if let Some(err) = io_error {
-        return Err(err);
-    }
-    Ok(())
 }
 
 async fn open_source(args: &Args) -> anyhow::Result<Arc<dyn BlockSource>> {
