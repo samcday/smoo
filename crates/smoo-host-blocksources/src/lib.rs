@@ -3,15 +3,11 @@ use async_trait::async_trait;
 use smoo_host_core::{BlockSource, BlockSourceError, BlockSourceErrorKind, BlockSourceResult};
 use std::{
     io,
-    io::SeekFrom,
+    os::unix::fs::FileExt,
     path::Path,
     sync::atomic::{AtomicU64, Ordering},
 };
-use tokio::{
-    fs::{File, OpenOptions},
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
-    sync::Mutex,
-};
+use tokio::{fs::OpenOptions, task};
 use tracing::debug;
 
 /// Block source that produces deterministic pseudo-random data based on a seed.
@@ -267,15 +263,15 @@ fn io_error(err: io::Error) -> BlockSourceError {
 }
 
 struct BlockFile {
-    file: Mutex<File>,
+    file: std::fs::File,
     len: AtomicU64,
     writable: bool,
 }
 
 impl BlockFile {
-    fn new(file: File, len: u64, writable: bool) -> Self {
+    fn new(file: std::fs::File, len: u64, writable: bool) -> Self {
         Self {
-            file: Mutex::new(file),
+            file,
             len: AtomicU64::new(len),
             writable,
         }
@@ -286,9 +282,26 @@ impl BlockFile {
     }
 
     async fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
-        let mut file = self.file.lock().await;
-        file.seek(SeekFrom::Start(offset)).await?;
-        file.read_exact(buf).await?;
+        let file = self.file.try_clone()?;
+        let len = buf.len();
+        let tmp = task::spawn_blocking(move || {
+            let mut tmp = vec![0u8; len];
+            let mut read = 0;
+            while read < len {
+                let n = file.read_at(&mut tmp[read..], offset + read as u64)?;
+                if n == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "short read from block file",
+                    ));
+                }
+                read += n;
+            }
+            Ok::<_, io::Error>(tmp)
+        })
+        .await
+        .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))??;
+        buf.copy_from_slice(&tmp);
         Ok(())
     }
 
@@ -300,27 +313,50 @@ impl BlockFile {
             ));
         }
 
-        let mut file = self.file.lock().await;
-        file.seek(SeekFrom::Start(offset)).await?;
-        file.write_all(buf).await?;
+        let file = self.file.try_clone()?;
+        let data = buf.to_vec();
+        let len = data.len();
+        task::spawn_blocking(move || {
+            let mut written = 0;
+            while written < len {
+                let n = file.write_at(&data[written..], offset + written as u64)?;
+                if n == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "short write to block file",
+                    ));
+                }
+                written += n;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap_or_else(|err| Err(io::Error::new(io::ErrorKind::Other, err.to_string())))?;
 
-        let written = u64::try_from(buf.len())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "write length exceeds u64"))?;
         let end = offset
-            .checked_add(written)
+            .checked_add(u64::try_from(len).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "write length exceeds u64")
+            })?)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "write offset overflow"))?;
         self.len.fetch_max(end, Ordering::Relaxed);
         Ok(())
     }
 
     async fn flush(&self) -> io::Result<()> {
-        let file = self.file.lock().await;
-        file.sync_data().await
+        let file = self.file.try_clone()?;
+        task::spawn_blocking(move || file.sync_data())
+            .await
+            .unwrap_or_else(|err| {
+                Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("flush join error: {err}"),
+                ))
+            })
     }
 }
 
 struct OpenedBlockFile {
-    file: File,
+    file: std::fs::File,
     len: u64,
     writable: bool,
 }
@@ -358,6 +394,8 @@ async fn open_block_file(path: &Path) -> Result<OpenedBlockFile> {
     if writable {
         debug!(path = %path_display, len = len, "opened block source read-write");
     }
+
+    let file = file.into_std().await;
 
     Ok(OpenedBlockFile {
         file,
