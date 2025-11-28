@@ -38,6 +38,8 @@ sudo ./target/debug/smoo-host-cli --file random.img
 ### Development prerequisites
 
  * Alpine: `apk add linux-headers clang-dev`
+ * Debian: `sudo apt build-dep ./`
+ * Fedora: `sudo dnf build-dep --spec ./smoo.spec`
  * Others: idk pls expand here
 
 ## Status
