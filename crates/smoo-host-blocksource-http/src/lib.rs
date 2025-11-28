@@ -4,7 +4,10 @@
 //! treated as read-only). Designed to work on native (reqwest) and wasm32 (gloo-net/fetch).
 
 use async_trait::async_trait;
-use smoo_host_core::{BlockSource, BlockSourceError, BlockSourceErrorKind, BlockSourceResult};
+use core::hash::Hasher;
+use smoo_host_core::{
+    BlockSource, BlockSourceError, BlockSourceErrorKind, BlockSourceResult, ExportIdentity,
+};
 use std::ops::RangeInclusive;
 use tracing::debug;
 use url::Url;
@@ -146,6 +149,12 @@ impl BlockSource for HttpBlockSource {
             BlockSourceErrorKind::Unsupported,
             "HTTP block source does not support discard",
         ))
+    }
+}
+
+impl ExportIdentity for HttpBlockSource {
+    fn write_export_id(&self, state: &mut dyn Hasher) {
+        state.write(self.url.as_str().as_bytes());
     }
 }
 

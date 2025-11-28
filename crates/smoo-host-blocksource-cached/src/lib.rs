@@ -6,11 +6,14 @@ use alloc::{boxed::Box, collections::BTreeMap, vec, vec::Vec};
 use async_trait::async_trait;
 use core::{
     cell::UnsafeCell,
+    hash::Hasher,
     hint::spin_loop,
     sync::atomic::{AtomicBool, Ordering},
 };
 use futures_channel::oneshot;
-use smoo_host_core::{BlockSource, BlockSourceError, BlockSourceErrorKind, BlockSourceResult};
+use smoo_host_core::{
+    BlockSource, BlockSourceError, BlockSourceErrorKind, BlockSourceResult, ExportIdentity,
+};
 
 /// Persistent storage for cached blocks.
 ///
@@ -260,6 +263,17 @@ where
 
     async fn discard(&self, _lba: u64, _num_blocks: u32) -> BlockSourceResult<()> {
         Ok(())
+    }
+}
+
+impl<S, C> ExportIdentity for CachedBlockSource<S, C>
+where
+    S: BlockSource + ExportIdentity,
+    C: CacheStore,
+{
+    fn write_export_id(&self, state: &mut dyn Hasher) {
+        state.write(b"cached:");
+        ExportIdentity::write_export_id(&self.inner, state);
     }
 }
 

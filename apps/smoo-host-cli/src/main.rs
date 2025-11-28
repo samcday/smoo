@@ -6,7 +6,8 @@ use smoo_host_blocksource_http::HttpBlockSource;
 use smoo_host_blocksources::{DeviceBlockSource, FileBlockSource, RandomBlockSource};
 use smoo_host_core::{
     control::{fetch_ident, read_status, send_config_exports_v0, ConfigExportsV0},
-    BlockSource, BlockSourceResult, HostErrorKind, SmooHost, TransportError, TransportErrorKind,
+    derive_export_id_from_source, BlockSource, BlockSourceResult, HostErrorKind, SmooHost,
+    TransportError, TransportErrorKind,
 };
 use smoo_host_rusb::{RusbControl, RusbTransport, RusbTransportConfig};
 use smoo_proto::SmooStatusV0;
@@ -79,13 +80,19 @@ enum HostSource {
 #[derive(Clone)]
 struct SharedSource {
     inner: Arc<HostSource>,
+    export_identity: Arc<str>,
 }
 
 impl SharedSource {
-    fn new(inner: HostSource) -> Self {
+    fn new(inner: HostSource, export_identity: String) -> Self {
         Self {
             inner: Arc::new(inner),
+            export_identity: Arc::<str>::from(export_identity),
         }
+    }
+
+    fn identity(&self) -> &str {
+        &self.export_identity
     }
 }
 
@@ -176,6 +183,12 @@ impl BlockSource for SharedSource {
 
     async fn discard(&self, lba: u64, num_blocks: u32) -> BlockSourceResult<()> {
         self.inner.discard(lba, num_blocks).await
+    }
+}
+
+impl smoo_host_core::ExportIdentity for SharedSource {
+    fn write_export_id(&self, state: &mut dyn core::hash::Hasher) {
+        state.write(self.export_identity.as_bytes());
     }
 }
 
@@ -519,7 +532,6 @@ impl EndpointBuilder {
 async fn open_sources(args: &Args) -> Result<(BTreeMap<u32, SharedSource>, ConfigExportsV0)> {
     let mut sources = BTreeMap::new();
     let mut entries: Vec<smoo_proto::ConfigExport> = Vec::new();
-    let mut next_id: u32 = 1;
     let block_size = args.block_size;
     ensure!(
         block_size.is_power_of_two(),
@@ -529,34 +541,24 @@ async fn open_sources(args: &Args) -> Result<(BTreeMap<u32, SharedSource>, Confi
 
     for path in &args.files {
         let size_bytes = file_size_bytes(path)?;
-        let source = SharedSource::new(HostSource::File(
-            FileBlockSource::open(path, block_size).await?,
-        ));
-        sources.insert(next_id, source);
-        entries.push(smoo_proto::ConfigExport {
-            export_id: next_id,
-            block_size,
-            size_bytes,
-        });
-        next_id = next_id
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("export_id overflow"))?;
+        let canonical = canonicalize_path(path)?;
+        let identity = format!("file:{}", canonical.display());
+        let source = SharedSource::new(
+            HostSource::File(FileBlockSource::open(path, block_size).await?),
+            identity.clone(),
+        );
+        register_export(&mut sources, &mut entries, source, block_size, size_bytes)?;
     }
 
     for path in &args.devices {
         let size_bytes = file_size_bytes(path)?;
-        let source = SharedSource::new(HostSource::Device(
-            DeviceBlockSource::open(path, block_size).await?,
-        ));
-        sources.insert(next_id, source);
-        entries.push(smoo_proto::ConfigExport {
-            export_id: next_id,
-            block_size,
-            size_bytes,
-        });
-        next_id = next_id
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("export_id overflow"))?;
+        let canonical = canonicalize_path(path)?;
+        let identity = format!("device:{}", canonical.display());
+        let source = SharedSource::new(
+            HostSource::Device(DeviceBlockSource::open(path, block_size).await?),
+            identity.clone(),
+        );
+        register_export(&mut sources, &mut entries, source, block_size, size_bytes)?;
     }
 
     for url_str in &args.http {
@@ -575,16 +577,9 @@ async fn open_sources(args: &Args) -> Result<(BTreeMap<u32, SharedSource>, Confi
             size_bytes % block_size as u64 == 0,
             "HTTP backing size must align to block size"
         );
-        let shared = SharedSource::new(HostSource::Http(source));
-        sources.insert(next_id, shared);
-        entries.push(smoo_proto::ConfigExport {
-            export_id: next_id,
-            block_size,
-            size_bytes,
-        });
-        next_id = next_id
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("export_id overflow"))?;
+        let source_id = format!("http:{}", url);
+        let shared = SharedSource::new(HostSource::Http(source), source_id);
+        register_export(&mut sources, &mut entries, shared, block_size, size_bytes)?;
     }
 
     for url_str in &args.cached_http {
@@ -609,16 +604,9 @@ async fn open_sources(args: &Args) -> Result<(BTreeMap<u32, SharedSource>, Confi
         let cached = CachedBlockSource::new(source, cache)
             .await
             .context("init cached HTTP block source")?;
-        let shared = SharedSource::new(HostSource::CachedHttp(cached));
-        sources.insert(next_id, shared);
-        entries.push(smoo_proto::ConfigExport {
-            export_id: next_id,
-            block_size,
-            size_bytes,
-        });
-        next_id = next_id
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("export_id overflow"))?;
+        let source_id = format!("cached-http:{}", url);
+        let shared = SharedSource::new(HostSource::CachedHttp(cached), source_id);
+        register_export(&mut sources, &mut entries, shared, block_size, size_bytes)?;
     }
 
     for (idx, blocks) in args.random.iter().copied().enumerate() {
@@ -627,18 +615,11 @@ async fn open_sources(args: &Args) -> Result<(BTreeMap<u32, SharedSource>, Confi
             .checked_mul(block_size as u64)
             .ok_or_else(|| anyhow!("random backing size overflows u64"))?;
         let seed = args.random_seed.wrapping_add(idx as u64);
-        let source = SharedSource::new(HostSource::Random(RandomBlockSource::new(
-            block_size, blocks, seed,
-        )?));
-        sources.insert(next_id, source);
-        entries.push(smoo_proto::ConfigExport {
-            export_id: next_id,
-            block_size,
-            size_bytes,
-        });
-        next_id = next_id
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("export_id overflow"))?;
+        let source = SharedSource::new(
+            HostSource::Random(RandomBlockSource::new(block_size, blocks, seed)?),
+            format!("random:{seed}"),
+        );
+        register_export(&mut sources, &mut entries, source, block_size, size_bytes)?;
     }
 
     let payload = ConfigExportsV0::from_slice(&entries)
@@ -646,9 +627,46 @@ async fn open_sources(args: &Args) -> Result<(BTreeMap<u32, SharedSource>, Confi
     Ok((sources, payload))
 }
 
+fn register_export(
+    sources: &mut BTreeMap<u32, SharedSource>,
+    entries: &mut Vec<smoo_proto::ConfigExport>,
+    source: SharedSource,
+    block_size: u32,
+    size_bytes: u64,
+) -> Result<()> {
+    let identity = source.identity().to_string();
+    ensure!(
+        source.block_size() == block_size,
+        "backing {identity} block size {} disagrees with configuration {}",
+        source.block_size(),
+        block_size
+    );
+    ensure!(
+        size_bytes % block_size as u64 == 0,
+        "backing size for {identity} must align to block size"
+    );
+    let block_count = size_bytes / block_size as u64;
+    let export_id = derive_export_id_from_source(&source, block_count);
+    ensure!(
+        !sources.contains_key(&export_id),
+        "derived duplicate export_id {export_id} for backing {identity}; check for repeated inputs or adjust backing parameters to avoid collisions"
+    );
+    sources.insert(export_id, source);
+    entries.push(smoo_proto::ConfigExport {
+        export_id,
+        block_size,
+        size_bytes,
+    });
+    Ok(())
+}
+
 fn file_size_bytes(path: &PathBuf) -> Result<u64> {
     let meta = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
     Ok(meta.len())
+}
+
+fn canonicalize_path(path: &PathBuf) -> Result<PathBuf> {
+    fs::canonicalize(path).with_context(|| format!("canonicalize {}", path.display()))
 }
 
 fn infer_interface_endpoints<T: UsbContext>(

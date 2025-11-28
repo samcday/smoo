@@ -1,6 +1,6 @@
 use alloc::{boxed::Box, string::String};
 use async_trait::async_trait;
-use core::fmt;
+use core::{fmt, hash::Hasher};
 
 pub type BlockSourceResult<T> = core::result::Result<T, BlockSourceError>;
 
@@ -84,4 +84,10 @@ pub trait BlockSource: Send + Sync {
     async fn discard(&self, _lba: u64, _num_blocks: u32) -> BlockSourceResult<()> {
         Ok(())
     }
+
+    /// Feed identifying bytes for export_id derivation.
+    ///
+    /// Implementations should write stable, canonical data that uniquely
+    /// distinguishes the backing (e.g. canonical path, URL, seed).
+    fn write_export_id(&self, _state: &mut dyn Hasher) {}
 }

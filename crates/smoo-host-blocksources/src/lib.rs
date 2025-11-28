@@ -1,6 +1,9 @@
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
-use smoo_host_core::{BlockSource, BlockSourceError, BlockSourceErrorKind, BlockSourceResult};
+use core::hash::Hasher;
+use smoo_host_core::{
+    BlockSource, BlockSourceError, BlockSourceErrorKind, BlockSourceResult, ExportIdentity,
+};
 use std::{
     io,
     os::unix::fs::FileExt,
@@ -24,6 +27,7 @@ pub struct RandomBlockSource {
 pub struct FileBlockSource {
     inner: BlockFile,
     block_size: u32,
+    identity: String,
 }
 
 impl FileBlockSource {
@@ -35,9 +39,13 @@ impl FileBlockSource {
         );
         ensure!(block_size > 0, "block size must be non-zero");
         let opened = open_block_file(path.as_ref()).await?;
+        let canonical = tokio::fs::canonicalize(path.as_ref())
+            .await
+            .with_context(|| format!("canonicalize {}", path.as_ref().display()))?;
         Ok(Self {
             inner: BlockFile::new(opened.file, opened.len, opened.writable),
             block_size,
+            identity: format!("file:{}", canonical.to_string_lossy()),
         })
     }
 
@@ -56,12 +64,17 @@ impl FileBlockSource {
             BlockSourceError::with_message(BlockSourceErrorKind::OutOfRange, "lba overflow")
         })
     }
+
+    fn write_identity<H: Hasher + ?Sized>(&self, state: &mut H) {
+        state.write(self.identity.as_bytes());
+    }
 }
 
 /// Block source backed by a block device node (e.g. `/dev/nvme0n1p3`).
 pub struct DeviceBlockSource {
     inner: BlockFile,
     block_size: u32,
+    identity: String,
 }
 
 impl DeviceBlockSource {
@@ -73,9 +86,13 @@ impl DeviceBlockSource {
         );
         ensure!(block_size > 0, "block size must be non-zero");
         let opened = open_block_file(path.as_ref()).await?;
+        let canonical = tokio::fs::canonicalize(path.as_ref())
+            .await
+            .with_context(|| format!("canonicalize {}", path.as_ref().display()))?;
         Ok(Self {
             inner: BlockFile::new(opened.file, opened.len, opened.writable),
             block_size,
+            identity: format!("device:{}", canonical.to_string_lossy()),
         })
     }
 
@@ -93,6 +110,10 @@ impl DeviceBlockSource {
         lba.checked_mul(self.block_size as u64).ok_or_else(|| {
             BlockSourceError::with_message(BlockSourceErrorKind::OutOfRange, "lba overflow")
         })
+    }
+
+    fn write_identity<H: Hasher + ?Sized>(&self, state: &mut H) {
+        state.write(self.identity.as_bytes());
     }
 }
 
@@ -143,6 +164,11 @@ impl RandomBlockSource {
             let copy_len = chunk.len();
             chunk.copy_from_slice(&bytes[..copy_len]);
         }
+    }
+
+    fn write_identity<H: Hasher + ?Sized>(&self, state: &mut H) {
+        state.write_u64(self.seed);
+        state.write_u64(self.blocks);
     }
 }
 
@@ -255,6 +281,24 @@ impl BlockSource for DeviceBlockSource {
 
     async fn flush(&self) -> BlockSourceResult<()> {
         self.inner.flush().await.map_err(io_error)
+    }
+}
+
+impl ExportIdentity for FileBlockSource {
+    fn write_export_id(&self, state: &mut dyn Hasher) {
+        self.write_identity(state);
+    }
+}
+
+impl ExportIdentity for DeviceBlockSource {
+    fn write_export_id(&self, state: &mut dyn Hasher) {
+        self.write_identity(state);
+    }
+}
+
+impl ExportIdentity for RandomBlockSource {
+    fn write_export_id(&self, state: &mut dyn Hasher) {
+        self.write_identity(state);
     }
 }
 
