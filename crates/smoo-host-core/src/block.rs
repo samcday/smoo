@@ -1,4 +1,5 @@
-use alloc::{boxed::Box, string::String};
+use crate::export_id::ExportIdentity;
+use alloc::{boxed::Box, string::String, sync::Arc};
 use async_trait::async_trait;
 use core::{fmt, hash::Hasher};
 
@@ -90,4 +91,94 @@ pub trait BlockSource: Send + Sync {
     /// Implementations should write stable, canonical data that uniquely
     /// distinguishes the backing (e.g. canonical path, URL, seed).
     fn write_export_id(&self, _state: &mut dyn Hasher) {}
+}
+
+/// Object-safe trait that bundles [`BlockSource`] with [`ExportIdentity`].
+pub trait DynBlockSource: BlockSource + ExportIdentity {}
+
+impl<T> DynBlockSource for T where T: BlockSource + ExportIdentity {}
+
+/// Cloneable, identity-carrying wrapper around a block source.
+pub struct BlockSourceHandle {
+    source: Arc<dyn DynBlockSource>,
+    identity: Arc<str>,
+}
+
+impl ExportIdentity for Arc<dyn DynBlockSource> {
+    fn write_export_id(&self, state: &mut dyn Hasher) {
+        ExportIdentity::write_export_id(&(**self), state);
+    }
+}
+
+impl BlockSourceHandle {
+    pub fn new<S>(source: S, identity: impl Into<Arc<str>>) -> Self
+    where
+        S: DynBlockSource + 'static,
+    {
+        Self {
+            source: Arc::new(source),
+            identity: identity.into(),
+        }
+    }
+
+    pub fn from_arc(source: Arc<dyn DynBlockSource>, identity: impl Into<Arc<str>>) -> Self {
+        Self {
+            source,
+            identity: identity.into(),
+        }
+    }
+
+    pub fn identity(&self) -> &str {
+        &self.identity
+    }
+
+    pub fn inner(&self) -> Arc<dyn DynBlockSource> {
+        Arc::clone(&self.source)
+    }
+}
+
+impl Clone for BlockSourceHandle {
+    fn clone(&self) -> Self {
+        Self {
+            source: Arc::clone(&self.source),
+            identity: Arc::clone(&self.identity),
+        }
+    }
+}
+
+#[async_trait]
+impl BlockSource for BlockSourceHandle {
+    fn block_size(&self) -> u32 {
+        self.source.block_size()
+    }
+
+    async fn total_blocks(&self) -> BlockSourceResult<u64> {
+        self.source.total_blocks().await
+    }
+
+    async fn read_blocks(&self, lba: u64, buf: &mut [u8]) -> BlockSourceResult<usize> {
+        self.source.read_blocks(lba, buf).await
+    }
+
+    async fn write_blocks(&self, lba: u64, buf: &[u8]) -> BlockSourceResult<usize> {
+        self.source.write_blocks(lba, buf).await
+    }
+
+    async fn flush(&self) -> BlockSourceResult<()> {
+        self.source.flush().await
+    }
+
+    async fn discard(&self, lba: u64, num_blocks: u32) -> BlockSourceResult<()> {
+        self.source.discard(lba, num_blocks).await
+    }
+
+    fn write_export_id(&self, state: &mut dyn Hasher) {
+        ExportIdentity::write_export_id(&self.source, state);
+    }
+}
+
+impl ExportIdentity for BlockSourceHandle {
+    fn write_export_id(&self, state: &mut dyn Hasher) {
+        ExportIdentity::write_export_id(&self.source, state);
+    }
 }

@@ -124,6 +124,13 @@ mod tests {
     #[derive(Clone)]
     struct FakeSource(&'static str, u32);
 
+    impl ExportIdentity for FakeSource {
+        fn write_export_id(&self, state: &mut dyn Hasher) {
+            state.write(self.0.as_bytes());
+            state.write_u32(self.1);
+        }
+    }
+
     #[async_trait::async_trait]
     impl crate::BlockSource for FakeSource {
         fn block_size(&self) -> u32 {
@@ -140,11 +147,6 @@ mod tests {
 
         async fn write_blocks(&self, _lba: u64, _buf: &[u8]) -> crate::BlockSourceResult<usize> {
             Ok(0)
-        }
-
-        fn write_export_id(&self, state: &mut dyn Hasher) {
-            state.write(self.0.as_bytes());
-            state.write_u32(self.1);
         }
     }
 

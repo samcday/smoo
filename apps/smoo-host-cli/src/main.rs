@@ -6,12 +6,12 @@ use smoo_host_blocksource_http::HttpBlockSource;
 use smoo_host_blocksources::{DeviceBlockSource, FileBlockSource, RandomBlockSource};
 use smoo_host_core::{
     control::{fetch_ident, read_status, send_config_exports_v0, ConfigExportsV0},
-    derive_export_id_from_source, BlockSource, BlockSourceResult, HostErrorKind, SmooHost,
-    TransportError, TransportErrorKind,
+    derive_export_id_from_source, BlockSource, BlockSourceHandle, BlockSourceResult,
+    ExportIdentity, HostErrorKind, SmooHost, TransportError, TransportErrorKind,
 };
 use smoo_host_rusb::{RusbControl, RusbTransport, RusbTransportConfig};
 use smoo_proto::SmooStatusV0;
-use std::{collections::BTreeMap, fmt, fs, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, fmt, fs, path::PathBuf, time::Duration};
 use tokio::{signal, sync::mpsc, time};
 use tracing::{debug, info, warn};
 
@@ -77,25 +77,6 @@ enum HostSource {
     Random(RandomBlockSource),
 }
 
-#[derive(Clone)]
-struct SharedSource {
-    inner: Arc<HostSource>,
-    export_identity: Arc<str>,
-}
-
-impl SharedSource {
-    fn new(inner: HostSource, export_identity: String) -> Self {
-        Self {
-            inner: Arc::new(inner),
-            export_identity: Arc::<str>::from(export_identity),
-        }
-    }
-
-    fn identity(&self) -> &str {
-        &self.export_identity
-    }
-}
-
 #[async_trait::async_trait]
 impl BlockSource for HostSource {
     fn block_size(&self) -> u32 {
@@ -159,36 +140,15 @@ impl BlockSource for HostSource {
     }
 }
 
-#[async_trait::async_trait]
-impl BlockSource for SharedSource {
-    fn block_size(&self) -> u32 {
-        self.inner.block_size()
-    }
-
-    async fn total_blocks(&self) -> BlockSourceResult<u64> {
-        self.inner.total_blocks().await
-    }
-
-    async fn read_blocks(&self, lba: u64, buf: &mut [u8]) -> BlockSourceResult<usize> {
-        self.inner.read_blocks(lba, buf).await
-    }
-
-    async fn write_blocks(&self, lba: u64, buf: &[u8]) -> BlockSourceResult<usize> {
-        self.inner.write_blocks(lba, buf).await
-    }
-
-    async fn flush(&self) -> BlockSourceResult<()> {
-        self.inner.flush().await
-    }
-
-    async fn discard(&self, lba: u64, num_blocks: u32) -> BlockSourceResult<()> {
-        self.inner.discard(lba, num_blocks).await
-    }
-}
-
-impl smoo_host_core::ExportIdentity for SharedSource {
+impl smoo_host_core::ExportIdentity for HostSource {
     fn write_export_id(&self, state: &mut dyn core::hash::Hasher) {
-        state.write(self.export_identity.as_bytes());
+        match self {
+            HostSource::File(inner) => ExportIdentity::write_export_id(inner, state),
+            HostSource::Device(inner) => ExportIdentity::write_export_id(inner, state),
+            HostSource::Http(inner) => ExportIdentity::write_export_id(inner, state),
+            HostSource::CachedHttp(inner) => ExportIdentity::write_export_id(inner, state),
+            HostSource::Random(inner) => ExportIdentity::write_export_id(inner, state),
+        }
     }
 }
 
@@ -233,7 +193,7 @@ enum SessionEnd {
 
 async fn run_session(
     args: &Args,
-    sources: BTreeMap<u32, SharedSource>,
+    sources: BTreeMap<u32, BlockSourceHandle>,
     config_payload: &ConfigExportsV0,
     expected_session_id: &mut Option<u64>,
     has_connected: bool,
@@ -529,7 +489,7 @@ impl EndpointBuilder {
     }
 }
 
-async fn open_sources(args: &Args) -> Result<(BTreeMap<u32, SharedSource>, ConfigExportsV0)> {
+async fn open_sources(args: &Args) -> Result<(BTreeMap<u32, BlockSourceHandle>, ConfigExportsV0)> {
     let mut sources = BTreeMap::new();
     let mut entries: Vec<smoo_proto::ConfigExport> = Vec::new();
     let block_size = args.block_size;
@@ -543,7 +503,7 @@ async fn open_sources(args: &Args) -> Result<(BTreeMap<u32, SharedSource>, Confi
         let size_bytes = file_size_bytes(path)?;
         let canonical = canonicalize_path(path)?;
         let identity = format!("file:{}", canonical.display());
-        let source = SharedSource::new(
+        let source = BlockSourceHandle::new(
             HostSource::File(FileBlockSource::open(path, block_size).await?),
             identity.clone(),
         );
@@ -554,7 +514,7 @@ async fn open_sources(args: &Args) -> Result<(BTreeMap<u32, SharedSource>, Confi
         let size_bytes = file_size_bytes(path)?;
         let canonical = canonicalize_path(path)?;
         let identity = format!("device:{}", canonical.display());
-        let source = SharedSource::new(
+        let source = BlockSourceHandle::new(
             HostSource::Device(DeviceBlockSource::open(path, block_size).await?),
             identity.clone(),
         );
@@ -578,7 +538,7 @@ async fn open_sources(args: &Args) -> Result<(BTreeMap<u32, SharedSource>, Confi
             "HTTP backing size must align to block size"
         );
         let source_id = format!("http:{}", url);
-        let shared = SharedSource::new(HostSource::Http(source), source_id);
+        let shared = BlockSourceHandle::new(HostSource::Http(source), source_id);
         register_export(&mut sources, &mut entries, shared, block_size, size_bytes)?;
     }
 
@@ -605,7 +565,7 @@ async fn open_sources(args: &Args) -> Result<(BTreeMap<u32, SharedSource>, Confi
             .await
             .context("init cached HTTP block source")?;
         let source_id = format!("cached-http:{}", url);
-        let shared = SharedSource::new(HostSource::CachedHttp(cached), source_id);
+        let shared = BlockSourceHandle::new(HostSource::CachedHttp(cached), source_id);
         register_export(&mut sources, &mut entries, shared, block_size, size_bytes)?;
     }
 
@@ -615,7 +575,7 @@ async fn open_sources(args: &Args) -> Result<(BTreeMap<u32, SharedSource>, Confi
             .checked_mul(block_size as u64)
             .ok_or_else(|| anyhow!("random backing size overflows u64"))?;
         let seed = args.random_seed.wrapping_add(idx as u64);
-        let source = SharedSource::new(
+        let source = BlockSourceHandle::new(
             HostSource::Random(RandomBlockSource::new(block_size, blocks, seed)?),
             format!("random:{seed}"),
         );
@@ -628,9 +588,9 @@ async fn open_sources(args: &Args) -> Result<(BTreeMap<u32, SharedSource>, Confi
 }
 
 fn register_export(
-    sources: &mut BTreeMap<u32, SharedSource>,
+    sources: &mut BTreeMap<u32, BlockSourceHandle>,
     entries: &mut Vec<smoo_proto::ConfigExport>,
-    source: SharedSource,
+    source: BlockSourceHandle,
     block_size: u32,
     size_bytes: u64,
 ) -> Result<()> {
