@@ -271,6 +271,7 @@ enum QueueEvent {
 struct OutstandingRequest {
     dev_id: u32,
     request: UblkIoRequest,
+    queues: Arc<UblkQueueRuntime>,
 }
 
 enum ControlMessage {
@@ -481,11 +482,11 @@ async fn run_event_loop(
             }
             maybe_msg = control_rx.recv() => {
                 if let Some(msg) = maybe_msg {
-                    if matches!(msg, ControlMessage::Config(_)) {
-                        // Drop any parked I/O when exports are being reconfigured.
-                        outstanding.clear();
-                    }
+                    let was_config = matches!(msg, ControlMessage::Config(_));
                     process_control_message(msg, ublk, &mut runtime, &mut link).await?;
+                    if was_config {
+                        prune_outstanding_for_missing_exports(&mut outstanding, &runtime.exports);
+                    }
                     process_link_commands(&mut runtime, &mut link).await?;
                     drain_outstanding(&mut runtime, &mut link, &mut outstanding).await?;
                     sync_queue_tasks(&mut runtime, &queue_tx).await;
@@ -1341,7 +1342,7 @@ async fn handle_queue_event(
                 return Ok(());
             };
             let Some(handle) = ctrl.device_handle() else {
-                park_request(outstanding, export_id, dev_id, request);
+                park_request(outstanding, export_id, dev_id, queues.clone(), request);
                 return Ok(());
             };
             if handle.dev_id() != dev_id {
@@ -1356,11 +1357,11 @@ async fn handle_queue_event(
                     tag = request.tag,
                     "link not online; parking IO"
                 );
-                park_request(outstanding, export_id, dev_id, request);
+                park_request(outstanding, export_id, dev_id, queues.clone(), request);
                 return Ok(());
             }
             let Some(gadget) = runtime.gadget.as_mut() else {
-                park_request(outstanding, export_id, dev_id, request);
+                park_request(outstanding, export_id, dev_id, queues.clone(), request);
                 return Ok(());
             };
             trace!(
@@ -1377,7 +1378,7 @@ async fn handle_queue_event(
             if let Err(err) = result {
                 let io_err = io_error_from_anyhow(&err);
                 link.on_io_error(&io_err);
-                park_request(outstanding, export_id, dev_id, request);
+                park_request(outstanding, export_id, dev_id, queues.clone(), request);
                 warn!(export_id, queue = request.queue_id, tag = request.tag, error = ?err, "link error handling request; parked for retry");
             }
         }
@@ -1389,7 +1390,11 @@ async fn handle_queue_event(
             if let Some(ctrl) = runtime.exports.get_mut(&export_id) {
                 ctrl.fail_device(format!("device {dev_id} queue task error: {error:#}"));
             }
-            outstanding.remove(&export_id);
+            if let Some(mut pending) = outstanding.remove(&export_id) {
+                for ((_queue_id, _tag), req) in pending.drain() {
+                    let _ = req.queues.complete_io(req.request, -libc::ENOLINK);
+                }
+            }
             link.on_io_error(&io::Error::new(io::ErrorKind::Other, "queue task error"));
         }
     }
@@ -1400,6 +1405,7 @@ fn park_request(
     outstanding: &mut HashMap<u32, HashMap<(u16, u16), OutstandingRequest>>,
     export_id: u32,
     dev_id: u32,
+    queues: Arc<UblkQueueRuntime>,
     req: UblkIoRequest,
 ) {
     let entry = outstanding.entry(export_id).or_default();
@@ -1408,8 +1414,28 @@ fn park_request(
         OutstandingRequest {
             dev_id,
             request: req,
+            queues,
         },
     );
+}
+
+fn prune_outstanding_for_missing_exports(
+    outstanding: &mut HashMap<u32, HashMap<(u16, u16), OutstandingRequest>>,
+    exports: &HashMap<u32, ExportController>,
+) {
+    let mut to_fail = Vec::new();
+    for export_id in outstanding.keys() {
+        if !exports.contains_key(export_id) {
+            to_fail.push(*export_id);
+        }
+    }
+    for export_id in to_fail {
+        if let Some(mut pending) = outstanding.remove(&export_id) {
+            for ((_queue_id, _tag), req) in pending.drain() {
+                let _ = req.queues.complete_io(req.request, -libc::ENODEV);
+            }
+        }
+    }
 }
 
 async fn drain_outstanding(
@@ -1462,10 +1488,17 @@ async fn drain_outstanding(
             continue;
         };
         let Some(ctrl) = runtime.exports.get(&export_id) else {
+            let _ = pending.queues.complete_io(pending.request, -libc::ENODEV);
             continue;
         };
         let Some(handle) = ctrl.device_handle() else {
-            park_request(outstanding, export_id, pending.dev_id, pending.request);
+            park_request(
+                outstanding,
+                export_id,
+                pending.dev_id,
+                pending.queues.clone(),
+                pending.request,
+            );
             break;
         };
         if handle.dev_id() != pending.dev_id {
@@ -1478,11 +1511,23 @@ async fn drain_outstanding(
             continue;
         }
         if !handle.is_online() {
-            park_request(outstanding, export_id, pending.dev_id, pending.request);
+            park_request(
+                outstanding,
+                export_id,
+                pending.dev_id,
+                pending.queues.clone(),
+                pending.request,
+            );
             break;
         }
         let Some(queues) = handle.queues() else {
-            park_request(outstanding, export_id, pending.dev_id, pending.request);
+            park_request(
+                outstanding,
+                export_id,
+                pending.dev_id,
+                pending.queues.clone(),
+                pending.request,
+            );
             break;
         };
         let req = pending.request;
@@ -1497,7 +1542,13 @@ async fn drain_outstanding(
         if let Err(err) = result {
             let io_err = io_error_from_anyhow(&err);
             link.on_io_error(&io_err);
-            park_request(outstanding, export_id, pending.dev_id, req);
+            park_request(
+                outstanding,
+                export_id,
+                pending.dev_id,
+                pending.queues.clone(),
+                req,
+            );
             warn!(
                 export_id,
                 queue = req.queue_id,

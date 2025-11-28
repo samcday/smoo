@@ -66,6 +66,10 @@ impl LinkController {
     /// Notify the controller that a SMOO_STATUS (or equivalent heartbeat) was seen.
     pub fn on_status_ping(&mut self) {
         self.last_status = Some(Instant::now());
+        if matches!(self.state, LinkState::Offline) {
+            // Host is talking to ep0; ensure data plane is reopened.
+            self.enter_ready();
+        }
         if matches!(self.state, LinkState::Ready | LinkState::Online) {
             self.state = LinkState::Online;
         }
