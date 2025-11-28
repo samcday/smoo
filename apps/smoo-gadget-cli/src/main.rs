@@ -474,7 +474,7 @@ async fn run_event_loop(
             }
             _ = liveness_tick.tick() => {
                 link.tick(Instant::now());
-                trace!(state = ?link.state(), outstanding_exports = outstanding.len(), "liveness tick");
+                // trace!(state = ?link.state(), outstanding_exports = outstanding.len(), "liveness tick");
                 process_link_commands(&mut runtime, &mut link).await?;
                 drain_outstanding(&mut runtime, &mut link, &mut outstanding).await?;
                 sync_queue_tasks(&mut runtime, &queue_tx).await;
@@ -1039,23 +1039,22 @@ async fn apply_config(
     config: ConfigExportsV0,
 ) -> Result<()> {
     let entries = config.entries();
-    let records = if entries.is_empty() {
+    let desired_records = if entries.is_empty() {
         Vec::new()
     } else {
         config_entries_to_records(entries)?
     };
 
-    for controller in runtime.exports.values_mut() {
-        if let Some((ctrl, queues)) = controller.take_device_handles() {
-            ublk.stop_dev(SmooUblkDevice::from_parts(ctrl, queues), true)
-                .await
-                .context("stop ublk device before applying CONFIG_EXPORTS")?;
+    // Fast-path: zero exports means tear everything down.
+    if desired_records.is_empty() {
+        for controller in runtime.exports.values_mut() {
+            if let Some((ctrl, queues)) = controller.take_device_handles() {
+                ublk.stop_dev(SmooUblkDevice::from_parts(ctrl, queues), true)
+                    .await
+                    .context("stop ublk device before applying CONFIG_EXPORTS")?;
+            }
         }
-    }
-    runtime.exports.clear();
-
-    if records.is_empty() {
-        info!("CONFIG_EXPORTS requested zero exports");
+        runtime.exports.clear();
         runtime.state_store().replace_all(Vec::new());
         if let Err(err) = runtime.state_store().persist() {
             warn!(error = ?err, "failed to clear state file");
@@ -1064,15 +1063,52 @@ async fn apply_config(
         return Ok(());
     }
 
-    runtime.state_store().replace_all(records.clone());
+    let desired_specs: HashMap<u32, ExportSpec> = desired_records
+        .iter()
+        .map(|record| (record.export_id, record.spec.clone()))
+        .collect();
+
+    // Stop and remove exports that are missing or whose geometry changed.
+    let mut to_remove = Vec::new();
+    for (export_id, controller) in runtime.exports.iter() {
+        match desired_specs.get(export_id) {
+            Some(spec) if spec == &controller.spec => {}
+            _ => to_remove.push(*export_id),
+        }
+    }
+    for export_id in to_remove {
+        if let Some(mut controller) = runtime.exports.remove(&export_id) {
+            if let Some((ctrl, queues)) = controller.take_device_handles() {
+                ublk.stop_dev(SmooUblkDevice::from_parts(ctrl, queues), true)
+                    .await
+                    .with_context(|| format!("stop ublk device for export {}", export_id))?;
+            }
+        }
+    }
+
+    // Create controllers for any new exports.
+    for record in &desired_records {
+        if !runtime.exports.contains_key(&record.export_id) {
+            runtime.exports.insert(
+                record.export_id,
+                ExportController::new(record.export_id, record.spec.clone(), ExportState::New),
+            );
+        }
+    }
+
+    // Rebuild state store with the desired exports, keeping any assigned dev_ids
+    // for controllers we kept alive.
+    let mut new_records = Vec::with_capacity(desired_records.len());
+    for mut record in desired_records {
+        if let Some(ctrl) = runtime.exports.get(&record.export_id) {
+            record.assigned_dev_id = ctrl.dev_id();
+        }
+        new_records.push(record);
+    }
+
+    runtime.state_store().replace_all(new_records);
     if let Err(err) = runtime.state_store().persist() {
         warn!(error = ?err, "failed to write state store");
-    }
-    for record in records {
-        runtime.exports.insert(
-            record.export_id,
-            ExportController::new(record.export_id, record.spec, ExportState::New),
-        );
     }
     runtime
         .status()
