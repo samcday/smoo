@@ -2,12 +2,9 @@ pub mod device;
 pub mod file;
 pub mod random;
 
-use anyhow::{Context, Result, ensure};
-use async_trait::async_trait;
+use anyhow::{Context, Result};
 use core::hash::Hasher;
-use smoo_host_core::{
-    BlockSource, BlockSourceError, BlockSourceErrorKind, BlockSourceResult, ExportIdentity,
-};
+use smoo_host_core::{BlockSourceError, BlockSourceErrorKind};
 use std::{
     io,
     os::unix::fs::FileExt,
@@ -59,7 +56,7 @@ impl BlockFile {
             Ok::<_, io::Error>(tmp)
         })
         .await
-        .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))??;
+        .map_err(|err| io::Error::other(err.to_string()))??;
         buf.copy_from_slice(&tmp);
         Ok(())
     }
@@ -90,7 +87,7 @@ impl BlockFile {
             Ok(())
         })
         .await
-        .unwrap_or_else(|err| Err(io::Error::new(io::ErrorKind::Other, err.to_string())))?;
+        .unwrap_or_else(|err| Err(io::Error::other(err.to_string())))?;
 
         let end = offset
             .checked_add(u64::try_from(len).map_err(|_| {
@@ -105,12 +102,7 @@ impl BlockFile {
         let file = self.file.try_clone()?;
         task::spawn_blocking(move || file.sync_data())
             .await
-            .unwrap_or_else(|err| {
-                Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("flush join error: {err}"),
-                ))
-            })
+            .unwrap_or_else(|err| Err(io::Error::other(format!("flush join error: {err}"))))
     }
 }
 

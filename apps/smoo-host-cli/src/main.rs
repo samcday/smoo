@@ -604,7 +604,7 @@ fn register_export(
         block_size
     );
     ensure!(
-        size_bytes % block_size as u64 == 0,
+        size_bytes.is_multiple_of(block_size as u64),
         "backing size for {identity} must align to block size"
     );
     let block_count = size_bytes / block_size as u64;

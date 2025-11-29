@@ -118,7 +118,7 @@ fn error_is_missing(err: &anyhow::Error) -> bool {
     err.chain()
         .find_map(|cause| cause.downcast_ref::<std::io::Error>())
         .and_then(|io_err| io_err.raw_os_error())
-        .map_or(false, |code| code == libc::ENOENT || code == libc::EINVAL)
+        .is_some_and(|code| code == libc::ENOENT || code == libc::EINVAL)
 }
 
 pub struct ExportController {
@@ -240,7 +240,7 @@ impl ExportController {
             ExportState::Device(handle) => match handle {
                 DeviceHandle::Online { .. } => false,
                 DeviceHandle::Failed { .. } => {
-                    self.next_retry_at.map_or(true, |retry_at| now >= retry_at)
+                    self.next_retry_at.is_none_or(|retry_at| now >= retry_at)
                 }
                 _ => true,
             },

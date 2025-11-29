@@ -607,10 +607,7 @@ impl SmooUblk {
         let buffers = QueueBuffers::new(queue_count, queue_depth, max_io_bytes)
             .context("allocate ublk buffers")?;
         let queue_buf_ptrs = buffers.raw_ptrs();
-        if let Err(err) = self.start_user_recovery(dev_id).await {
-            // Surface EBUSY as-is for the caller to retry when the previous server is still alive.
-            return Err(err);
-        }
+        self.start_user_recovery(dev_id).await?;
         let cdev_path = format!("/dev/ublkc{}", dev_id);
         let base_cdev = File::options()
             .read(true)
@@ -923,8 +920,8 @@ impl SmooUblkDevice {
     pub fn into_parts(self) -> (UblkCtrlHandle, Arc<UblkQueueRuntime>) {
         let mut this = ManuallyDrop::new(self);
         // Safe because ManuallyDrop prevents Drop; we take ownership of the fields.
-        let ctrl = unsafe { std::ptr::read(&mut this.ctrl) };
-        let queues = unsafe { std::ptr::read(&mut this.queues) };
+        let ctrl = unsafe { std::ptr::read(&this.ctrl) };
+        let queues = unsafe { std::ptr::read(&this.queues) };
         (ctrl, queues)
     }
 

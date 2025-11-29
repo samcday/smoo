@@ -1226,12 +1226,9 @@ async fn apply_config(
 
     // Create controllers for any new exports.
     for record in &desired_records {
-        if !runtime.exports.contains_key(&record.export_id) {
-            runtime.exports.insert(
-                record.export_id,
-                ExportController::new(record.export_id, record.spec.clone(), ExportState::New),
-            );
-        }
+        runtime.exports.entry(record.export_id).or_insert_with(|| {
+            ExportController::new(record.export_id, record.spec.clone(), ExportState::New)
+        });
     }
 
     // Rebuild state store with the desired exports, keeping any assigned dev_ids
@@ -1514,7 +1511,7 @@ async fn handle_queue_event(
             );
             let result = handle_request(
                 gadget.as_ref(),
-                &inflight,
+                inflight,
                 export_id,
                 queues.clone(),
                 request,
@@ -1540,7 +1537,7 @@ async fn handle_queue_event(
                     let _ = req.queues.complete_io(req.request, -libc::ENOLINK);
                 }
             }
-            link.on_io_error(&io::Error::new(io::ErrorKind::Other, "queue task error"));
+            link.on_io_error(&io::Error::other("queue task error"));
         }
     }
     Ok(())
@@ -1724,7 +1721,7 @@ fn io_error_from_anyhow(err: &anyhow::Error) -> io::Error {
     {
         io::Error::new(cause.kind(), cause.to_string())
     } else {
-        io::Error::new(io::ErrorKind::Other, err.to_string())
+        io::Error::other(err.to_string())
     }
 }
 
@@ -1739,7 +1736,7 @@ fn error_is_missing(err: &anyhow::Error) -> bool {
     err.chain()
         .find_map(|cause| cause.downcast_ref::<std::io::Error>())
         .and_then(|io_err| io_err.raw_os_error())
-        .map_or(false, |code| code == libc::ENOENT || code == libc::EINVAL)
+        .is_some_and(|code| code == libc::ENOENT || code == libc::EINVAL)
 }
 
 fn pid_is_alive(pid: i32) -> bool {
