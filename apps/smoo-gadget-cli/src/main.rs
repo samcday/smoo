@@ -1,9 +1,9 @@
 use anyhow::{anyhow, ensure, Context, Result};
 use clap::{Parser, ValueEnum};
 use smoo_gadget_core::{
-    ConfigExport, ConfigExportsV0, ControlIo, DeviceHandle, DmaHeap, Ep0Event, ExportController,
-    ExportFlags, ExportReconcileContext, ExportSpec, ExportState, FunctionfsEndpoints,
-    GadgetConfig, GadgetControl, GadgetStatusReport, LinkCommand, LinkController, LinkState,
+    ConfigExport, ConfigExportsV0, ControlIo, DeviceHandle, DmaHeap, ExportController, ExportFlags,
+    ExportReconcileContext, ExportSpec, ExportState, FunctionfsEndpoints, GadgetConfig,
+    GadgetControl, GadgetStatusReport, LinkCommand, LinkController, LinkState,
     PersistedExportRecord, RuntimeTunables, SetupCommand, SetupPacket, SmooGadget, SmooUblk,
     SmooUblkDevice, StateStore, UblkBuffer, UblkIoRequest, UblkOp, UblkQueueRuntime,
 };
@@ -28,7 +28,7 @@ use tracing::{debug, info, trace, warn};
 use tracing_subscriber::prelude::*;
 use usb_gadget::{
     function::custom::{
-        CtrlReceiver, CtrlReq, CtrlSender, Custom, Endpoint, EndpointDirection, Interface,
+        CtrlReceiver, CtrlReq, CtrlSender, Custom, Endpoint, EndpointDirection, Event, Interface,
         TransferType,
     },
     Class, Config, Gadget, Id, RegGadget, Strings,
@@ -287,7 +287,7 @@ struct InflightRequest {
 
 enum ControlMessage {
     Config(ConfigExportsV0),
-    Ep0Event(Ep0Event),
+    Ep0Event(Event<'static>),
     StatusPing,
 }
 
@@ -719,27 +719,27 @@ async fn control_loop(
         match event {
             usb_gadget::function::custom::Event::Bind => {
                 debug!("FunctionFS bind event (control loop)");
-                let _ = tx.send(ControlMessage::Ep0Event(Ep0Event::Bind)).await;
+                let _ = tx.send(ControlMessage::Ep0Event(Event::Bind)).await;
             }
             usb_gadget::function::custom::Event::Unbind => {
                 debug!("FunctionFS unbind event (control loop)");
-                let _ = tx.send(ControlMessage::Ep0Event(Ep0Event::Unbind)).await;
+                let _ = tx.send(ControlMessage::Ep0Event(Event::Unbind)).await;
             }
             usb_gadget::function::custom::Event::Enable => {
                 debug!("FunctionFS enable event (control loop)");
-                let _ = tx.send(ControlMessage::Ep0Event(Ep0Event::Enable)).await;
+                let _ = tx.send(ControlMessage::Ep0Event(Event::Enable)).await;
             }
             usb_gadget::function::custom::Event::Disable => {
                 debug!("FunctionFS disable event (control loop)");
-                let _ = tx.send(ControlMessage::Ep0Event(Ep0Event::Disable)).await;
+                let _ = tx.send(ControlMessage::Ep0Event(Event::Disable)).await;
             }
             usb_gadget::function::custom::Event::Suspend => {
                 debug!("FunctionFS suspend event (control loop)");
-                let _ = tx.send(ControlMessage::Ep0Event(Ep0Event::Suspend)).await;
+                let _ = tx.send(ControlMessage::Ep0Event(Event::Suspend)).await;
             }
             usb_gadget::function::custom::Event::Resume => {
                 debug!("FunctionFS resume event (control loop)");
-                let _ = tx.send(ControlMessage::Ep0Event(Ep0Event::Resume)).await;
+                let _ = tx.send(ControlMessage::Ep0Event(Event::Resume)).await;
             }
             usb_gadget::function::custom::Event::SetupDeviceToHost(sender) => {
                 let report = status.report().await;

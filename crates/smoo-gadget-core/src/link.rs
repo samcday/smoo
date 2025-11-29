@@ -1,6 +1,6 @@
-use crate::Ep0Event;
 use std::io;
 use std::time::{Duration, Instant};
+use usb_gadget::function::custom::Event;
 
 /// Current USB link state as observed from FunctionFS lifecycle events and liveness pings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,15 +51,17 @@ impl LinkController {
     }
 
     /// Notify the controller of an ep0 lifecycle event.
-    pub fn on_ep0_event(&mut self, event: Ep0Event) {
+    pub fn on_ep0_event(&mut self, event: Event) {
         match event {
-            Ep0Event::Bind | Ep0Event::Enable | Ep0Event::Resume => {
+            Event::Bind | Event::Enable | Event::Resume => {
                 self.enter_ready();
             }
-            Ep0Event::Disable | Ep0Event::Unbind | Ep0Event::Suspend => {
+            Event::Disable | Event::Unbind | Event::Suspend => {
                 self.enter_offline();
             }
-            Ep0Event::Setup(_) => { /* ignored for link purposes */ }
+            Event::SetupDeviceToHost(_) | Event::SetupHostToDevice(_) => { /* ignored */ }
+            Event::Unknown(_) => {}
+            _ => {}
         }
     }
 
@@ -125,7 +127,7 @@ mod tests {
         let mut ctrl = LinkController::new(Duration::from_secs(5));
         assert_eq!(ctrl.state(), LinkState::Offline);
 
-        ctrl.on_ep0_event(Ep0Event::Enable);
+        ctrl.on_ep0_event(Event::Enable);
         assert_eq!(ctrl.state(), LinkState::Ready);
         assert_eq!(ctrl.take_command(), Some(LinkCommand::Reopen));
 
@@ -141,7 +143,7 @@ mod tests {
     #[test]
     fn liveness_timeout_forces_offline() {
         let mut ctrl = LinkController::new(Duration::from_millis(100));
-        ctrl.on_ep0_event(Ep0Event::Enable);
+        ctrl.on_ep0_event(Event::Enable);
         ctrl.take_command();
         ctrl.on_status_ping();
         let now = Instant::now() + Duration::from_millis(250);

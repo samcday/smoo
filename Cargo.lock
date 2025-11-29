@@ -1687,6 +1687,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "usb-gadget",
 ]
 
 [[package]]

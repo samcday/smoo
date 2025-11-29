@@ -43,7 +43,6 @@ const USB_RECIP_INTERFACE: u8 = 0x01;
 const SMOO_REQ_TYPE: u8 = USB_DIR_IN | USB_TYPE_VENDOR | USB_RECIP_INTERFACE;
 
 const SETUP_STAGE_LEN: usize = 8;
-const FUNCTIONFS_EVENT_SIZE: usize = SETUP_STAGE_LEN + 4;
 
 /// File descriptor bundle for a FunctionFS interface (data-plane endpoints only).
 pub struct FunctionfsEndpoints {
@@ -65,126 +64,6 @@ impl FunctionfsEndpoints {
             interrupt_out,
             bulk_in,
             bulk_out,
-        }
-    }
-}
-
-/// Async wrapper around the FunctionFS control endpoint (ep0).
-///
-/// This controller exposes raw FunctionFS events so higher-level code can react to
-/// lifecycle changes (BIND/ENABLE/DISABLE/etc.) and vendor-specific SETUP packets.
-/// Future configuration handlers (e.g. CONFIG_EXPORTS) can listen for [`Ep0Event::Setup`]
-/// and interact with the host using the [`write_in`], [`read_out`], and [`stall`]
-/// helpers.
-pub struct Ep0Controller {
-    ep0: File,
-}
-
-impl Ep0Controller {
-    /// Construct a controller from a FunctionFS ep0 file descriptor.
-    pub fn from_owned_fd(fd: OwnedFd) -> io::Result<Self> {
-        let file = to_tokio_file(fd)?;
-        Ok(Self::new(file))
-    }
-
-    fn new(ep0: File) -> Self {
-        Self { ep0 }
-    }
-
-    /// Read the next FunctionFS event from ep0.
-    pub async fn next_event(&mut self) -> Result<Ep0Event> {
-        let mut buf = [0u8; FUNCTIONFS_EVENT_SIZE];
-        self.ep0
-            .read_exact(&mut buf)
-            .await
-            .context("read ep0 event")?;
-        Ep0Event::from_bytes(buf)
-    }
-
-    /// Send an IN data stage (device → host) for the current control transfer.
-    pub async fn write_in(&mut self, data: &[u8]) -> Result<()> {
-        self.ep0.write_all(data).await.context("write ep0 data")?;
-        self.ep0.flush().await.context("flush ep0")?;
-        Ok(())
-    }
-
-    /// Read an OUT data stage (host → device) for the current control transfer.
-    pub async fn read_out(&mut self, buf: &mut [u8]) -> Result<()> {
-        if buf.is_empty() {
-            return Ok(());
-        }
-        self.ep0.read_exact(buf).await.context("read ep0 payload")?;
-        Ok(())
-    }
-
-    /// Stall the current control transfer.
-    pub async fn stall(&mut self) -> Result<()> {
-        // Writing a single zero byte signals a halt condition to FunctionFS.
-        self.ep0
-            .write_all(&[0u8])
-            .await
-            .context("stall ep0 control")?;
-        self.ep0.flush().await.context("flush ep0 after stall")?;
-        Ok(())
-    }
-}
-
-/// FunctionFS control-plane events surfaced by [`Ep0Controller`].
-#[derive(Clone, Copy, Debug)]
-pub enum Ep0Event {
-    Bind,
-    Unbind,
-    Enable,
-    Disable,
-    Suspend,
-    Resume,
-    Setup(SetupPacket),
-}
-
-impl Ep0Event {
-    fn from_bytes(bytes: [u8; FUNCTIONFS_EVENT_SIZE]) -> Result<Self> {
-        let event_type = Ep0EventType::try_from(bytes[SETUP_STAGE_LEN])?;
-        Ok(match event_type {
-            Ep0EventType::Bind => Ep0Event::Bind,
-            Ep0EventType::Unbind => Ep0Event::Unbind,
-            Ep0EventType::Enable => Ep0Event::Enable,
-            Ep0EventType::Disable => Ep0Event::Disable,
-            Ep0EventType::Suspend => Ep0Event::Suspend,
-            Ep0EventType::Resume => Ep0Event::Resume,
-            Ep0EventType::Setup => {
-                let mut setup_bytes = [0u8; SETUP_STAGE_LEN];
-                setup_bytes.copy_from_slice(&bytes[..SETUP_STAGE_LEN]);
-                Ep0Event::Setup(SetupPacket::from_bytes(setup_bytes))
-            }
-        })
-    }
-}
-
-#[repr(u8)]
-#[derive(Clone, Copy, Debug)]
-enum Ep0EventType {
-    Bind = 0,
-    Unbind = 1,
-    Enable = 2,
-    Disable = 3,
-    Setup = 4,
-    Suspend = 5,
-    Resume = 6,
-}
-
-impl TryFrom<u8> for Ep0EventType {
-    type Error = anyhow::Error;
-
-    fn try_from(value: u8) -> Result<Self> {
-        match value {
-            0 => Ok(Ep0EventType::Bind),
-            1 => Ok(Ep0EventType::Unbind),
-            2 => Ok(Ep0EventType::Enable),
-            3 => Ok(Ep0EventType::Disable),
-            4 => Ok(Ep0EventType::Setup),
-            5 => Ok(Ep0EventType::Suspend),
-            6 => Ok(Ep0EventType::Resume),
-            other => Err(anyhow!("unknown FunctionFS event type {other}")),
         }
     }
 }
@@ -317,21 +196,6 @@ pub trait ControlIo {
     async fn write_in(&mut self, data: &[u8]) -> Result<()>;
     async fn read_out(&mut self, buf: &mut [u8]) -> Result<()>;
     async fn stall(&mut self) -> Result<()>;
-}
-
-#[async_trait::async_trait]
-impl ControlIo for Ep0Controller {
-    async fn write_in(&mut self, data: &[u8]) -> Result<()> {
-        Ep0Controller::write_in(self, data).await
-    }
-
-    async fn read_out(&mut self, buf: &mut [u8]) -> Result<()> {
-        Ep0Controller::read_out(self, buf).await
-    }
-
-    async fn stall(&mut self) -> Result<()> {
-        Ep0Controller::stall(self).await
-    }
 }
 
 impl SmooGadget {
@@ -528,7 +392,7 @@ pub enum SetupCommand {
 
 /// Data-plane controller that owns the FunctionFS interrupt and bulk endpoints.
 ///
-/// Today it still drives a single export, but the separation from [`Ep0Controller`]
+/// Today it still drives a single export, but the separation from control-plane handling
 /// allows future work to multiplex multiple exports or schedule heavy work without
 /// blocking EP0.
 pub struct GadgetDataPlane {
