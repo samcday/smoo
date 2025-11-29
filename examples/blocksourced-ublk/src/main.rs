@@ -15,7 +15,7 @@
 use anyhow::{Context, ensure};
 use clap::{ArgGroup, Parser};
 use smoo_gadget_ublk::{SmooUblk, SmooUblkDevice, UblkIoRequest, UblkOp, UblkQueueRuntime};
-use smoo_host_blocksources::{DeviceBlockSource, FileBlockSource};
+use smoo_host_blocksources::{DeviceBlockSource, FileBlockSource, RandomBlockSource};
 use smoo_host_core::BlockSource;
 use std::{io, path::PathBuf, sync::Arc};
 use tokio::sync::{Notify, mpsc};
@@ -24,8 +24,8 @@ use tracing_subscriber::prelude::*;
 
 #[derive(Debug, Parser)]
 #[command(name = "blocksourced-ublk")]
-#[command(about = "Expose a file or block device through a ublk queue", long_about = None)]
-#[command(group = ArgGroup::new("backing").args(["file", "device"]).required(true))]
+#[command(about = "Expose a file or block device through a ublk target", long_about = None)]
+#[command(group = ArgGroup::new("backing").args(["file", "device", "random"]).required(true))]
 struct Args {
     /// Backing file path
     #[arg(long, value_name = "PATH")]
@@ -33,6 +33,9 @@ struct Args {
     /// Backing block device path
     #[arg(long, value_name = "PATH")]
     device: Option<PathBuf>,
+    /// Backing random block device size
+    #[arg(long)]
+    random: Option<u64>,
     /// Number of ublk queues to configure
     #[arg(long, default_value_t = 1)]
     queue_count: u16,
@@ -64,9 +67,7 @@ async fn main() -> anyhow::Result<()> {
 
     let source = open_source(&args).await.context("open block source")?;
     let block_size = source.block_size() as usize;
-    let (block_count, max_blocks) = derive_block_count(source.as_ref(), args.blocks)
-        .await
-        .context("determine block count")?;
+    let block_count = source.total_blocks().await.context("read source size")? as usize;
 
     let shutdown = Arc::new(Notify::new());
     {
@@ -91,7 +92,6 @@ async fn main() -> anyhow::Result<()> {
 
     info!(
         block_size = block_size,
-        max_blocks = max_blocks,
         blocks = block_count,
         queues = args.queue_count,
         depth = args.queue_depth,
@@ -281,34 +281,20 @@ async fn serve_queue(
 
 async fn open_source(args: &Args) -> anyhow::Result<Arc<dyn BlockSource>> {
     let block_size = args.block_size;
-    let source: Arc<dyn BlockSource> = match (&args.file, &args.device) {
-        (Some(path), None) => Arc::new(FileBlockSource::open(path, block_size).await?),
-        (None, Some(path)) => Arc::new(DeviceBlockSource::open(path, block_size).await?),
-        _ => unreachable!("clap enforces mutually exclusive arguments"),
-    };
-    Ok(source)
-}
 
-async fn derive_block_count(
-    source: &dyn BlockSource,
-    requested: Option<u64>,
-) -> anyhow::Result<(usize, u64)> {
-    let max_blocks = source.total_blocks().await.context("read source size")?;
-    ensure!(max_blocks > 0, "source smaller than one block");
-    let desired = match requested {
-        Some(blocks) => {
-            ensure!(
-                blocks <= max_blocks,
-                "requested blocks ({}) exceeds source capacity ({})",
-                blocks,
-                max_blocks
-            );
-            blocks
-        }
-        None => max_blocks,
-    };
-    let block_count = usize::try_from(desired).context("block count exceeds usize")?;
-    Ok((block_count, max_blocks))
+    if let Some(path) = &args.file {
+        return Ok(Arc::new(FileBlockSource::open(path, block_size).await?));
+    }
+
+    if let Some(path) = &args.device {
+        return Ok(Arc::new(DeviceBlockSource::open(path, block_size).await?));
+    }
+
+    if let Some(size) = args.random {
+        return Ok(Arc::new(RandomBlockSource::new(512, size, 42)?));
+    }
+
+    unreachable!("clap enforces mutually exclusive arguments")
 }
 
 fn errno_from_io(err: &io::Error) -> i32 {
