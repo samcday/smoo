@@ -167,8 +167,7 @@ impl Request {
         let request_id = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
         let export_id = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
         let lba = u64::from_le_bytes([
-            bytes[12], bytes[13], bytes[14], bytes[15], bytes[16], bytes[17], bytes[18],
-            bytes[19],
+            bytes[12], bytes[13], bytes[14], bytes[15], bytes[16], bytes[17], bytes[18], bytes[19],
         ]);
         let num_blocks = u32::from_le_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
         let flags = u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]);
@@ -249,8 +248,7 @@ impl Response {
         let request_id = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
         let export_id = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
         let lba = u64::from_le_bytes([
-            bytes[12], bytes[13], bytes[14], bytes[15], bytes[16], bytes[17], bytes[18],
-            bytes[19],
+            bytes[12], bytes[13], bytes[14], bytes[15], bytes[16], bytes[17], bytes[18], bytes[19],
         ]);
         let num_blocks = u32::from_le_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
         let flags = u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]);

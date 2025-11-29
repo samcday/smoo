@@ -1,6 +1,6 @@
 use crate::{
-    BlockSource, BlockSourceError, BlockSourceErrorKind, ExportIdentity, Transport,
-    TransportError, TransportErrorKind,
+    BlockSource, BlockSourceError, BlockSourceErrorKind, ExportIdentity, Transport, TransportError,
+    TransportErrorKind,
     control::{ConfigExportsV0, fetch_ident, send_config_exports_v0},
 };
 use alloc::{
@@ -10,14 +10,10 @@ use alloc::{
     vec,
     vec::Vec,
 };
+use core::fmt;
 use core::future::Future;
 use core::pin::Pin;
-use core::fmt;
-use futures_util::{
-    future::FutureExt,
-    stream::FuturesUnordered,
-    StreamExt,
-};
+use futures_util::{StreamExt, future::FutureExt, stream::FuturesUnordered};
 use smoo_proto::{Ident, OpCode, REQUEST_LEN, RESPONSE_LEN, Request, Response};
 use tracing::trace;
 
@@ -182,11 +178,8 @@ where
             }
         };
         let transport = self.transport.clone();
-        self.in_flight.push(Box::pin(handle_request(
-            transport,
-            source,
-            request,
-        )));
+        self.in_flight
+            .push(Box::pin(handle_request(transport, source, request)));
         Ok(())
     }
 
@@ -201,7 +194,6 @@ where
         }
         Ok(())
     }
-
 }
 
 const ERRNO_EINVAL: u32 = 22;
@@ -243,11 +235,7 @@ where
     }
 }
 
-async fn handle_read<T, S>(
-    transport: T,
-    source: S,
-    request: Request,
-) -> HostResult<Response>
+async fn handle_read<T, S>(transport: T, source: S, request: Request) -> HostResult<Response>
 where
     T: Transport + Clone + 'static,
     S: BlockSource + ExportIdentity + Clone + 'static,
@@ -300,11 +288,7 @@ where
     ))
 }
 
-async fn handle_write<T, S>(
-    transport: T,
-    source: S,
-    request: Request,
-) -> HostResult<Response>
+async fn handle_write<T, S>(transport: T, source: S, request: Request) -> HostResult<Response>
 where
     T: Transport + Clone + 'static,
     S: BlockSource + ExportIdentity + Clone + 'static,
