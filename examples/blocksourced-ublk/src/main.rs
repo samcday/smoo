@@ -15,7 +15,9 @@
 use anyhow::{Context, ensure};
 use clap::{ArgGroup, Parser};
 use smoo_gadget_ublk::{SmooUblk, SmooUblkDevice, UblkIoRequest, UblkOp, UblkQueueRuntime};
-use smoo_host_blocksources::{DeviceBlockSource, FileBlockSource, RandomBlockSource};
+use smoo_host_blocksources::device::DeviceBlockSource;
+use smoo_host_blocksources::file::FileBlockSource;
+use smoo_host_blocksources::random::RandomBlockSource;
 use smoo_host_core::BlockSource;
 use std::{io, path::PathBuf, sync::Arc};
 use tokio::sync::{Notify, mpsc};

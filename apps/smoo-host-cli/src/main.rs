@@ -3,7 +3,9 @@ use clap::{ArgGroup, Parser};
 use rusb::{Direction, TransferType, UsbContext};
 use smoo_host_blocksource_cached::{CachedBlockSource, MemoryCacheStore};
 use smoo_host_blocksource_http::HttpBlockSource;
-use smoo_host_blocksources::{DeviceBlockSource, FileBlockSource, RandomBlockSource};
+use smoo_host_blocksources::device::DeviceBlockSource;
+use smoo_host_blocksources::file::FileBlockSource;
+use smoo_host_blocksources::random::RandomBlockSource;
 use smoo_host_core::{
     control::{fetch_ident, read_status, send_config_exports_v0, ConfigExportsV0},
     derive_export_id_from_source, BlockSource, BlockSourceHandle, BlockSourceResult,
