@@ -77,11 +77,12 @@ Control-plane (`Request` / `Response`):
 * fields:
 
   * op: read/write/flush/discard
+  * request_id (unique per request)
   * LBA
   * byte length (block-aligned)
   * flags (future)
 * MUST fit in one interrupt transfer
-* MUST be delivered in-order
+* Responses carry the same `request_id` and MAY arrive out-of-order
 
 Data (bulk):
 

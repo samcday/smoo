@@ -116,6 +116,7 @@ impl<T: UsbContext + Send + Sync + 'static> ControlTransport for RusbControl<T> 
 }
 
 /// [`Transport`] implementation backed by `rusb`.
+#[derive(Clone)]
 pub struct RusbTransport<T: UsbContext + Send + Sync + 'static> {
     control: RusbControl<T>,
     config: RusbTransportConfig,
@@ -163,7 +164,7 @@ impl<T: UsbContext + Send + Sync + 'static> ControlTransport for RusbTransport<T
 
 #[async_trait]
 impl<T: UsbContext + Send + Sync + 'static> Transport for RusbTransport<T> {
-    async fn read_interrupt(&mut self, buf: &mut [u8]) -> TransportResult<usize> {
+    async fn read_interrupt(&self, buf: &mut [u8]) -> TransportResult<usize> {
         let handle = self.control.handle.clone();
         let endpoint = self.config.interrupt_in;
         let timeout = self.config.timeout;
@@ -183,7 +184,7 @@ impl<T: UsbContext + Send + Sync + 'static> Transport for RusbTransport<T> {
         })
     }
 
-    async fn write_interrupt(&mut self, buf: &[u8]) -> TransportResult<usize> {
+    async fn write_interrupt(&self, buf: &[u8]) -> TransportResult<usize> {
         let payload = buf.to_vec();
         let handle = self.control.handle.clone();
         let endpoint = self.config.interrupt_out;
@@ -197,7 +198,7 @@ impl<T: UsbContext + Send + Sync + 'static> Transport for RusbTransport<T> {
         .map_err(|err| map_rusb_error("interrupt-out write", err))
     }
 
-    async fn read_bulk(&mut self, buf: &mut [u8]) -> TransportResult<usize> {
+    async fn read_bulk(&self, buf: &mut [u8]) -> TransportResult<usize> {
         let len = buf.len();
         if len == 0 {
             return Ok(0);
@@ -220,7 +221,7 @@ impl<T: UsbContext + Send + Sync + 'static> Transport for RusbTransport<T> {
         })
     }
 
-    async fn write_bulk(&mut self, buf: &[u8]) -> TransportResult<usize> {
+    async fn write_bulk(&self, buf: &[u8]) -> TransportResult<usize> {
         if buf.is_empty() {
             return Ok(0);
         }

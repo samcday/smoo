@@ -86,16 +86,16 @@ pub trait ControlTransport: Send + Sync {
 /// host and gadget. This trait is intentionally low-level; smoo-specific
 /// encoding/decoding is handled in `host-core`.
 #[async_trait]
-pub trait Transport: ControlTransport {
+pub trait Transport: ControlTransport + Send + Sync {
     /// Receive bytes from the Request interrupt endpoint (device → host).
-    async fn read_interrupt(&mut self, buf: &mut [u8]) -> TransportResult<usize>;
+    async fn read_interrupt(&self, buf: &mut [u8]) -> TransportResult<usize>;
 
     /// Send bytes to the Response interrupt endpoint (host → device).
-    async fn write_interrupt(&mut self, buf: &[u8]) -> TransportResult<usize>;
+    async fn write_interrupt(&self, buf: &[u8]) -> TransportResult<usize>;
 
     /// Read a payload from the gadget over the bulk IN endpoint.
-    async fn read_bulk(&mut self, buf: &mut [u8]) -> TransportResult<usize>;
+    async fn read_bulk(&self, buf: &mut [u8]) -> TransportResult<usize>;
 
     /// Write a payload to the gadget over the bulk OUT endpoint.
-    async fn write_bulk(&mut self, buf: &[u8]) -> TransportResult<usize>;
+    async fn write_bulk(&self, buf: &[u8]) -> TransportResult<usize>;
 }

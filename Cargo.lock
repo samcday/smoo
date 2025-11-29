@@ -1779,7 +1779,9 @@ name = "smoo-host-core"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "futures-util",
  "smoo-proto",
+ "tracing",
 ]
 
 [[package]]

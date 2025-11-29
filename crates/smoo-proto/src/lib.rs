@@ -9,9 +9,9 @@ pub const IDENT_LEN: usize = 8;
 /// Vendor control request opcode used to fetch [`Ident`].
 pub const IDENT_REQUEST: u8 = 0x01;
 /// Number of bytes in an encoded [`Request`] control message.
-pub const REQUEST_LEN: usize = 24;
+pub const REQUEST_LEN: usize = 28;
 /// Number of bytes in an encoded [`Response`] control message.
-pub const RESPONSE_LEN: usize = 24;
+pub const RESPONSE_LEN: usize = 28;
 /// bmRequestType for CONFIG_EXPORTS (host → gadget, vendor, interface, OUT).
 pub const CONFIG_EXPORTS_REQ_TYPE: u8 = 0x41;
 /// Vendor control bRequest used to apply CONFIG_EXPORTS.
@@ -126,6 +126,7 @@ impl Ident {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Request {
     pub export_id: u32,
+    pub request_id: u32,
     pub op: OpCode,
     pub lba: u64,
     pub num_blocks: u32,
@@ -133,9 +134,17 @@ pub struct Request {
 }
 
 impl Request {
-    pub const fn new(export_id: u32, op: OpCode, lba: u64, num_blocks: u32, flags: u32) -> Self {
+    pub const fn new(
+        export_id: u32,
+        request_id: u32,
+        op: OpCode,
+        lba: u64,
+        num_blocks: u32,
+        flags: u32,
+    ) -> Self {
         Self {
             export_id,
+            request_id,
             op,
             lba,
             num_blocks,
@@ -146,23 +155,27 @@ impl Request {
     pub fn encode(self) -> [u8; REQUEST_LEN] {
         let mut buf = [0u8; REQUEST_LEN];
         buf[0] = self.op.into();
-        buf[4..8].copy_from_slice(&self.export_id.to_le_bytes());
-        buf[8..16].copy_from_slice(&self.lba.to_le_bytes());
-        buf[16..20].copy_from_slice(&self.num_blocks.to_le_bytes());
-        buf[20..24].copy_from_slice(&self.flags.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.request_id.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.export_id.to_le_bytes());
+        buf[12..20].copy_from_slice(&self.lba.to_le_bytes());
+        buf[20..24].copy_from_slice(&self.num_blocks.to_le_bytes());
+        buf[24..28].copy_from_slice(&self.flags.to_le_bytes());
         buf
     }
 
     pub fn decode(bytes: [u8; REQUEST_LEN]) -> Result<Self> {
-        let export_id = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        let request_id = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        let export_id = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
         let lba = u64::from_le_bytes([
-            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+            bytes[12], bytes[13], bytes[14], bytes[15], bytes[16], bytes[17], bytes[18],
+            bytes[19],
         ]);
-        let num_blocks = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
-        let flags = u32::from_le_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+        let num_blocks = u32::from_le_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+        let flags = u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]);
         let op = OpCode::try_from(bytes[0])?;
         Ok(Self {
             export_id,
+            request_id,
             op,
             lba,
             num_blocks,
@@ -191,6 +204,7 @@ impl TryFrom<&[u8]> for Request {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Response {
     pub export_id: u32,
+    pub request_id: u32,
     pub op: OpCode,
     pub status: u8,
     pub lba: u64,
@@ -201,6 +215,7 @@ pub struct Response {
 impl Response {
     pub const fn new(
         export_id: u32,
+        request_id: u32,
         op: OpCode,
         status: u8,
         lba: u64,
@@ -209,6 +224,7 @@ impl Response {
     ) -> Self {
         Self {
             export_id,
+            request_id,
             op,
             status,
             lba,
@@ -221,24 +237,28 @@ impl Response {
         let mut buf = [0u8; RESPONSE_LEN];
         buf[0] = self.op.into();
         buf[1] = self.status;
-        buf[4..8].copy_from_slice(&self.export_id.to_le_bytes());
-        buf[8..16].copy_from_slice(&self.lba.to_le_bytes());
-        buf[16..20].copy_from_slice(&self.num_blocks.to_le_bytes());
-        buf[20..24].copy_from_slice(&self.flags.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.request_id.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.export_id.to_le_bytes());
+        buf[12..20].copy_from_slice(&self.lba.to_le_bytes());
+        buf[20..24].copy_from_slice(&self.num_blocks.to_le_bytes());
+        buf[24..28].copy_from_slice(&self.flags.to_le_bytes());
         buf
     }
 
     pub fn decode(bytes: [u8; RESPONSE_LEN]) -> Result<Self> {
-        let export_id = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        let request_id = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        let export_id = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
         let lba = u64::from_le_bytes([
-            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+            bytes[12], bytes[13], bytes[14], bytes[15], bytes[16], bytes[17], bytes[18],
+            bytes[19],
         ]);
-        let num_blocks = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
-        let flags = u32::from_le_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+        let num_blocks = u32::from_le_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+        let flags = u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]);
         let op = OpCode::try_from(bytes[0])?;
         let status = bytes[1];
         Ok(Self {
             export_id,
+            request_id,
             op,
             lba,
             num_blocks,
@@ -509,7 +529,7 @@ mod tests {
 
     #[test]
     fn request_round_trip() {
-        let req = Request::new(2, OpCode::Write, 42, 8, 0xAA55AA55);
+        let req = Request::new(2, 99, OpCode::Write, 42, 8, 0xAA55AA55);
         let bytes = req.encode();
         assert_eq!(Request::decode(bytes).unwrap(), req);
         assert_eq!(Request::try_from(bytes.as_slice()).unwrap(), req);
@@ -517,7 +537,7 @@ mod tests {
 
     #[test]
     fn response_round_trip() {
-        let resp = Response::new(3, OpCode::Read, 0, 9001, 16, 0);
+        let resp = Response::new(3, 77, OpCode::Read, 0, 9001, 16, 0);
         let bytes = resp.encode();
         assert_eq!(Response::decode(bytes).unwrap(), resp);
         assert_eq!(Response::try_from(bytes.as_slice()).unwrap(), resp);
@@ -533,7 +553,7 @@ mod tests {
 
     #[test]
     fn bad_opcode() {
-        let mut bytes = Request::new(1, OpCode::Flush, 0, 0, 0).encode();
+        let mut bytes = Request::new(1, 2, OpCode::Flush, 0, 0, 0).encode();
         bytes[0] = 0xFF;
         assert!(matches!(
             Request::decode(bytes),
@@ -544,10 +564,10 @@ mod tests {
     #[test]
     fn invalid_len() {
         assert!(matches!(
-            Request::try_from(&[0u8; 23][..]),
+            Request::try_from(&[0u8; 27][..]),
             Err(ProtoError::InvalidLength {
-                expected: 24,
-                actual: 23
+                expected: 28,
+                actual: 27
             })
         ));
     }

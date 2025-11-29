@@ -32,6 +32,7 @@ impl WebUsbControl {
 }
 
 /// [`Transport`] implementation backed by WebUSB.
+#[derive(Clone)]
 pub struct WebUsbTransport {
     device: UsbDevice,
     config: WebUsbTransportConfig,
@@ -127,19 +128,19 @@ impl ControlTransport for WebUsbControl {
 
 #[async_trait]
 impl Transport for WebUsbTransport {
-    async fn read_interrupt(&mut self, buf: &mut [u8]) -> TransportResult<usize> {
+    async fn read_interrupt(&self, buf: &mut [u8]) -> TransportResult<usize> {
         transfer_in(&self.device, self.config.interrupt_in, buf).await
     }
 
-    async fn write_interrupt(&mut self, buf: &[u8]) -> TransportResult<usize> {
+    async fn write_interrupt(&self, buf: &[u8]) -> TransportResult<usize> {
         transfer_out(&self.device, self.config.interrupt_out, buf).await
     }
 
-    async fn read_bulk(&mut self, buf: &mut [u8]) -> TransportResult<usize> {
+    async fn read_bulk(&self, buf: &mut [u8]) -> TransportResult<usize> {
         transfer_in(&self.device, self.config.bulk_in, buf).await
     }
 
-    async fn write_bulk(&mut self, buf: &[u8]) -> TransportResult<usize> {
+    async fn write_bulk(&self, buf: &[u8]) -> TransportResult<usize> {
         transfer_out(&self.device, self.config.bulk_out, buf).await
     }
 }

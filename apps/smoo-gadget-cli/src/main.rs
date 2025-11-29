@@ -606,7 +606,8 @@ async fn handle_request(
 
         let num_blocks = u32::try_from(req_len / block_size)
             .context("request block count exceeds protocol limit")?;
-        let proto_req = Request::new(export_id, opcode, req.sector, num_blocks, 0);
+        let request_id = make_request_id(req.queue_id, req.tag);
+        let proto_req = Request::new(export_id, request_id, opcode, req.sector, num_blocks, 0);
         trace!(
             export_id,
             dev_id = queues.dev_id(),
@@ -646,6 +647,18 @@ async fn handle_request(
         }
 
         let response = gadget.read_response().await.context("read smoo response")?;
+
+        if response.request_id != request_id || response.export_id != export_id {
+            warn!(
+                queue = req.queue_id,
+                tag = req.tag,
+                expected_request_id = request_id,
+                received_request_id = response.request_id,
+                expected_export = export_id,
+                received_export = response.export_id,
+                "response mismatched request identity"
+            );
+        }
 
         let status = response_status(&response, req_len, block_size)?;
         if status >= 0 && (status as usize) != req_len {
@@ -752,6 +765,10 @@ fn opcode_from_ublk(op: UblkOp) -> Option<OpCode> {
         UblkOp::Discard => Some(OpCode::Discard),
         UblkOp::Unknown(_) => None,
     }
+}
+
+fn make_request_id(queue_id: u16, tag: u16) -> u32 {
+    ((queue_id as u32) << 16) | tag as u32
 }
 
 fn response_status(resp: &Response, expected_len: usize, block_size: usize) -> Result<i32> {

@@ -9,6 +9,7 @@ use smoo_host_core::{
 pub struct WebUsbControl;
 
 /// Stub WebUSB transport that always reports unsupported.
+#[derive(Clone, Copy)]
 pub struct WebUsbTransport;
 
 impl WebUsbTransport {
@@ -61,19 +62,19 @@ impl ControlTransport for WebUsbTransport {
 
 #[async_trait]
 impl Transport for WebUsbTransport {
-    async fn read_interrupt(&mut self, _buf: &mut [u8]) -> TransportResult<usize> {
+    async fn read_interrupt(&self, _buf: &mut [u8]) -> TransportResult<usize> {
         Err(TransportError::new(TransportErrorKind::Unsupported))
     }
 
-    async fn write_interrupt(&mut self, _buf: &[u8]) -> TransportResult<usize> {
+    async fn write_interrupt(&self, _buf: &[u8]) -> TransportResult<usize> {
         Err(TransportError::new(TransportErrorKind::Unsupported))
     }
 
-    async fn read_bulk(&mut self, _buf: &mut [u8]) -> TransportResult<usize> {
+    async fn read_bulk(&self, _buf: &mut [u8]) -> TransportResult<usize> {
         Err(TransportError::new(TransportErrorKind::Unsupported))
     }
 
-    async fn write_bulk(&mut self, _buf: &[u8]) -> TransportResult<usize> {
+    async fn write_bulk(&self, _buf: &[u8]) -> TransportResult<usize> {
         Err(TransportError::new(TransportErrorKind::Unsupported))
     }
 }
