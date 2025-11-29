@@ -18,9 +18,10 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
+    io::AsyncReadExt,
     signal,
     signal::unix::{signal as unix_signal, SignalKind},
-    sync::{mpsc, watch, RwLock},
+    sync::{mpsc, watch, Mutex, RwLock},
     task::JoinHandle,
 };
 use tracing::{debug, info, trace, warn};
@@ -128,7 +129,8 @@ async fn main() -> Result<()> {
         DEFAULT_MAX_IO_BYTES,
         dma_heap,
     );
-    let gadget = SmooGadget::new(endpoints, gadget_config).context("init smoo gadget core")?;
+    let gadget =
+        Arc::new(SmooGadget::new(endpoints, gadget_config).context("init smoo gadget core")?);
     info!(
         ident_major = ident.major,
         ident_minor = ident.minor,
@@ -223,7 +225,7 @@ struct RuntimeState {
     exports: HashMap<u32, ExportController>,
     queue_tasks: HashMap<u32, QueueTaskSet>,
     tunables: RuntimeTunables,
-    gadget: Option<SmooGadget>,
+    gadget: Option<Arc<SmooGadget>>,
     gadget_config: GadgetConfig,
     ffs_dir: PathBuf,
 }
@@ -272,6 +274,15 @@ struct OutstandingRequest {
     dev_id: u32,
     request: UblkIoRequest,
     queues: Arc<UblkQueueRuntime>,
+}
+
+struct InflightRequest {
+    export_id: u32,
+    request_id: u32,
+    request: UblkIoRequest,
+    queues: Arc<UblkQueueRuntime>,
+    req_len: usize,
+    block_size: usize,
 }
 
 enum ControlMessage {
@@ -443,6 +454,9 @@ async fn run_event_loop(
 
     let mut io_error = None;
     let mut recovery_exit = false;
+    let inflight: Arc<Mutex<HashMap<u32, HashMap<u32, InflightRequest>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let mut response_task: Option<JoinHandle<()>> = None;
     loop {
         idle_sleep
             .as_mut()
@@ -450,7 +464,7 @@ async fn run_event_loop(
         let now = Instant::now();
         link.tick(now);
         process_link_commands(&mut runtime, &mut link).await?;
-        drain_outstanding(&mut runtime, &mut link, &mut outstanding).await?;
+        drain_outstanding(&mut runtime, &mut link, &inflight, &mut outstanding).await?;
         let reconcile_needed = runtime
             .exports
             .values()
@@ -459,6 +473,18 @@ async fn run_event_loop(
             reconcile_exports(ublk, &mut runtime).await?;
         }
         sync_queue_tasks(&mut runtime, &queue_tx).await;
+        if runtime.gadget.is_none() {
+            if let Some(handle) = response_task.take() {
+                handle.abort();
+            }
+            drain_inflight(&inflight).await;
+        } else if response_task.is_none() {
+            if let Some(gadget) = runtime.gadget.clone() {
+                let inflight_map = inflight.clone();
+                let interrupt_out = gadget.response_reader();
+                response_task = Some(tokio::spawn(response_loop(interrupt_out, inflight_map)));
+            }
+        }
         let active_count = count_active_exports(&runtime.exports);
         runtime.status().set_export_count(active_count).await;
 
@@ -477,7 +503,7 @@ async fn run_event_loop(
                 link.tick(Instant::now());
                 // trace!(state = ?link.state(), outstanding_exports = outstanding.len(), "liveness tick");
                 process_link_commands(&mut runtime, &mut link).await?;
-                drain_outstanding(&mut runtime, &mut link, &mut outstanding).await?;
+                drain_outstanding(&mut runtime, &mut link, &inflight, &mut outstanding).await?;
                 sync_queue_tasks(&mut runtime, &queue_tx).await;
             }
             maybe_msg = control_rx.recv() => {
@@ -488,7 +514,7 @@ async fn run_event_loop(
                         prune_outstanding_for_missing_exports(&mut outstanding, &runtime.exports);
                     }
                     process_link_commands(&mut runtime, &mut link).await?;
-                    drain_outstanding(&mut runtime, &mut link, &mut outstanding).await?;
+                    drain_outstanding(&mut runtime, &mut link, &inflight, &mut outstanding).await?;
                     sync_queue_tasks(&mut runtime, &queue_tx).await;
                 } else {
                     break;
@@ -496,7 +522,10 @@ async fn run_event_loop(
             }
             maybe_evt = queue_rx.recv() => {
                 if let Some(evt) = maybe_evt {
-                    if let Err(err) = handle_queue_event(&mut runtime, &mut link, &mut outstanding, evt).await {
+                    if let Err(err) =
+                        handle_queue_event(&mut runtime, &mut link, &inflight, &mut outstanding, evt)
+                            .await
+                    {
                         io_error = Some(err);
                         break;
                     }
@@ -529,9 +558,10 @@ async fn run_event_loop(
 }
 
 async fn handle_request(
-    gadget: &mut SmooGadget,
+    gadget: &SmooGadget,
+    inflight: &Arc<Mutex<HashMap<u32, HashMap<u32, InflightRequest>>>>,
     export_id: u32,
-    queues: &UblkQueueRuntime,
+    queues: Arc<UblkQueueRuntime>,
     req: UblkIoRequest,
 ) -> Result<()> {
     let block_size = queues.block_size();
@@ -608,6 +638,22 @@ async fn handle_request(
             .context("request block count exceeds protocol limit")?;
         let request_id = make_request_id(req.queue_id, req.tag);
         let proto_req = Request::new(export_id, request_id, opcode, req.sector, num_blocks, 0);
+        {
+            // Track the request before sending it so early Responses can't be dropped as unknown.
+            let mut guard = inflight.lock().await;
+            let entry = InflightRequest {
+                export_id,
+                request_id,
+                request: req,
+                queues: queues.clone(),
+                req_len,
+                block_size,
+            };
+            guard
+                .entry(export_id)
+                .or_default()
+                .insert(request_id, entry);
+        }
         trace!(
             export_id,
             dev_id = queues.dev_id(),
@@ -646,38 +692,16 @@ async fn handle_request(
             }
         }
 
-        let response = gadget.read_response().await.context("read smoo response")?;
-
-        if response.request_id != request_id || response.export_id != export_id {
-            warn!(
-                queue = req.queue_id,
-                tag = req.tag,
-                expected_request_id = request_id,
-                received_request_id = response.request_id,
-                expected_export = export_id,
-                received_export = response.export_id,
-                "response mismatched request identity"
-            );
-        }
-
-        let status = response_status(&response, req_len, block_size)?;
-        if status >= 0 && (status as usize) != req_len {
-            warn!(
-                queue = req.queue_id,
-                tag = req.tag,
-                expected = req_len,
-                reported = status,
-                "response byte count mismatch"
-            );
-        }
-        queues
-            .complete_io(req, status)
-            .context("complete ublk request")?;
         Ok(())
     }
     .await;
 
-    result
+    if let Err(err) = result {
+        drop_inflight_entry(inflight, export_id, make_request_id(req.queue_id, req.tag)).await;
+        return Err(err);
+    }
+
+    Ok(())
 }
 
 async fn control_loop(
@@ -780,6 +804,102 @@ fn response_status(resp: &Response, expected_len: usize, block_size: usize) -> R
     i32::try_from(len)
         .or_else(|_| i32::try_from(expected_len))
         .map_err(|_| anyhow!("response length exceeds i32"))
+}
+
+async fn response_loop(
+    interrupt_out: Arc<Mutex<tokio::fs::File>>,
+    inflight: Arc<Mutex<HashMap<u32, HashMap<u32, InflightRequest>>>>,
+) {
+    loop {
+        let response = {
+            let mut buf = [0u8; smoo_proto::RESPONSE_LEN];
+            let read_res = {
+                let mut lock = interrupt_out.lock().await;
+                lock.read_exact(&mut buf).await
+            };
+            if let Err(err) = read_res {
+                warn!(error = ?err, "response reader exiting after error");
+                break;
+            }
+            match Response::try_from(buf.as_slice()) {
+                Ok(resp) => resp,
+                Err(err) => {
+                    warn!(error = ?err, "response reader failed to decode Response");
+                    continue;
+                }
+            }
+        };
+        let entry = {
+            let mut guard = inflight.lock().await;
+            guard
+                .get_mut(&response.export_id)
+                .and_then(|m| m.remove(&response.request_id))
+        };
+        let Some(entry) = entry else {
+            warn!(
+                request_id = response.request_id,
+                export_id = response.export_id,
+                op = ?response.op,
+                "response for unknown request; dropping"
+            );
+            continue;
+        };
+        if response.export_id != entry.export_id || response.request_id != entry.request_id {
+            warn!(
+                export_id = response.export_id,
+                request_id = response.request_id,
+                expected_export = entry.export_id,
+                expected_request = entry.request_id,
+                "response identity mismatch; dropping"
+            );
+            let _ = entry.queues.complete_io(entry.request, -libc::EBADE);
+            continue;
+        }
+        let status = match response_status(&response, entry.req_len, entry.block_size) {
+            Ok(status) => status,
+            Err(err) => {
+                warn!(
+                    request_id = response.request_id,
+                    export_id = response.export_id,
+                    error = %err,
+                    "failed to interpret response"
+                );
+                -libc::EIO
+            }
+        };
+        if status >= 0 && (status as usize) != entry.req_len {
+            warn!(
+                request_id = response.request_id,
+                export_id = response.export_id,
+                expected = entry.req_len,
+                reported = status,
+                "response byte count mismatch"
+            );
+        }
+        if let Err(err) = entry.queues.complete_io(entry.request, status) {
+            warn!(
+                request_id = response.request_id,
+                export_id = response.export_id,
+                error = ?err,
+                "failed to complete ublk request from response"
+            );
+        }
+    }
+    drain_inflight(&inflight).await;
+}
+
+async fn drop_inflight_entry(
+    inflight: &Arc<Mutex<HashMap<u32, HashMap<u32, InflightRequest>>>>,
+    export_id: u32,
+    request_id: u32,
+) {
+    let mut guard = inflight.lock().await;
+    if let Some(map) = guard.get_mut(&export_id) {
+        map.remove(&request_id);
+        if map.is_empty() {
+            guard.remove(&export_id);
+        }
+    }
 }
 
 fn request_byte_len(req: &UblkIoRequest, block_size: usize) -> io::Result<usize> {
@@ -1325,7 +1445,7 @@ async fn process_link_commands(
                 match open_data_endpoints(&runtime.ffs_dir) {
                     Ok(endpoints) => match SmooGadget::new(endpoints, runtime.gadget_config) {
                         Ok(gadget) => {
-                            runtime.gadget = Some(gadget);
+                            runtime.gadget = Some(Arc::new(gadget));
                             debug!("link controller reopened data plane");
                         }
                         Err(err) => {
@@ -1345,6 +1465,7 @@ async fn process_link_commands(
 async fn handle_queue_event(
     runtime: &mut RuntimeState,
     link: &mut LinkController,
+    inflight: &Arc<Mutex<HashMap<u32, HashMap<u32, InflightRequest>>>>,
     outstanding: &mut HashMap<u32, HashMap<(u16, u16), OutstandingRequest>>,
     event: QueueEvent,
 ) -> Result<()> {
@@ -1377,7 +1498,7 @@ async fn handle_queue_event(
                 park_request(outstanding, export_id, dev_id, queues.clone(), request);
                 return Ok(());
             }
-            let Some(gadget) = runtime.gadget.as_mut() else {
+            let Some(gadget) = runtime.gadget.clone() else {
                 park_request(outstanding, export_id, dev_id, queues.clone(), request);
                 return Ok(());
             };
@@ -1391,7 +1512,14 @@ async fn handle_queue_event(
                 num_sectors = request.num_sectors,
                 "dispatch ublk request to host"
             );
-            let result = handle_request(gadget, export_id, queues.as_ref(), request).await;
+            let result = handle_request(
+                gadget.as_ref(),
+                &inflight,
+                export_id,
+                queues.clone(),
+                request,
+            )
+            .await;
             if let Err(err) = result {
                 let io_err = io_error_from_anyhow(&err);
                 link.on_io_error(&io_err);
@@ -1458,6 +1586,7 @@ fn prune_outstanding_for_missing_exports(
 async fn drain_outstanding(
     runtime: &mut RuntimeState,
     link: &mut LinkController,
+    inflight: &Arc<Mutex<HashMap<u32, HashMap<u32, InflightRequest>>>>,
     outstanding: &mut HashMap<u32, HashMap<(u16, u16), OutstandingRequest>>,
 ) -> Result<()> {
     if outstanding.is_empty() {
@@ -1555,7 +1684,7 @@ async fn drain_outstanding(
             tag = req.tag,
             "replaying outstanding IO to host"
         );
-        let result = handle_request(gadget, export_id, queues.as_ref(), req).await;
+        let result = handle_request(gadget, inflight, export_id, queues.clone(), req).await;
         if let Err(err) = result {
             let io_err = io_error_from_anyhow(&err);
             link.on_io_error(&io_err);
@@ -1577,6 +1706,15 @@ async fn drain_outstanding(
         }
     }
     Ok(())
+}
+
+async fn drain_inflight(inflight: &Arc<Mutex<HashMap<u32, HashMap<u32, InflightRequest>>>>) {
+    let mut guard = inflight.lock().await;
+    for (_export, mut requests) in guard.drain() {
+        for (_req_id, req) in requests.drain() {
+            let _ = req.queues.complete_io(req.request, -libc::ENOLINK);
+        }
+    }
 }
 
 fn io_error_from_anyhow(err: &anyhow::Error) -> io::Error {
