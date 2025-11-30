@@ -82,6 +82,10 @@ pub(crate) struct BufferPool {
     copy: CopyPool,
 }
 
+// Safe because BufferPool is only accessed behind a Mutex, and its internal raw
+// pointers never outlive the pool itself.
+unsafe impl Send for BufferPool {}
+
 impl BufferPool {
     pub(crate) fn new(
         bulk_in_fd: RawFd,
@@ -127,6 +131,8 @@ pub(crate) enum BufferHandle {
     Copy(CopyBuffer),
 }
 
+unsafe impl Send for BufferHandle {}
+
 impl BufferHandle {
     pub(crate) fn len(&self) -> usize {
         match self {
@@ -146,6 +152,13 @@ impl BufferHandle {
         match self {
             BufferHandle::Dma(h) => h.as_slice(),
             BufferHandle::Copy(h) => &h.buf,
+        }
+    }
+
+    pub(crate) fn dma_fd(&self) -> Option<RawFd> {
+        match self {
+            BufferHandle::Dma(h) => Some(h.fd()),
+            BufferHandle::Copy(_) => None,
         }
     }
 
@@ -371,6 +384,8 @@ impl DmaBuffer {
 pub(crate) struct DmaBufferHandle {
     buf: DmaBuffer,
 }
+
+unsafe impl Send for DmaBufferHandle {}
 
 impl DmaBufferHandle {
     pub(crate) fn fd(&self) -> RawFd {

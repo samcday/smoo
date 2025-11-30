@@ -3,9 +3,9 @@ use clap::{Parser, ValueEnum};
 use smoo_gadget_core::{
     ConfigExport, ConfigExportsV0, ControlIo, DeviceHandle, DmaHeap, ExportController, ExportFlags,
     ExportReconcileContext, ExportSpec, ExportState, FunctionfsEndpoints, GadgetConfig,
-    GadgetControl, GadgetStatusReport, LinkCommand, LinkController, LinkState,
-    PersistedExportRecord, RuntimeTunables, SetupCommand, SetupPacket, SmooGadget, SmooUblk,
-    SmooUblkDevice, StateStore, UblkBuffer, UblkIoRequest, UblkOp, UblkQueueRuntime,
+    GadgetControl, GadgetStatusReport, IoPumpHandle, IoWork, LinkCommand, LinkController,
+    LinkState, PersistedExportRecord, RuntimeTunables, SetupCommand, SetupPacket, SmooGadget,
+    SmooUblk, SmooUblkDevice, StateStore, UblkIoRequest, UblkOp, UblkQueueRuntime,
 };
 use smoo_proto::{Ident, OpCode, Request, Response, SMOO_STATUS_REQUEST, SMOO_STATUS_REQ_TYPE};
 use std::{
@@ -161,6 +161,7 @@ async fn main() -> Result<()> {
         dma_heap,
     };
     let link = LinkController::new(Duration::from_secs(3));
+    let io_pump_capacity = args.queue_count as usize * args.queue_depth as usize;
     let runtime = RuntimeState {
         state_store,
         status,
@@ -168,6 +169,8 @@ async fn main() -> Result<()> {
         queue_tasks: HashMap::new(),
         tunables,
         gadget: Some(gadget),
+        io_pump: None,
+        io_pump_capacity,
         gadget_config,
         ffs_dir,
     };
@@ -226,6 +229,8 @@ struct RuntimeState {
     queue_tasks: HashMap<u32, QueueTaskSet>,
     tunables: RuntimeTunables,
     gadget: Option<Arc<SmooGadget>>,
+    io_pump: Option<IoPumpHandle>,
+    io_pump_capacity: usize,
     gadget_config: GadgetConfig,
     ffs_dir: PathBuf,
 }
@@ -474,15 +479,26 @@ async fn run_event_loop(
         }
         sync_queue_tasks(&mut runtime, &queue_tx).await;
         if runtime.gadget.is_none() {
+            if let Some(pump) = runtime.io_pump.take() {
+                pump.shutdown().await;
+            }
             if let Some(handle) = response_task.take() {
                 handle.abort();
             }
             drain_inflight(&inflight).await;
-        } else if response_task.is_none() {
-            if let Some(gadget) = runtime.gadget.clone() {
-                let inflight_map = inflight.clone();
-                let interrupt_out = gadget.response_reader();
-                response_task = Some(tokio::spawn(response_loop(interrupt_out, inflight_map)));
+        } else {
+            if runtime.io_pump.is_none() {
+                if let Some(gadget) = runtime.gadget.clone() {
+                    runtime.io_pump =
+                        Some(IoPumpHandle::spawn(gadget, runtime.io_pump_capacity));
+                }
+            }
+            if response_task.is_none() {
+                if let Some(gadget) = runtime.gadget.clone() {
+                    let inflight_map = inflight.clone();
+                    let interrupt_out = gadget.response_reader();
+                    response_task = Some(tokio::spawn(response_loop(interrupt_out, inflight_map)));
+                }
             }
         }
         let active_count = count_active_exports(&runtime.exports);
@@ -537,6 +553,13 @@ async fn run_event_loop(
         }
     }
 
+    if let Some(pump) = runtime.io_pump.take() {
+        pump.shutdown().await;
+    }
+    if let Some(handle) = response_task.take() {
+        handle.abort();
+    }
+
     if recovery_exit {
         return Ok(());
     }
@@ -558,7 +581,7 @@ async fn run_event_loop(
 }
 
 async fn handle_request(
-    gadget: &SmooGadget,
+    pump: &IoPumpHandle,
     inflight: &Arc<Mutex<HashMap<u32, HashMap<u32, InflightRequest>>>>,
     export_id: u32,
     queues: Arc<UblkQueueRuntime>,
@@ -610,94 +633,66 @@ async fn handle_request(
         "handle_request begin"
     );
 
-    let mut payload: Option<UblkBuffer<'_>> = None;
-    let result = async {
-        if matches!(opcode, OpCode::Read | OpCode::Write) && req_len > 0 {
-            let capacity = queues.buffer_len();
-            if req_len > capacity {
-                warn!(
-                    queue = req.queue_id,
-                    tag = req.tag,
-                    req_bytes = req_len,
-                    buf_cap = capacity,
-                    "request exceeds buffer capacity"
-                );
-                queues
-                    .complete_io(req, -libc::EINVAL)
-                    .context("complete oversized request")?;
-                return Ok(());
-            }
-            payload = Some(
-                queues
-                    .checkout_buffer(req.queue_id, req.tag)
-                    .context("checkout bulk buffer")?,
+    if matches!(opcode, OpCode::Read | OpCode::Write) && req_len > 0 {
+        let capacity = queues.buffer_len();
+        if req_len > capacity {
+            warn!(
+                queue = req.queue_id,
+                tag = req.tag,
+                req_bytes = req_len,
+                buf_cap = capacity,
+                "request exceeds buffer capacity"
             );
+            queues
+                .complete_io(req, -libc::EINVAL)
+                .context("complete oversized request")?;
+            return Ok(());
         }
-
-        let num_blocks = u32::try_from(req_len / block_size)
-            .context("request block count exceeds protocol limit")?;
-        let request_id = make_request_id(req.queue_id, req.tag);
-        let proto_req = Request::new(export_id, request_id, opcode, req.sector, num_blocks, 0);
-        {
-            // Track the request before sending it so early Responses can't be dropped as unknown.
-            let mut guard = inflight.lock().await;
-            let entry = InflightRequest {
-                export_id,
-                request_id,
-                request: req,
-                queues: queues.clone(),
-                req_len,
-                block_size,
-            };
-            guard
-                .entry(export_id)
-                .or_default()
-                .insert(request_id, entry);
-        }
-        trace!(
-            export_id,
-            dev_id = queues.dev_id(),
-            queue = req.queue_id,
-            tag = req.tag,
-            op = ?opcode,
-            num_blocks,
-            req_bytes = req_len,
-            "sending smoo Request"
-        );
-        gadget
-            .send_request(proto_req)
-            .await
-            .context("send smoo request")?;
-        trace!(
-            export_id,
-            dev_id = queues.dev_id(),
-            queue = req.queue_id,
-            tag = req.tag,
-            "smoo Request sent"
-        );
-
-        if opcode == OpCode::Read && req_len > 0 {
-            if let Some(buf) = payload.as_mut() {
-                gadget
-                    .read_bulk_buffer(&mut buf.as_mut_slice()[..req_len])
-                    .await
-                    .context("read bulk payload")?;
-            }
-        } else if opcode == OpCode::Write && req_len > 0 {
-            if let Some(buf) = payload.as_mut() {
-                gadget
-                    .write_bulk_buffer(&mut buf.as_mut_slice()[..req_len])
-                    .await
-                    .context("write bulk payload")?;
-            }
-        }
-
-        Ok(())
     }
-    .await;
 
-    if let Err(err) = result {
-        drop_inflight_entry(inflight, export_id, make_request_id(req.queue_id, req.tag)).await;
+    let num_blocks = u32::try_from(req_len / block_size)
+        .context("request block count exceeds protocol limit")?;
+    let request_id = make_request_id(req.queue_id, req.tag);
+    let proto_req = Request::new(export_id, request_id, opcode, req.sector, num_blocks, 0);
+    {
+        // Track the request before sending it so early Responses can't be dropped as unknown.
+        let mut guard = inflight.lock().await;
+        let entry = InflightRequest {
+            export_id,
+            request_id,
+            request: req,
+            queues: queues.clone(),
+            req_len,
+            block_size,
+        };
+        guard
+            .entry(export_id)
+            .or_default()
+            .insert(request_id, entry);
+    }
+    trace!(
+        export_id,
+        dev_id = queues.dev_id(),
+        queue = req.queue_id,
+        tag = req.tag,
+        op = ?opcode,
+        num_blocks,
+        req_bytes = req_len,
+        "queueing smoo Request through pump"
+    );
+
+    if let Err(err) = pump
+        .submit(IoWork {
+            request: proto_req,
+            req_len,
+            queue_id: req.queue_id,
+            tag: req.tag,
+            op: opcode,
+            queues: queues.clone(),
+        })
+        .await
+    {
+        drop_inflight_entry(inflight, export_id, request_id).await;
         return Err(err);
     }
 
@@ -1432,6 +1427,9 @@ async fn process_link_commands(
     while let Some(cmd) = link.take_command() {
         match cmd {
             LinkCommand::DropLink => {
+                if let Some(pump) = runtime.io_pump.take() {
+                    pump.shutdown().await;
+                }
                 runtime.gadget = None;
                 debug!("link controller requested drop; data plane closed");
             }
@@ -1442,7 +1440,12 @@ async fn process_link_commands(
                 match open_data_endpoints(&runtime.ffs_dir) {
                     Ok(endpoints) => match SmooGadget::new(endpoints, runtime.gadget_config) {
                         Ok(gadget) => {
-                            runtime.gadget = Some(Arc::new(gadget));
+                            let gadget = Arc::new(gadget);
+                            runtime.io_pump = Some(IoPumpHandle::spawn(
+                                gadget.clone(),
+                                runtime.io_pump_capacity,
+                            ));
+                            runtime.gadget = Some(gadget);
                             debug!("link controller reopened data plane");
                         }
                         Err(err) => {
@@ -1495,7 +1498,7 @@ async fn handle_queue_event(
                 park_request(outstanding, export_id, dev_id, queues.clone(), request);
                 return Ok(());
             }
-            let Some(gadget) = runtime.gadget.clone() else {
+            let Some(pump) = runtime.io_pump.as_ref() else {
                 park_request(outstanding, export_id, dev_id, queues.clone(), request);
                 return Ok(());
             };
@@ -1509,14 +1512,8 @@ async fn handle_queue_event(
                 num_sectors = request.num_sectors,
                 "dispatch ublk request to host"
             );
-            let result = handle_request(
-                gadget.as_ref(),
-                inflight,
-                export_id,
-                queues.clone(),
-                request,
-            )
-            .await;
+            let result =
+                handle_request(pump, inflight, export_id, queues.clone(), request).await;
             if let Err(err) = result {
                 let io_err = io_error_from_anyhow(&err);
                 link.on_io_error(&io_err);
@@ -1596,7 +1593,7 @@ async fn drain_outstanding(
         );
         return Ok(());
     }
-    let Some(gadget) = runtime.gadget.as_mut() else {
+    let Some(pump) = runtime.io_pump.as_ref() else {
         trace!(
             outstanding_exports = outstanding.len(),
             "no gadget endpoints available; deferring outstanding IO drain"
@@ -1681,7 +1678,7 @@ async fn drain_outstanding(
             tag = req.tag,
             "replaying outstanding IO to host"
         );
-        let result = handle_request(gadget, inflight, export_id, queues.clone(), req).await;
+        let result = handle_request(pump, inflight, export_id, queues.clone(), req).await;
         if let Err(err) = result {
             let io_err = io_error_from_anyhow(&err);
             link.on_io_error(&io_err);

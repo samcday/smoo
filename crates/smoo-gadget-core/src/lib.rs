@@ -22,11 +22,13 @@ use tracing::trace;
 
 mod dma;
 mod link;
+mod pump;
 mod runtime;
 mod state_store;
 
 use crate::dma::{BufferHandle, BufferPool, dmabuf_transfer_blocking};
 pub use link::{LinkCommand, LinkController, LinkState};
+pub use pump::{IoPumpHandle, IoWork};
 pub use runtime::{
     DeviceHandle, ExportController, ExportReconcileContext, ExportState, GadgetRuntime,
     RuntimeTunables,
@@ -511,7 +513,8 @@ impl GadgetDataPlane {
                 let mut handle = pool.checkout();
                 let result = match handle {
                     BufferHandle::Dma(_) => {
-                        self.queue_dmabuf_transfer(self.bulk_out_fd, handle.len(), &handle)
+                        let buf_fd = handle.dma_fd().expect("dma buffer");
+                        self.queue_dmabuf_transfer(self.bulk_out_fd, handle.len(), buf_fd)
                             .await
                     }
                     BufferHandle::Copy(_) => self.read_bulk(handle.as_mut_slice()).await,
@@ -547,10 +550,12 @@ impl GadgetDataPlane {
                     .prepare_device_read()
                     .context("prepare buffer before device read")?;
                 let result = match handle {
-                    BufferHandle::Dma(_) => self
-                        .queue_dmabuf_transfer(self.bulk_in_fd, handle.len(), &handle)
-                        .await
-                        .context("FUNCTIONFS dmabuf transfer (IN)"),
+                    BufferHandle::Dma(_) => {
+                        let buf_fd = handle.dma_fd().expect("dma buffer");
+                        self.queue_dmabuf_transfer(self.bulk_in_fd, handle.len(), buf_fd)
+                            .await
+                            .context("FUNCTIONFS dmabuf transfer (IN)")
+                    }
                     BufferHandle::Copy(_) => self.write_bulk(handle.as_slice()).await,
                 };
                 pool.checkin(handle);
@@ -567,14 +572,8 @@ impl GadgetDataPlane {
         &self,
         endpoint_fd: RawFd,
         len: usize,
-        handle: &BufferHandle,
+        buf_fd: RawFd,
     ) -> Result<()> {
-        let buf_fd = match handle {
-            BufferHandle::Dma(h) => h.fd(),
-            BufferHandle::Copy(_) => {
-                return Err(anyhow!("attempted dma transfer with copy buffer"));
-            }
-        };
         task::spawn_blocking(move || dmabuf_transfer_blocking(endpoint_fd, buf_fd, len))
             .await
             .map_err(|err| anyhow!("dma-buf transfer task failed: {err}"))?
