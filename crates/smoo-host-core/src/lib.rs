@@ -6,6 +6,7 @@ pub mod block;
 pub mod control;
 pub mod export_id;
 pub mod host;
+pub mod pump;
 pub mod transport;
 
 pub use block::{
@@ -16,6 +17,7 @@ pub use export_id::{
     derive_export_id_with,
 };
 pub use host::{HostError, HostErrorKind, HostResult, SmooHost};
+pub use pump::{start_host_io_pump, HostIoPumpHandle, HostIoPumpRequestRx, HostIoPumpTask};
 pub use transport::{
     ControlTransport, Transport, TransportError, TransportErrorKind, TransportResult,
 };

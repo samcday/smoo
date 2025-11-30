@@ -9,6 +9,7 @@ use smoo_host_core::{
     control::{fetch_ident, read_status, send_config_exports_v0, ConfigExportsV0},
     derive_export_id_from_source, BlockSource, BlockSourceHandle, BlockSourceResult,
     ExportIdentity, HostErrorKind, SmooHost, TransportError, TransportErrorKind,
+    start_host_io_pump,
 };
 use smoo_host_transport_nusb::{NusbControl, NusbTransport};
 use smoo_proto::SmooStatusV0;
@@ -285,7 +286,9 @@ async fn run_session(
             let _ = heartbeat_tx.send(err);
         }
     });
-    let mut host = SmooHost::new(transport, sources);
+    let (pump_handle, request_rx, pump_task) = start_host_io_pump(transport);
+    let mut pump_task = tokio::spawn(async move { pump_task.await });
+    let mut host = SmooHost::new(pump_handle.clone(), request_rx, sources);
     host.record_ident(ident);
     info!(
         major = ident.major,
@@ -310,6 +313,19 @@ async fn run_session(
                             return Err(anyhow!(err.to_string()));
                         }
                     },
+                }
+            }
+            pump_res = &mut pump_task => {
+                match pump_res {
+                    Ok(Ok(())) => break SessionEnd::TransportLost,
+                    Ok(Err(err)) => {
+                        warn!(error = %err, "pump task exited");
+                        break SessionEnd::TransportLost;
+                    }
+                    Err(join_err) => {
+                        warn!(error = %join_err, "pump task join failed");
+                        break SessionEnd::TransportLost;
+                    }
                 }
             }
             event = heartbeat_rx.recv() => {
@@ -337,6 +353,13 @@ async fn run_session(
         heartbeat_task.abort();
     }
     let _ = heartbeat_task.await;
+
+    // Gracefully stop the pump.
+    let _ = pump_handle.shutdown().await;
+    if !pump_task.is_finished() {
+        pump_task.abort();
+    }
+    let _ = pump_task.await;
 
     Ok(outcome)
 }

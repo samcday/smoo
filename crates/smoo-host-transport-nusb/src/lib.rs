@@ -61,7 +61,6 @@ impl NusbControl {
 /// [`Transport`] implementation backed by `nusb`.
 #[derive(Clone)]
 pub struct NusbTransport {
-    device: Arc<Device>,
     control: NusbControl,
     interrupt_in: Arc<Mutex<EndpointRead<Interrupt>>>,
     interrupt_out: Arc<Mutex<EndpointWrite<Interrupt>>>,
@@ -94,26 +93,29 @@ impl NusbTransport {
         let interrupt_out_mps = interrupt_out_ep.max_packet_size() as usize;
         let bulk_in_mps = bulk_in_ep.max_packet_size() as usize;
         let bulk_out_mps = bulk_out_ep.max_packet_size() as usize;
+        let interrupt_transfer_size = interrupt_in_mps.max(1024);
+        let bulk_transfer_size = bulk_in_mps.max(64 * 1024);
 
         let interrupt_in = Arc::new(Mutex::new(EndpointRead::new(
             interrupt_in_ep,
-            interrupt_in_mps,
+            interrupt_transfer_size,
         )));
         let interrupt_out = Arc::new(Mutex::new(EndpointWrite::new(
             interrupt_out_ep,
-            interrupt_out_mps,
+            interrupt_transfer_size,
         )));
-        let bulk_in = Arc::new(Mutex::new(EndpointRead::new(bulk_in_ep, bulk_in_mps * 4)));
+        let bulk_in = Arc::new(Mutex::new(EndpointRead::new(
+            bulk_in_ep,
+            bulk_transfer_size,
+        )));
         let bulk_out = Arc::new(Mutex::new(EndpointWrite::new(
             bulk_out_ep,
-            bulk_out_mps * 4,
+            bulk_transfer_size,
         )));
 
-        let device = Arc::new(device);
-        let control = NusbControl::new(device.clone(), config.interface);
+        let control = NusbControl::new(Arc::new(device), config.interface);
 
         Ok(Self {
-            device,
             control,
             interrupt_in,
             interrupt_out,

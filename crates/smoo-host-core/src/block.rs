@@ -74,7 +74,7 @@ pub trait BlockSource: Send + Sync {
     async fn read_blocks(&self, lba: u64, buf: &mut [u8]) -> BlockSourceResult<usize>;
 
     /// Write one or more blocks starting at `lba` from `buf`.
-    async fn write_blocks(&self, lba: u64, buf: &[u8]) -> BlockSourceResult<usize>;
+    async fn write_blocks(&self, lba: u64, buf:     &[u8]) -> BlockSourceResult<usize>;
 
     /// Flush outstanding writes to durable media.
     async fn flush(&self) -> BlockSourceResult<()> {
