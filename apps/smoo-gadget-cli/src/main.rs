@@ -489,8 +489,7 @@ async fn run_event_loop(
         } else {
             if runtime.io_pump.is_none() {
                 if let Some(gadget) = runtime.gadget.clone() {
-                    runtime.io_pump =
-                        Some(IoPumpHandle::spawn(gadget, runtime.io_pump_capacity));
+                    runtime.io_pump = Some(IoPumpHandle::spawn(gadget, runtime.io_pump_capacity));
                 }
             }
             if response_task.is_none() {
@@ -1512,8 +1511,7 @@ async fn handle_queue_event(
                 num_sectors = request.num_sectors,
                 "dispatch ublk request to host"
             );
-            let result =
-                handle_request(pump, inflight, export_id, queues.clone(), request).await;
+            let result = handle_request(pump, inflight, export_id, queues.clone(), request).await;
             if let Err(err) = result {
                 let io_err = io_error_from_anyhow(&err);
                 link.on_io_error(&io_err);

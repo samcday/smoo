@@ -1,6 +1,5 @@
 use anyhow::{anyhow, ensure, Context, Result};
 use clap::{ArgGroup, Parser};
-use rusb::{Direction, TransferType, UsbContext};
 use smoo_host_blocksource_cached::{CachedBlockSource, MemoryCacheStore};
 use smoo_host_blocksource_http::HttpBlockSource;
 use smoo_host_blocksources::device::DeviceBlockSource;
@@ -11,7 +10,7 @@ use smoo_host_core::{
     derive_export_id_from_source, BlockSource, BlockSourceHandle, BlockSourceResult,
     ExportIdentity, HostErrorKind, SmooHost, TransportError, TransportErrorKind,
 };
-use smoo_host_rusb::{RusbControl, RusbTransport, RusbTransportConfig};
+use smoo_host_transport_nusb::{NusbControl, NusbTransport};
 use smoo_proto::SmooStatusV0;
 use std::{collections::BTreeMap, fmt, fs, path::PathBuf, time::Duration};
 use tokio::{signal, sync::mpsc, time};
@@ -205,9 +204,18 @@ async fn run_session(
 
     let mut attempts = 0usize;
     let mut delay = DISCOVERY_DELAY_INITIAL;
-    let (handle, interface) = loop {
-        match discover_device(args, attempts == 0 && !has_connected) {
-            Ok(found) => break found,
+    let (transport, control) = loop {
+        match NusbTransport::open_matching(
+            args.vendor_id,
+            args.product_id,
+            SMOO_INTERFACE_CLASS,
+            SMOO_INTERFACE_SUBCLASS,
+            SMOO_INTERFACE_PROTOCOL,
+            Duration::from_millis(args.timeout_ms),
+        )
+        .await
+        {
+            Ok((transport, control)) => break (transport, control),
             Err(err) => {
                 if !has_connected && attempts == 0 {
                     warn!(error = %err, "no smoo gadget found; waiting for connection");
@@ -226,17 +234,6 @@ async fn run_session(
             }
         }
     };
-    let endpoints = infer_interface_endpoints(&handle, interface).context("discover endpoints")?;
-    let transport_config = RusbTransportConfig {
-        interface,
-        interrupt_in: endpoints.interrupt_in,
-        interrupt_out: endpoints.interrupt_out,
-        bulk_in: endpoints.bulk_in,
-        bulk_out: endpoints.bulk_out,
-        timeout: Duration::from_millis(args.timeout_ms),
-    };
-    let transport = RusbTransport::new(handle, transport_config).context("init transport")?;
-    let control = transport.control_handle();
     let ident = fetch_ident(&control)
         .await
         .context("IDENT control transfer")?;
@@ -342,153 +339,6 @@ async fn run_session(
     let _ = heartbeat_task.await;
 
     Ok(outcome)
-}
-
-fn discover_device(args: &Args, log_scan: bool) -> Result<(rusb::DeviceHandle<rusb::Context>, u8)> {
-    let context = rusb::Context::new().context("init libusb context")?;
-    let devices = context.devices().context("enumerate usb devices")?;
-    if log_scan {
-        info!(
-            vendor_filter = args.vendor_id.map(|v| format!("{:#06x}", v)),
-            product_filter = args.product_id.map(|p| format!("{:#06x}", p)),
-            "scanning USB devices for smoo gadget"
-        );
-    } else {
-        debug!(
-            vendor_filter = args.vendor_id.map(|v| format!("{:#06x}", v)),
-            product_filter = args.product_id.map(|p| format!("{:#06x}", p)),
-            "probing USB devices for smoo gadget"
-        );
-    }
-    for device in devices.iter() {
-        let device_desc = match device.device_descriptor() {
-            Ok(desc) => desc,
-            Err(err) => {
-                warn!(error = %err, "read device descriptor failed");
-                continue;
-            }
-        };
-        if let Some(vendor) = args.vendor_id {
-            if device_desc.vendor_id() != vendor {
-                debug!(
-                    vid = format_args!("{:#06x}", device_desc.vendor_id()),
-                    pid = format_args!("{:#06x}", device_desc.product_id()),
-                    "skipping device due to vendor filter"
-                );
-                continue;
-            }
-        } else if log_scan {
-            debug!(
-                vid = format_args!("{:#06x}", device_desc.vendor_id()),
-                pid = format_args!("{:#06x}", device_desc.product_id()),
-                "examining usb device"
-            );
-        }
-        if let Some(product) = args.product_id {
-            if device_desc.product_id() != product {
-                if log_scan {
-                    debug!("skipping device due to product filter");
-                }
-                continue;
-            }
-        }
-        for cfg_idx in 0..device_desc.num_configurations() {
-            let config = match device.config_descriptor(cfg_idx) {
-                Ok(cfg) => cfg,
-                Err(err) => {
-                    warn!(error = %err, config = cfg_idx, "read config descriptor failed");
-                    continue;
-                }
-            };
-            for interface in config.interfaces() {
-                for desc in interface.descriptors() {
-                    let iface_num = desc.interface_number();
-                    if desc.class_code() == SMOO_INTERFACE_CLASS
-                        && desc.sub_class_code() == SMOO_INTERFACE_SUBCLASS
-                        && desc.protocol_code() == SMOO_INTERFACE_PROTOCOL
-                    {
-                        let handle = match device.open() {
-                            Ok(handle) => handle,
-                            Err(err) => {
-                                warn!(error = %err, "failed to open matching usb device");
-                                continue;
-                            }
-                        };
-                        handle
-                            .set_auto_detach_kernel_driver(true)
-                            .context("enable auto-detach")?;
-                        info!(
-                            vid = format_args!("{:#06x}", device_desc.vendor_id()),
-                            pid = format_args!("{:#06x}", device_desc.product_id()),
-                            interface = iface_num,
-                            "selected smoo-compatible interface"
-                        );
-                        return Ok((handle, iface_num));
-                    }
-                }
-            }
-        }
-    }
-    Err(anyhow!(
-        "No smoo-compatible USB devices found{}.",
-        if args.vendor_id.is_some() || args.product_id.is_some() {
-            " (after applying filters)"
-        } else {
-            ""
-        }
-    ))
-}
-
-struct InterfaceEndpoints {
-    interrupt_in: u8,
-    interrupt_out: u8,
-    bulk_in: u8,
-    bulk_out: u8,
-}
-
-#[derive(Default)]
-struct EndpointBuilder {
-    interrupt_in: Option<u8>,
-    interrupt_out: Option<u8>,
-    bulk_in: Option<u8>,
-    bulk_out: Option<u8>,
-}
-
-impl EndpointBuilder {
-    fn record(&mut self, ep: &rusb::EndpointDescriptor) {
-        match (ep.transfer_type(), ep.direction()) {
-            (TransferType::Interrupt, Direction::In) if self.interrupt_in.is_none() => {
-                self.interrupt_in = Some(ep.address());
-            }
-            (TransferType::Interrupt, Direction::Out) if self.interrupt_out.is_none() => {
-                self.interrupt_out = Some(ep.address());
-            }
-            (TransferType::Bulk, Direction::In) if self.bulk_in.is_none() => {
-                self.bulk_in = Some(ep.address());
-            }
-            (TransferType::Bulk, Direction::Out) if self.bulk_out.is_none() => {
-                self.bulk_out = Some(ep.address());
-            }
-            _ => {}
-        }
-    }
-
-    fn finish(self) -> Option<InterfaceEndpoints> {
-        let (Some(interrupt_in), Some(interrupt_out), Some(bulk_in), Some(bulk_out)) = (
-            self.interrupt_in,
-            self.interrupt_out,
-            self.bulk_in,
-            self.bulk_out,
-        ) else {
-            return None;
-        };
-        Some(InterfaceEndpoints {
-            interrupt_in,
-            interrupt_out,
-            bulk_in,
-            bulk_out,
-        })
-    }
 }
 
 async fn open_sources(args: &Args) -> Result<(BTreeMap<u32, BlockSourceHandle>, ConfigExportsV0)> {
@@ -631,34 +481,6 @@ fn canonicalize_path(path: &PathBuf) -> Result<PathBuf> {
     fs::canonicalize(path).with_context(|| format!("canonicalize {}", path.display()))
 }
 
-fn infer_interface_endpoints<T: UsbContext>(
-    handle: &rusb::DeviceHandle<T>,
-    interface: u8,
-) -> Result<InterfaceEndpoints> {
-    let config = handle
-        .device()
-        .active_config_descriptor()
-        .context("read active config descriptor")?;
-    for intf in config.interfaces() {
-        for desc in intf.descriptors() {
-            if desc.interface_number() != interface {
-                continue;
-            }
-            let mut builder = EndpointBuilder::default();
-            for ep in desc.endpoint_descriptors() {
-                builder.record(&ep);
-            }
-            if let Some(endpoints) = builder.finish() {
-                return Ok(endpoints);
-            }
-        }
-    }
-    Err(anyhow!(
-        "required endpoints not found for interface {}",
-        interface
-    ))
-}
-
 #[derive(Debug, Clone)]
 enum HeartbeatFailure {
     SessionChanged { previous: u64, current: u64 },
@@ -680,7 +502,7 @@ impl fmt::Display for HeartbeatFailure {
 }
 
 async fn run_heartbeat(
-    client: RusbControl<rusb::Context>,
+    client: NusbControl,
     initial_session_id: u64,
     interval: Duration,
 ) -> Result<(), HeartbeatFailure> {
@@ -710,7 +532,7 @@ async fn run_heartbeat(
 }
 
 async fn fetch_status_with_retry(
-    client: &RusbControl<rusb::Context>,
+    client: &NusbControl,
     attempts: usize,
     delay: Duration,
 ) -> Result<SmooStatusV0, TransportError> {
