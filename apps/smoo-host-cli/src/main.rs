@@ -10,7 +10,7 @@ use smoo_host_core::{
     derive_export_id_from_source, start_host_io_pump, BlockSource, BlockSourceHandle,
     BlockSourceResult, ExportIdentity, HostErrorKind, SmooHost, TransportError, TransportErrorKind,
 };
-use smoo_host_transport_nusb::{NusbControl, NusbTransport};
+use smoo_host_transport_rusb::{RusbControl, RusbTransport};
 use smoo_proto::SmooStatusV0;
 use std::{collections::BTreeMap, fmt, fs, path::PathBuf, time::Duration};
 use tokio::{signal, sync::mpsc, time};
@@ -65,7 +65,7 @@ struct Args {
     /// Logical block size exposed through the gadget (bytes)
     #[arg(long, default_value_t = 512)]
     block_size: u32,
-    /// Control/interrupt transfer timeout in milliseconds
+    /// Per-transfer timeout in milliseconds (clamped to 200ms for cancellation)
     #[arg(long, default_value_t = 1000)]
     timeout_ms: u64,
 }
@@ -204,14 +204,15 @@ async fn run_session(
 
     let mut attempts = 0usize;
     let mut delay = DISCOVERY_DELAY_INITIAL;
+    let transfer_timeout = Duration::from_millis(args.timeout_ms.min(200));
     let (transport, control) = loop {
-        match NusbTransport::open_matching(
+        match RusbTransport::open_matching(
             args.vendor_id,
             args.product_id,
             SMOO_INTERFACE_CLASS,
             SMOO_INTERFACE_SUBCLASS,
             SMOO_INTERFACE_PROTOCOL,
-            Duration::from_millis(args.timeout_ms),
+            transfer_timeout,
         )
         .await
         {
@@ -524,7 +525,7 @@ impl fmt::Display for HeartbeatFailure {
 }
 
 async fn run_heartbeat(
-    client: NusbControl,
+    client: RusbControl,
     initial_session_id: u64,
     interval: Duration,
 ) -> Result<(), HeartbeatFailure> {
@@ -554,7 +555,7 @@ async fn run_heartbeat(
 }
 
 async fn fetch_status_with_retry(
-    client: &NusbControl,
+    client: &RusbControl,
     attempts: usize,
     delay: Duration,
 ) -> Result<SmooStatusV0, TransportError> {

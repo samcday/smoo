@@ -3,7 +3,6 @@ pub mod file;
 pub mod random;
 
 use anyhow::{Context, Result};
-use core::hash::Hasher;
 use smoo_host_core::{BlockSourceError, BlockSourceErrorKind};
 use std::{
     io,

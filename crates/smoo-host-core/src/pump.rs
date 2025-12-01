@@ -7,9 +7,8 @@ use core::{
 };
 use futures_channel::{mpsc, oneshot};
 use futures_util::{
-    future::{BoxFuture, Fuse, FusedFuture, FutureExt, OptionFuture},
-    select_biased,
-    stream::StreamExt,
+    future::{poll_fn, BoxFuture, Fuse, FusedFuture, FutureExt, OptionFuture},
+    stream::{Fuse as StreamFuse, StreamExt},
 };
 use smoo_proto::{REQUEST_LEN, RESPONSE_LEN, Request, Response};
 
@@ -57,6 +56,11 @@ impl HostIoPumpHandle {
     /// Send a Response over interrupt OUT.
     pub async fn send_response(&self, response: Response) -> TransportResult<()> {
         let (reply_tx, reply_rx) = oneshot::channel();
+        tracing::trace!(
+            export_id = response.export_id,
+            request_id = response.request_id,
+            "pump: queue send_response"
+        );
         self.send_cmd(PumpCmd::SendResponse {
             response,
             reply: reply_tx,
@@ -68,6 +72,7 @@ impl HostIoPumpHandle {
     /// Read a bulk payload of `len` bytes from the gadget.
     pub async fn read_bulk(&self, len: usize) -> TransportResult<Vec<u8>> {
         let (reply_tx, reply_rx) = oneshot::channel();
+        tracing::trace!(bytes = len, "pump: queue read_bulk");
         self.send_cmd(PumpCmd::ReadBulk {
             buf: vec![0u8; len],
             reply: reply_tx,
@@ -79,6 +84,7 @@ impl HostIoPumpHandle {
     /// Write a bulk payload to the gadget.
     pub async fn write_bulk(&self, buf: Vec<u8>) -> TransportResult<()> {
         let (reply_tx, reply_rx) = oneshot::channel();
+        tracing::trace!(bytes = buf.len(), "pump: queue write_bulk");
         self.send_cmd(PumpCmd::WriteBulk {
             buf,
             reply: reply_tx,
@@ -144,6 +150,11 @@ type BulkInResult = (
 );
 type BulkOutResult = (oneshot::Sender<TransportResult<()>>, TransportResult<()>);
 
+enum PumpProgress {
+    Continue,
+    Finished(TransportResult<()>),
+}
+
 async fn run_pump<T>(
     transport: T,
     cmd_rx: mpsc::UnboundedReceiver<PumpCmd>,
@@ -152,8 +163,7 @@ async fn run_pump<T>(
 where
     T: Transport + Clone + Send + Sync + 'static,
 {
-    let mut cmd_rx = cmd_rx.fuse();
-    let mut next_cmd = cmd_rx.next().fuse();
+    let mut cmd_rx: StreamFuse<mpsc::UnboundedReceiver<PumpCmd>> = cmd_rx.fuse();
     let mut interrupt_in: InterruptInFuture = arm_interrupt_in(transport.clone());
     let mut interrupt_out: InterruptOutFuture = OptionFuture::from(None).fuse();
     let mut bulk_in: BulkInFuture = OptionFuture::from(None).fuse();
@@ -164,82 +174,155 @@ where
     let mut cmd_closed = false;
 
     loop {
-        if interrupt_in.is_terminated() {
-            interrupt_in = arm_interrupt_in(transport.clone());
-        }
-        if interrupt_out.is_terminated() {
-            if let Some(op) = interrupt_out_queue.pop_front() {
-                interrupt_out = arm_interrupt_out(transport.clone(), op);
-            }
-        }
-        if bulk_in.is_terminated() {
-            if let Some(op) = bulk_in_queue.pop_front() {
-                bulk_in = arm_bulk_in(transport.clone(), op);
-            }
-        }
-        if bulk_out.is_terminated() {
-            if let Some(op) = bulk_out_queue.pop_front() {
-                bulk_out = arm_bulk_out(transport.clone(), op);
-            }
-        }
-
-        select_biased! {
-            cmd = next_cmd => {
-                next_cmd = cmd_rx.next().fuse();
-                match cmd {
-                    Some(PumpCmd::SendResponse { response, reply }) => {
-                        interrupt_out_queue.push_back(InterruptOutOp { response, reply });
-                    }
-                    Some(PumpCmd::ReadBulk { buf, reply }) => {
-                        bulk_in_queue.push_back(BulkInOp { buf, reply });
-                    }
-                    Some(PumpCmd::WriteBulk { buf, reply }) => {
-                        bulk_out_queue.push_back(BulkOutOp { buf, reply });
-                    }
-                    Some(PumpCmd::Shutdown) => break Ok(()),
-                    None => cmd_closed = true,
-                }
-            }
-            req = interrupt_in => {
-                match req {
-                    Some(Ok(request)) => {
-                        if req_tx.unbounded_send(request).is_err() {
-                            break Err(disconnected_err());
-                        }
-                    }
-                    Some(Err(err)) => break Err(err),
-                    None => {}
-                }
-            }
-            res = interrupt_out => {
-                if let Some((reply, result)) = res {
-                    let _ = reply.send(result);
-                }
-            }
-            res = bulk_in => {
-                if let Some((reply, result)) = res {
-                    let _ = reply.send(result);
-                }
-            }
-            res = bulk_out => {
-                if let Some((reply, result)) = res {
-                    let _ = reply.send(result);
-                }
-            }
-            default => {
-                if cmd_closed
-                    && interrupt_out_queue.is_empty()
-                    && bulk_in_queue.is_empty()
-                    && bulk_out_queue.is_empty()
-                    && interrupt_out.is_terminated()
-                    && bulk_in.is_terminated()
-                    && bulk_out.is_terminated()
-                {
-                    break Ok(());
-                }
-            }
+        match poll_fn(|cx| {
+            poll_pump(
+                cx,
+                &transport,
+                &mut cmd_rx,
+                &mut interrupt_in,
+                &mut interrupt_out,
+                &mut bulk_in,
+                &mut bulk_out,
+                &mut interrupt_out_queue,
+                &mut bulk_in_queue,
+                &mut bulk_out_queue,
+                &mut cmd_closed,
+                &req_tx,
+            )
+        })
+        .await?
+        {
+            PumpProgress::Continue => continue,
+            PumpProgress::Finished(res) => break res,
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn poll_pump<T>(
+    cx: &mut Context<'_>,
+    transport: &T,
+    cmd_rx: &mut StreamFuse<mpsc::UnboundedReceiver<PumpCmd>>,
+    interrupt_in: &mut InterruptInFuture,
+    interrupt_out: &mut InterruptOutFuture,
+    bulk_in: &mut BulkInFuture,
+    bulk_out: &mut BulkOutFuture,
+    interrupt_out_queue: &mut VecDeque<InterruptOutOp>,
+    bulk_in_queue: &mut VecDeque<BulkInOp>,
+    bulk_out_queue: &mut VecDeque<BulkOutOp>,
+    cmd_closed: &mut bool,
+    req_tx: &mpsc::UnboundedSender<Request>,
+) -> Poll<TransportResult<PumpProgress>>
+where
+    T: Transport + Clone + Send + Sync + 'static,
+{
+    if interrupt_in.is_terminated() {
+        *interrupt_in = arm_interrupt_in(transport.clone());
+    }
+    if interrupt_out.is_terminated() {
+        if let Some(op) = interrupt_out_queue.pop_front() {
+            *interrupt_out = arm_interrupt_out(transport.clone(), op);
+        }
+    }
+    if bulk_in.is_terminated() {
+        if let Some(op) = bulk_in_queue.pop_front() {
+            *bulk_in = arm_bulk_in(transport.clone(), op);
+        }
+    }
+    if bulk_out.is_terminated() {
+        if let Some(op) = bulk_out_queue.pop_front() {
+            *bulk_out = arm_bulk_out(transport.clone(), op);
+        }
+    }
+
+    if let Poll::Ready(cmd) = cmd_rx.poll_next_unpin(cx) {
+        match cmd {
+            Some(PumpCmd::SendResponse { response, reply }) => {
+                tracing::trace!(
+                    export_id = response.export_id,
+                    request_id = response.request_id,
+                    "pump: enqueue response"
+                );
+                interrupt_out_queue.push_back(InterruptOutOp { response, reply });
+            }
+            Some(PumpCmd::ReadBulk { buf, reply }) => {
+                tracing::trace!(bytes = buf.len(), "pump: enqueue bulk-in");
+                bulk_in_queue.push_back(BulkInOp { buf, reply });
+            }
+            Some(PumpCmd::WriteBulk { buf, reply }) => {
+                tracing::trace!(bytes = buf.len(), "pump: enqueue bulk-out");
+                bulk_out_queue.push_back(BulkOutOp { buf, reply });
+            }
+            Some(PumpCmd::Shutdown) => return Poll::Ready(Ok(PumpProgress::Finished(Ok(())))),
+            None => *cmd_closed = true,
+        }
+        return Poll::Ready(Ok(PumpProgress::Continue));
+    }
+
+    if let Poll::Ready(req) = interrupt_in.poll_unpin(cx) {
+        match req {
+            Some(Ok(request)) => {
+                if req_tx.unbounded_send(request).is_err() {
+                    return Poll::Ready(Err(disconnected_err()));
+                }
+            }
+            Some(Err(err)) => {
+                if err.kind() != TransportErrorKind::Timeout {
+                    return Poll::Ready(Err(err));
+                }
+            }
+            None => {}
+        }
+        return Poll::Ready(Ok(PumpProgress::Continue));
+    }
+
+    if let Poll::Ready(res) = interrupt_out.poll_unpin(cx) {
+        if let Some((reply, result)) = res {
+            if let Err(ref err) = result {
+                tracing::warn!(%err, "pump: interrupt-out failed");
+            } else {
+                tracing::trace!("pump: interrupt-out done");
+            }
+            let _ = reply.send(result);
+        }
+        return Poll::Ready(Ok(PumpProgress::Continue));
+    }
+
+    if let Poll::Ready(res) = bulk_in.poll_unpin(cx) {
+        if let Some((reply, result)) = res {
+            match &result {
+                Ok(buf) => tracing::trace!(bytes = buf.len(), "pump: bulk-in done"),
+                Err(err) => tracing::warn!(%err, "pump: bulk-in failed"),
+            }
+            let _ = reply.send(result);
+        }
+        return Poll::Ready(Ok(PumpProgress::Continue));
+    }
+
+    if let Poll::Ready(res) = bulk_out.poll_unpin(cx) {
+        if let Some((reply, result)) = res {
+            if let Err(ref err) = result {
+                tracing::warn!(%err, "pump: bulk-out failed");
+            } else {
+                tracing::trace!("pump: bulk-out done");
+            }
+            let _ = reply.send(result);
+        }
+        return Poll::Ready(Ok(PumpProgress::Continue));
+    }
+
+    if *cmd_closed
+        && interrupt_out_queue.is_empty()
+        && bulk_in_queue.is_empty()
+        && bulk_out_queue.is_empty()
+        && interrupt_out.is_terminated()
+        && bulk_in.is_terminated()
+        && bulk_out.is_terminated()
+    {
+        return Poll::Ready(Ok(PumpProgress::Finished(Ok(()))));
+    }
+
+    Poll::Pending
 }
 
 fn arm_interrupt_in<T>(transport: T) -> InterruptInFuture
@@ -316,6 +399,7 @@ where
         async move {
             let reply = op.reply;
             let len = op.buf.len();
+            tracing::trace!(bytes = len, "pump: bulk-out transport write start");
             let result = match transport.write_bulk(&op.buf).await {
                 Ok(written) if written == len => Ok(()),
                 Ok(written) => Err(protocol_error(format!(
@@ -323,6 +407,10 @@ where
                 ))),
                 Err(err) => Err(err),
             };
+            match &result {
+                Ok(_) => tracing::trace!("pump: bulk-out transport write done"),
+                Err(err) => tracing::warn!(%err, "pump: bulk-out transport write failed"),
+            }
             (reply, result)
         }
         .boxed(),

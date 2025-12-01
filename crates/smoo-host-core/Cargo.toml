@@ -7,7 +7,7 @@ license = "GPL-3.0-only"
 
 [features]
 default = ["std"]
-std = []
+std = ["futures-channel/std", "futures-util/std"]
 
 [dependencies]
 async-trait = "0.1.89"

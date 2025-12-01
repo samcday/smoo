@@ -246,6 +246,14 @@ where
     );
     if byte_len > 0 {
         let mut buf: Vec<u8> = vec![0u8; byte_len];
+        trace!(
+            request_id = request.request_id,
+            export_id = request.export_id,
+            lba = request.lba,
+            num_blocks = request.num_blocks,
+            bytes = byte_len,
+            "host: blocksource read_blocks start"
+        );
         let read = match source.read_blocks(request.lba, &mut buf).await {
             Ok(len) => len,
             Err(err) => return Ok(response_from_block_error(request, err)),
@@ -253,7 +261,30 @@ where
         if read != byte_len {
             return Ok(short_io_response(request));
         }
+        trace!(
+            request_id = request.request_id,
+            export_id = request.export_id,
+            lba = request.lba,
+            num_blocks = request.num_blocks,
+            bytes = read,
+            "host: blocksource read_blocks done"
+        );
+        trace!(
+            request_id = request.request_id,
+            export_id = request.export_id,
+            lba = request.lba,
+            num_blocks = request.num_blocks,
+            bytes = buf.len(),
+            "host: pump write_bulk start"
+        );
         pump.write_bulk(buf).await?;
+        trace!(
+            request_id = request.request_id,
+            export_id = request.export_id,
+            lba = request.lba,
+            num_blocks = request.num_blocks,
+            "host: pump write_bulk done"
+        );
     }
     trace!(
         request_id = request.request_id,
@@ -295,7 +326,31 @@ where
         "host: handling write"
     );
     if byte_len > 0 {
+        trace!(
+            request_id = request.request_id,
+            export_id = request.export_id,
+            lba = request.lba,
+            num_blocks = request.num_blocks,
+            bytes = byte_len,
+            "host: pump read_bulk start"
+        );
         let buf = pump.read_bulk(byte_len).await?;
+        trace!(
+            request_id = request.request_id,
+            export_id = request.export_id,
+            lba = request.lba,
+            num_blocks = request.num_blocks,
+            bytes = buf.len(),
+            "host: pump read_bulk done"
+        );
+        trace!(
+            request_id = request.request_id,
+            export_id = request.export_id,
+            lba = request.lba,
+            num_blocks = request.num_blocks,
+            bytes = buf.len(),
+            "host: blocksource write_blocks start"
+        );
         let written = match source.write_blocks(request.lba, &buf).await {
             Ok(len) => len,
             Err(err) => return Ok(response_from_block_error(request, err)),
@@ -303,6 +358,14 @@ where
         if written != byte_len {
             return Ok(short_io_response(request));
         }
+        trace!(
+            request_id = request.request_id,
+            export_id = request.export_id,
+            lba = request.lba,
+            num_blocks = request.num_blocks,
+            bytes = written,
+            "host: blocksource write_blocks done"
+        );
     }
     trace!(
         request_id = request.request_id,

@@ -335,7 +335,6 @@ impl ControlTransport for NusbTransport {
 impl Transport for NusbTransport {
     async fn read_interrupt(&self, buf: &mut [u8]) -> TransportResult<usize> {
         let mut reader = self.interrupt_in.lock().await;
-        reader.set_read_timeout(self.timeout);
         reader
             .read_exact(buf)
             .await
