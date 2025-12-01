@@ -7,9 +7,8 @@ use smoo_host_blocksources::file::FileBlockSource;
 use smoo_host_blocksources::random::RandomBlockSource;
 use smoo_host_core::{
     control::{fetch_ident, read_status, send_config_exports_v0, ConfigExportsV0},
-    derive_export_id_from_source, BlockSource, BlockSourceHandle, BlockSourceResult,
-    ExportIdentity, HostErrorKind, SmooHost, TransportError, TransportErrorKind,
-    start_host_io_pump,
+    derive_export_id_from_source, start_host_io_pump, BlockSource, BlockSourceHandle,
+    BlockSourceResult, ExportIdentity, HostErrorKind, SmooHost, TransportError, TransportErrorKind,
 };
 use smoo_host_transport_nusb::{NusbControl, NusbTransport};
 use smoo_proto::SmooStatusV0;

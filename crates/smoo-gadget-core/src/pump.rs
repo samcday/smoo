@@ -28,15 +28,22 @@ struct IoCommand {
 /// Single-owner handle to the background I/O pump.
 pub struct IoPumpHandle {
     tx: mpsc::Sender<IoCommand>,
-    join: JoinHandle<()>,
+}
+
+impl Clone for IoPumpHandle {
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+        }
+    }
 }
 
 impl IoPumpHandle {
     /// Spawn a pump bound to the provided gadget and channel capacity.
-    pub fn spawn(gadget: Arc<SmooGadget>, capacity: usize) -> Self {
+    pub fn spawn(gadget: Arc<SmooGadget>, capacity: usize) -> (Self, JoinHandle<()>) {
         let (tx, rx) = mpsc::channel(capacity);
         let join = tokio::spawn(run_pump(gadget, rx));
-        Self { tx, join }
+        (Self { tx }, join)
     }
 
     /// Submit a work item and await its completion.
@@ -47,14 +54,6 @@ impl IoPumpHandle {
             .await
             .map_err(|_| anyhow!("io pump stopped"))?;
         rx.await.map_err(|_| anyhow!("io pump dropped result"))?
-    }
-
-    /// Stop the pump and wait for it to exit.
-    pub async fn shutdown(self) {
-        let IoPumpHandle { tx, join } = self;
-        drop(tx);
-        join.abort();
-        let _ = join.await;
     }
 }
 

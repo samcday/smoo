@@ -1,7 +1,7 @@
 use anyhow::{anyhow, ensure, Context, Result};
 use clap::{Parser, ValueEnum};
 use smoo_gadget_core::{
-    ConfigExport, ConfigExportsV0, ControlIo, DeviceHandle, DmaHeap, ExportController, ExportFlags,
+    ConfigExport, ConfigExportsV0, ControlIo, DmaHeap, ExportController, ExportFlags,
     ExportReconcileContext, ExportSpec, ExportState, FunctionfsEndpoints, GadgetConfig,
     GadgetControl, GadgetStatusReport, IoPumpHandle, IoWork, LinkCommand, LinkController,
     LinkState, PersistedExportRecord, RuntimeTunables, SetupCommand, SetupPacket, SmooGadget,
@@ -9,19 +9,26 @@ use smoo_gadget_core::{
 };
 use smoo_proto::{Ident, OpCode, Request, Response, SMOO_STATUS_REQUEST, SMOO_STATUS_REQ_TYPE};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs::File,
     io,
     os::fd::{FromRawFd, IntoRawFd, OwnedFd},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 use tokio::{
     io::AsyncReadExt,
     signal,
     signal::unix::{signal as unix_signal, SignalKind},
-    sync::{mpsc, watch, Mutex, RwLock},
+    sync::{
+        mpsc,
+        mpsc::error::{TryRecvError, TrySendError},
+        watch, Mutex, Notify, RwLock,
+    },
     task::JoinHandle,
 };
 use tracing::{debug, info, trace, warn};
@@ -38,6 +45,15 @@ const SMOO_CLASS: u8 = 0xFF;
 const SMOO_SUBCLASS: u8 = 0x53;
 const SMOO_PROTOCOL: u8 = 0x4D;
 const DEFAULT_MAX_IO_BYTES: usize = 4 * 1024 * 1024;
+const CONFIG_CHANNEL_DEPTH: usize = 32;
+const QUEUE_CHANNEL_DEPTH: usize = 128;
+const QUEUE_BATCH_MAX: usize = 32;
+const OUTSTANDING_BATCH_MAX: usize = 32;
+const IDLE_INTERVAL_MS: u64 = 10;
+const LIVENESS_INTERVAL_MS: u64 = 500;
+const MAINTENANCE_SLICE_MS: u64 = 200;
+const RECONCILE_TIMEOUT_MS: u64 = 200;
+const GRACEFUL_SHUTDOWN_TIMEOUT_MS: u64 = 5_000;
 
 #[derive(Debug, Parser)]
 #[command(name = "smoo-gadget-cli", version)]
@@ -140,7 +156,8 @@ async fn main() -> Result<()> {
     );
 
     let control_handler = gadget.control_handler();
-    let (control_tx, control_rx) = mpsc::channel(8);
+    let (control_tx, control_rx) = mpsc::channel(CONFIG_CHANNEL_DEPTH);
+    let (control_stop_tx, control_stop_rx) = watch::channel(false);
 
     let exports = build_initial_exports(&state_store);
     let initial_export_count = count_active_exports(&exports);
@@ -148,10 +165,13 @@ async fn main() -> Result<()> {
         state_store.session_id(),
         initial_export_count,
     ));
+    let ep0_signals = Ep0Signals::new();
     let control_task = tokio::spawn(control_loop(
         custom,
         control_handler,
         status.clone(),
+        ep0_signals.clone(),
+        control_stop_rx,
         control_tx,
     ));
     let tunables = RuntimeTunables {
@@ -170,11 +190,22 @@ async fn main() -> Result<()> {
         tunables,
         gadget: Some(gadget),
         io_pump: None,
+        io_pump_task: None,
         io_pump_capacity,
         gadget_config,
         ffs_dir,
+        reconcile_queue: VecDeque::new(),
     };
-    let result = run_event_loop(&mut ublk, runtime, control_rx, link).await;
+    let result = run_event_loop(
+        &mut ublk,
+        runtime,
+        control_rx,
+        link,
+        ep0_signals,
+        control_stop_tx.clone(),
+    )
+    .await;
+    let _ = control_stop_tx.send(true);
     control_task.abort();
     let _ = control_task.await;
     result
@@ -222,6 +253,54 @@ impl GadgetStatusShared {
     }
 }
 
+#[derive(Clone)]
+struct Ep0Signals {
+    status_seq: Arc<AtomicU64>,
+    lifecycle_seq: Arc<AtomicU64>,
+    lifecycle: Arc<Mutex<Vec<Event<'static>>>>,
+    notify: Arc<Notify>,
+}
+
+impl Ep0Signals {
+    fn new() -> Self {
+        Self {
+            status_seq: Arc::new(AtomicU64::new(0)),
+            lifecycle_seq: Arc::new(AtomicU64::new(0)),
+            lifecycle: Arc::new(Mutex::new(Vec::new())),
+            notify: Arc::new(Notify::new()),
+        }
+    }
+
+    fn status_seq(&self) -> u64 {
+        self.status_seq.load(Ordering::Relaxed)
+    }
+
+    fn lifecycle_seq(&self) -> u64 {
+        self.lifecycle_seq.load(Ordering::Relaxed)
+    }
+
+    fn mark_status_ping(&self) {
+        self.status_seq.fetch_add(1, Ordering::Relaxed);
+        self.notify.notify_waiters();
+    }
+
+    async fn push_lifecycle(&self, event: Event<'static>) {
+        let mut guard = self.lifecycle.lock().await;
+        guard.push(event);
+        self.lifecycle_seq.fetch_add(1, Ordering::Relaxed);
+        self.notify.notify_waiters();
+    }
+
+    async fn take_lifecycle(&self) -> Vec<Event<'static>> {
+        let mut guard = self.lifecycle.lock().await;
+        guard.drain(..).collect()
+    }
+
+    fn notifier(&self) -> Arc<Notify> {
+        self.notify.clone()
+    }
+}
+
 struct RuntimeState {
     state_store: StateStore,
     status: GadgetStatusShared,
@@ -230,9 +309,11 @@ struct RuntimeState {
     tunables: RuntimeTunables,
     gadget: Option<Arc<SmooGadget>>,
     io_pump: Option<IoPumpHandle>,
+    io_pump_task: Option<JoinHandle<()>>,
     io_pump_capacity: usize,
     gadget_config: GadgetConfig,
     ffs_dir: PathBuf,
+    reconcile_queue: VecDeque<u32>,
 }
 
 impl RuntimeState {
@@ -245,7 +326,7 @@ impl RuntimeState {
     }
 }
 
-type QueueSender = mpsc::UnboundedSender<QueueEvent>;
+type QueueSender = mpsc::Sender<QueueEvent>;
 
 struct QueueTaskSet {
     stop: watch::Sender<bool>,
@@ -257,6 +338,13 @@ impl QueueTaskSet {
         let _ = self.stop.send(true);
         for handle in self.handles {
             let _ = handle.await;
+        }
+    }
+
+    fn abort(self) {
+        let _ = self.stop.send(true);
+        for handle in self.handles {
+            handle.abort();
         }
     }
 }
@@ -290,10 +378,21 @@ struct InflightRequest {
     block_size: usize,
 }
 
-enum ControlMessage {
-    Config(ConfigExportsV0),
-    Ep0Event(Event<'static>),
-    StatusPing,
+async fn take_inflight_entry(
+    inflight: &Arc<Mutex<HashMap<u32, HashMap<u32, InflightRequest>>>>,
+    export_id: u32,
+    request_id: u32,
+) -> Option<InflightRequest> {
+    let mut guard = inflight.lock().await;
+    let entry = guard
+        .get_mut(&export_id)
+        .and_then(|map| map.remove(&request_id));
+    if let Some(map) = guard.get(&export_id) {
+        if map.is_empty() {
+            guard.remove(&export_id);
+        }
+    }
+    entry
 }
 
 fn build_initial_exports(state_store: &StateStore) -> HashMap<u32, ExportController> {
@@ -316,41 +415,6 @@ fn build_initial_exports(state_store: &StateStore) -> HashMap<u32, ExportControl
         );
     }
     exports
-}
-
-async fn reconcile_exports(ublk: &mut SmooUblk, runtime: &mut RuntimeState) -> Result<()> {
-    let RuntimeState {
-        state_store,
-        exports,
-        tunables,
-        ..
-    } = runtime;
-    let tunables = *tunables;
-    let now = Instant::now();
-    for controller in exports
-        .values_mut()
-        .filter(|ctrl| ctrl.needs_reconcile(now))
-    {
-        trace!(
-            export_id = controller.export_id,
-            state = export_state_tag(controller),
-            dev_id = controller.dev_id(),
-            "reconcile begin"
-        );
-        let mut cx = ExportReconcileContext {
-            ublk,
-            state_store,
-            tunables,
-        };
-        controller.reconcile(&mut cx).await?;
-        trace!(
-            export_id = controller.export_id,
-            state = export_state_tag(controller),
-            dev_id = controller.dev_id(),
-            "reconcile end"
-        );
-    }
-    Ok(())
 }
 
 fn spawn_queue_tasks(
@@ -392,13 +456,23 @@ async fn queue_task_loop(
             req = queues.next_io(queue_id) => {
                 match req {
                     Ok(request) => {
-                        if tx.send(QueueEvent::Request { export_id, dev_id, request, queues: queues.clone() }).is_err() {
-                            break;
+                        let send_fut = tx.send(QueueEvent::Request { export_id, dev_id, request, queues: queues.clone() });
+                        tokio::select! {
+                            res = send_fut => {
+                                if res.is_err() {
+                                    break;
+                                }
+                            }
+                            _ = stop.changed() => break,
                         }
                     }
                     Err(err) => {
                         if !*stop.borrow() {
-                            let _ = tx.send(QueueEvent::QueueError { export_id, dev_id, error: err });
+                            let send_fut = tx.send(QueueEvent::QueueError { export_id, dev_id, error: err });
+                            let _ = tokio::select! {
+                                res = send_fut => res,
+                                _ = stop.changed() => Ok(()),
+                            };
                         }
                         break;
                     }
@@ -442,130 +516,552 @@ async fn sync_queue_tasks(runtime: &mut RuntimeState, queue_tx: &QueueSender) {
     }
 }
 
+async fn stop_all_queue_tasks(runtime: &mut RuntimeState) {
+    let mut tasks = std::mem::take(&mut runtime.queue_tasks);
+    for (_, taskset) in tasks.drain() {
+        taskset.shutdown().await;
+    }
+}
+
+async fn ensure_data_plane(
+    runtime: &mut RuntimeState,
+    inflight: &Arc<Mutex<HashMap<u32, HashMap<u32, InflightRequest>>>>,
+    response_task: &mut Option<JoinHandle<()>>,
+) {
+    if runtime.gadget.is_none() {
+        if let Some(pump) = runtime.io_pump.take() {
+            drop(pump);
+        }
+        if let Some(task) = runtime.io_pump_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        if let Some(handle) = response_task.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+        drain_inflight(inflight).await;
+        return;
+    }
+
+    if runtime.io_pump.is_none() {
+        if let Some(gadget) = runtime.gadget.clone() {
+            let (handle, task) = IoPumpHandle::spawn(gadget, runtime.io_pump_capacity);
+            runtime.io_pump = Some(handle);
+            runtime.io_pump_task = Some(task);
+        }
+    }
+    if response_task.is_none() {
+        if let Some(gadget) = runtime.gadget.clone() {
+            let inflight_map = inflight.clone();
+            let interrupt_out = gadget.response_reader();
+            *response_task = Some(tokio::spawn(response_loop(interrupt_out, inflight_map)));
+        }
+    }
+}
+
+async fn drain_ep0_signals(
+    ep0_signals: &Ep0Signals,
+    last_status_seq: &mut u64,
+    last_lifecycle_seq: &mut u64,
+    link: &mut LinkController,
+) {
+    let status_seq = ep0_signals.status_seq();
+    if status_seq != *last_status_seq {
+        *last_status_seq = status_seq;
+        link.on_status_ping();
+    }
+    if ep0_signals.lifecycle_seq() != *last_lifecycle_seq {
+        let events = ep0_signals.take_lifecycle().await;
+        *last_lifecycle_seq = ep0_signals.lifecycle_seq();
+        for event in events {
+            link.on_ep0_event(event);
+        }
+    }
+}
+
+async fn drain_queue_batch(
+    runtime: &mut RuntimeState,
+    link: &mut LinkController,
+    inflight: &Arc<Mutex<HashMap<u32, HashMap<u32, InflightRequest>>>>,
+    outstanding: &mut HashMap<u32, HashMap<(u16, u16), OutstandingRequest>>,
+    queue_rx: &mut mpsc::Receiver<QueueEvent>,
+) -> Result<()> {
+    let mut processed = 0;
+    while processed < QUEUE_BATCH_MAX.saturating_sub(1) {
+        match queue_rx.try_recv() {
+            Ok(evt) => {
+                handle_queue_event(runtime, link, inflight, outstanding, evt).await?;
+                processed += 1;
+            }
+            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+        }
+    }
+    if processed >= QUEUE_BATCH_MAX.saturating_sub(1) {
+        trace!(processed, "queue batch truncated; will continue next tick");
+    }
+    Ok(())
+}
+
+fn pop_next_outstanding(
+    outstanding: &mut HashMap<u32, HashMap<(u16, u16), OutstandingRequest>>,
+) -> Option<(u32, u16, u16, OutstandingRequest)> {
+    let (export_id, (queue_id, tag)) = outstanding.iter().find_map(|(export_id, reqs)| {
+        reqs.keys()
+            .next()
+            .map(|(queue, tag)| (*export_id, (*queue, *tag)))
+    })?;
+    let pending = outstanding
+        .get_mut(&export_id)
+        .and_then(|map| map.remove(&(queue_id, tag)))?;
+    if let Some(map) = outstanding.get(&export_id) {
+        if map.is_empty() {
+            outstanding.remove(&export_id);
+        }
+    }
+    Some((export_id, queue_id, tag, pending))
+}
+
+async fn drain_outstanding_bounded(
+    runtime: &mut RuntimeState,
+    link: &mut LinkController,
+    inflight: &Arc<Mutex<HashMap<u32, HashMap<u32, InflightRequest>>>>,
+    outstanding: &mut HashMap<u32, HashMap<(u16, u16), OutstandingRequest>>,
+    deadline: Instant,
+) -> Result<()> {
+    if outstanding.is_empty() {
+        return Ok(());
+    }
+    if link.state() != LinkState::Online {
+        trace!(
+            outstanding_exports = outstanding.len(),
+            "link not online; deferring outstanding IO drain"
+        );
+        return Ok(());
+    }
+    let Some(pump) = runtime.io_pump.as_ref() else {
+        trace!(
+            outstanding_exports = outstanding.len(),
+            "no gadget endpoints available; deferring outstanding IO drain"
+        );
+        return Ok(());
+    };
+
+    let mut processed = 0usize;
+    while processed < OUTSTANDING_BATCH_MAX && Instant::now() < deadline {
+        let Some((export_id, _queue_id, _tag, pending)) = pop_next_outstanding(outstanding) else {
+            break;
+        };
+        let Some(ctrl) = runtime.exports.get(&export_id) else {
+            let _ = pending.queues.complete_io(pending.request, -libc::ENODEV);
+            continue;
+        };
+        let Some(handle) = ctrl.device_handle() else {
+            park_request(
+                outstanding,
+                export_id,
+                pending.dev_id,
+                pending.queues.clone(),
+                pending.request,
+            );
+            break;
+        };
+        if handle.dev_id() != pending.dev_id {
+            trace!(
+                export_id,
+                stale_dev = pending.dev_id,
+                current_dev = handle.dev_id(),
+                "dropping outstanding for stale device"
+            );
+            continue;
+        }
+        if !handle.is_online() {
+            park_request(
+                outstanding,
+                export_id,
+                pending.dev_id,
+                pending.queues.clone(),
+                pending.request,
+            );
+            break;
+        }
+        let Some(queues) = handle.queues() else {
+            park_request(
+                outstanding,
+                export_id,
+                pending.dev_id,
+                pending.queues.clone(),
+                pending.request,
+            );
+            break;
+        };
+        let req = pending.request;
+        trace!(
+            export_id,
+            dev_id = pending.dev_id,
+            queue = req.queue_id,
+            tag = req.tag,
+            "replaying outstanding IO to host"
+        );
+        if let Err(err) =
+            handle_request(pump.clone(), inflight, export_id, queues.clone(), req).await
+        {
+            let io_err = io_error_from_anyhow(&err);
+            link.on_io_error(&io_err);
+            park_request(
+                outstanding,
+                export_id,
+                pending.dev_id,
+                pending.queues.clone(),
+                req,
+            );
+            warn!(
+                export_id,
+                queue = req.queue_id,
+                tag = req.tag,
+                error = ?err,
+                "link error replaying outstanding IO; parked again"
+            );
+            break;
+        }
+        processed += 1;
+    }
+
+    if !outstanding.is_empty() {
+        trace!(
+            remaining_exports = outstanding.len(),
+            processed,
+            "outstanding drain truncated"
+        );
+    }
+    Ok(())
+}
+
+async fn run_reconcile_slice(
+    ublk: &mut SmooUblk,
+    runtime: &mut RuntimeState,
+    deadline: Instant,
+) -> Result<()> {
+    let now = Instant::now();
+    for (&export_id, ctrl) in runtime.exports.iter() {
+        if ctrl.needs_reconcile(now) && !runtime.reconcile_queue.contains(&export_id) {
+            runtime.reconcile_queue.push_back(export_id);
+        }
+    }
+
+    while Instant::now() < deadline {
+        let Some(export_id) = runtime.reconcile_queue.pop_front() else {
+            break;
+        };
+        let now = Instant::now();
+        let needs_reconcile = runtime
+            .exports
+            .get(&export_id)
+            .is_some_and(|ctrl| ctrl.needs_reconcile(now));
+        if !needs_reconcile {
+            continue;
+        }
+
+        let tunables = runtime.tunables;
+        let mut controller = match runtime.exports.remove(&export_id) {
+            Some(ctrl) => ctrl,
+            None => continue,
+        };
+        {
+            let mut cx = ExportReconcileContext {
+                ublk,
+                state_store: runtime.state_store(),
+                tunables,
+            };
+            match tokio::time::timeout(
+                Duration::from_millis(RECONCILE_TIMEOUT_MS),
+                controller.reconcile(&mut cx),
+            )
+            .await
+            {
+                Ok(res) => res?,
+                Err(_) => {
+                    warn!(export_id, "reconcile timed out; backing off");
+                    controller.fail_device("reconcile timed out".to_string());
+                }
+            }
+        }
+        let needs_more = controller.needs_reconcile(Instant::now());
+        runtime.exports.insert(export_id, controller);
+        if needs_more {
+            runtime.reconcile_queue.push_back(export_id);
+        }
+
+        if Instant::now() >= deadline {
+            break;
+        }
+    }
+    Ok(())
+}
+
+async fn drive_runtime(
+    ublk: &mut SmooUblk,
+    runtime: &mut RuntimeState,
+    link: &mut LinkController,
+    inflight: &Arc<Mutex<HashMap<u32, HashMap<u32, InflightRequest>>>>,
+    outstanding: &mut HashMap<u32, HashMap<(u16, u16), OutstandingRequest>>,
+    queue_tx: Option<&QueueSender>,
+    response_task: &mut Option<JoinHandle<()>>,
+    allow_reconcile: bool,
+) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_millis(MAINTENANCE_SLICE_MS);
+    link.tick(Instant::now());
+    process_link_commands(runtime, link).await?;
+    ensure_data_plane(runtime, inflight, response_task).await;
+    if let Some(tx) = queue_tx {
+        sync_queue_tasks(runtime, tx).await;
+    }
+    drain_outstanding_bounded(runtime, link, inflight, outstanding, deadline).await?;
+    if allow_reconcile {
+        run_reconcile_slice(ublk, runtime, deadline).await?;
+    }
+    let active_count = count_active_exports(&runtime.exports);
+    runtime.status().set_export_count(active_count).await;
+    Ok(())
+}
+
+async fn handle_config_message(
+    ublk: &mut SmooUblk,
+    runtime: &mut RuntimeState,
+    link: &mut LinkController,
+    outstanding: &mut HashMap<u32, HashMap<(u16, u16), OutstandingRequest>>,
+    config: ConfigExportsV0,
+) -> Result<()> {
+    apply_config(ublk, runtime, config).await?;
+    prune_outstanding_for_missing_exports(outstanding, &runtime.exports);
+    process_link_commands(runtime, link).await?;
+    Ok(())
+}
+
+async fn stop_accepting_new_io(runtime: &mut RuntimeState, queue_tx: &mut Option<QueueSender>) {
+    stop_all_queue_tasks(runtime).await;
+    *queue_tx = None;
+}
+
+enum ShutdownState {
+    Running,
+    Graceful { deadline: Instant },
+    Forceful,
+}
+
 async fn run_event_loop(
     ublk: &mut SmooUblk,
     mut runtime: RuntimeState,
-    mut control_rx: mpsc::Receiver<ControlMessage>,
+    mut control_rx: mpsc::Receiver<ConfigExportsV0>,
     mut link: LinkController,
+    ep0_signals: Ep0Signals,
+    control_stop: watch::Sender<bool>,
 ) -> Result<()> {
-    let shutdown = signal::ctrl_c();
-    tokio::pin!(shutdown);
-    let idle_sleep = tokio::time::sleep(Duration::from_millis(10));
-    tokio::pin!(idle_sleep);
-    let mut liveness_tick = tokio::time::interval(Duration::from_millis(500));
-    let mut outstanding: HashMap<u32, HashMap<(u16, u16), OutstandingRequest>> = HashMap::new();
+    let mut shutdown = Some(Box::pin(signal::ctrl_c()));
     let mut hup = unix_signal(SignalKind::hangup()).context("install SIGHUP handler")?;
-    let (queue_tx, mut queue_rx) = mpsc::unbounded_channel::<QueueEvent>();
+    let idle_sleep = tokio::time::sleep(Duration::from_millis(IDLE_INTERVAL_MS));
+    tokio::pin!(idle_sleep);
+    let mut liveness_tick = tokio::time::interval(Duration::from_millis(LIVENESS_INTERVAL_MS));
+    liveness_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    let mut io_error = None;
-    let mut recovery_exit = false;
+    let mut outstanding: HashMap<u32, HashMap<(u16, u16), OutstandingRequest>> = HashMap::new();
+    let (queue_tx_init, mut queue_rx) = mpsc::channel::<QueueEvent>(QUEUE_CHANNEL_DEPTH);
+    let mut queue_tx: Option<QueueSender> = Some(queue_tx_init);
     let inflight: Arc<Mutex<HashMap<u32, HashMap<u32, InflightRequest>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let mut response_task: Option<JoinHandle<()>> = None;
+    let ep0_notify = ep0_signals.notifier();
+
+    let mut io_error = None;
+    let mut recovery_exit = false;
+    let mut shutdown_state = ShutdownState::Running;
+    let mut last_status_seq = ep0_signals.status_seq();
+    let mut last_lifecycle_seq = ep0_signals.lifecycle_seq();
+
     loop {
         idle_sleep
             .as_mut()
-            .reset(tokio::time::Instant::now() + Duration::from_millis(10));
-        let now = Instant::now();
-        link.tick(now);
-        process_link_commands(&mut runtime, &mut link).await?;
-        drain_outstanding(&mut runtime, &mut link, &inflight, &mut outstanding).await?;
-        let reconcile_needed = runtime
-            .exports
-            .values()
-            .any(|ctrl| ctrl.needs_reconcile(now));
-        if reconcile_needed {
-            reconcile_exports(ublk, &mut runtime).await?;
-        }
-        sync_queue_tasks(&mut runtime, &queue_tx).await;
-        if runtime.gadget.is_none() {
-            if let Some(pump) = runtime.io_pump.take() {
-                pump.shutdown().await;
-            }
-            if let Some(handle) = response_task.take() {
-                handle.abort();
-            }
-            drain_inflight(&inflight).await;
-        } else {
-            if runtime.io_pump.is_none() {
-                if let Some(gadget) = runtime.gadget.clone() {
-                    runtime.io_pump = Some(IoPumpHandle::spawn(gadget, runtime.io_pump_capacity));
-                }
-            }
-            if response_task.is_none() {
-                if let Some(gadget) = runtime.gadget.clone() {
-                    let inflight_map = inflight.clone();
-                    let interrupt_out = gadget.response_reader();
-                    response_task = Some(tokio::spawn(response_loop(interrupt_out, inflight_map)));
-                }
-            }
-        }
-        let active_count = count_active_exports(&runtime.exports);
-        runtime.status().set_export_count(active_count).await;
+            .reset(tokio::time::Instant::now() + Duration::from_millis(IDLE_INTERVAL_MS));
 
-        tokio::select! {
-            _ = &mut shutdown => {
-                info!("shutdown signal received");
-                break;
+        drain_ep0_signals(
+            &ep0_signals,
+            &mut last_status_seq,
+            &mut last_lifecycle_seq,
+            &mut link,
+        )
+        .await;
+        process_link_commands(&mut runtime, &mut link).await?;
+
+        if let ShutdownState::Graceful { deadline } = shutdown_state {
+            if Instant::now() >= deadline {
+                warn!("graceful shutdown timed out; forcing shutdown");
+                shutdown_state = ShutdownState::Forceful;
+            }
+        }
+
+        if matches!(shutdown_state, ShutdownState::Forceful) {
+            break;
+        }
+
+        let ep0_notified = ep0_notify.notified();
+        tokio::pin!(ep0_notified);
+        tokio::select! { biased;
+            _ = async {
+                if let Some(fut) = shutdown.as_mut() {
+                    let _ = fut.as_mut().await;
+                }
+            }, if shutdown.is_some() => {
+                shutdown = None;
+                match shutdown_state {
+                    ShutdownState::Running => {
+                        info!("shutdown signal received; entering graceful shutdown");
+                        shutdown_state = ShutdownState::Graceful {
+                            deadline: Instant::now() + Duration::from_millis(GRACEFUL_SHUTDOWN_TIMEOUT_MS),
+                        };
+                        stop_accepting_new_io(&mut runtime, &mut queue_tx).await;
+                        let _ = control_stop.send(true);
+                    }
+                    ShutdownState::Graceful { .. } => {
+                        warn!("second shutdown signal; forcing shutdown");
+                        shutdown_state = ShutdownState::Forceful;
+                        break;
+                    }
+                    ShutdownState::Forceful => break,
+                }
             }
             Some(_) = hup.recv() => {
                 info!("SIGHUP received; initiating user recovery");
+                let _ = control_stop.send(true);
                 begin_user_recovery(ublk, &mut runtime).await?;
                 recovery_exit = true;
                 break;
             }
+            Some(config) = control_rx.recv(), if matches!(shutdown_state, ShutdownState::Running) => {
+                if let Err(err) = handle_config_message(ublk, &mut runtime, &mut link, &mut outstanding, config).await {
+                    warn!(error = ?err, "CONFIG_EXPORTS application failed");
+                }
+            }
+            maybe_evt = queue_rx.recv(), if !matches!(shutdown_state, ShutdownState::Forceful) => {
+                match maybe_evt {
+                    Some(evt) => {
+                        if let Err(err) = handle_queue_event(&mut runtime, &mut link, &inflight, &mut outstanding, evt).await {
+                            io_error = Some(err);
+                            break;
+                        }
+                        if let Err(err) = drain_queue_batch(&mut runtime, &mut link, &inflight, &mut outstanding, &mut queue_rx).await {
+                            io_error = Some(err);
+                            break;
+                        }
+                        if let Err(err) = drive_runtime(
+                            ublk,
+                            &mut runtime,
+                            &mut link,
+                            &inflight,
+                            &mut outstanding,
+                            queue_tx.as_ref(),
+                            &mut response_task,
+                            false,
+                        ).await {
+                            io_error = Some(err);
+                            break;
+                        }
+                    }
+                    None => {}
+                }
+            }
+            _ = ep0_notified.as_mut() => {
+                continue;
+            }
             _ = liveness_tick.tick() => {
-                link.tick(Instant::now());
-                // trace!(state = ?link.state(), outstanding_exports = outstanding.len(), "liveness tick");
-                process_link_commands(&mut runtime, &mut link).await?;
-                drain_outstanding(&mut runtime, &mut link, &inflight, &mut outstanding).await?;
-                sync_queue_tasks(&mut runtime, &queue_tx).await;
-            }
-            maybe_msg = control_rx.recv() => {
-                if let Some(msg) = maybe_msg {
-                    let was_config = matches!(msg, ControlMessage::Config(_));
-                    process_control_message(msg, ublk, &mut runtime, &mut link).await?;
-                    if was_config {
-                        prune_outstanding_for_missing_exports(&mut outstanding, &runtime.exports);
-                    }
-                    process_link_commands(&mut runtime, &mut link).await?;
-                    drain_outstanding(&mut runtime, &mut link, &inflight, &mut outstanding).await?;
-                    sync_queue_tasks(&mut runtime, &queue_tx).await;
-                } else {
+                if let Err(err) = drive_runtime(
+                    ublk,
+                    &mut runtime,
+                    &mut link,
+                    &inflight,
+                    &mut outstanding,
+                    queue_tx.as_ref(),
+                    &mut response_task,
+                    false,
+                ).await {
+                    io_error = Some(err);
                     break;
                 }
             }
-            maybe_evt = queue_rx.recv() => {
-                if let Some(evt) = maybe_evt {
-                    if let Err(err) =
-                        handle_queue_event(&mut runtime, &mut link, &inflight, &mut outstanding, evt)
-                            .await
-                    {
-                        io_error = Some(err);
-                        break;
-                    }
-                } else {
+            _ = &mut idle_sleep => {
+                let allow_reconcile = matches!(shutdown_state, ShutdownState::Running);
+                if let Err(err) = drive_runtime(
+                    ublk,
+                    &mut runtime,
+                    &mut link,
+                    &inflight,
+                    &mut outstanding,
+                    queue_tx.as_ref(),
+                    &mut response_task,
+                    allow_reconcile,
+                ).await {
+                    io_error = Some(err);
                     break;
                 }
             }
-            _ = &mut idle_sleep => {}
+        }
+
+        if let ShutdownState::Graceful { deadline } = shutdown_state {
+            if let Err(err) = drive_runtime(
+                ublk,
+                &mut runtime,
+                &mut link,
+                &inflight,
+                &mut outstanding,
+                queue_tx.as_ref(),
+                &mut response_task,
+                false,
+            )
+            .await
+            {
+                io_error = Some(err);
+                break;
+            }
+            let inflight_empty = inflight.lock().await.is_empty();
+            let outstanding_empty = outstanding.is_empty();
+            let queue_drained = queue_rx.is_closed() && queue_rx.is_empty();
+            if inflight_empty && outstanding_empty && queue_drained {
+                info!("graceful shutdown complete; exiting");
+                break;
+            }
+            if Instant::now() >= deadline {
+                warn!("graceful shutdown deadline reached; forcing shutdown");
+                shutdown_state = ShutdownState::Forceful;
+                shutdown = None;
+            }
         }
     }
 
     if let Some(pump) = runtime.io_pump.take() {
-        pump.shutdown().await;
+        drop(pump);
+    }
+    if let Some(task) = runtime.io_pump_task.take() {
+        task.abort();
+        let _ = task.await;
     }
     if let Some(handle) = response_task.take() {
         handle.abort();
+        let _ = handle.await;
     }
+    drain_inflight(&inflight).await;
 
     if recovery_exit {
         return Ok(());
     }
-    cleanup_ublk_devices(ublk, &mut runtime).await?;
+
+    let _ = control_stop.send(true);
+    cleanup_ublk_devices(
+        ublk,
+        &mut runtime,
+        matches!(shutdown_state, ShutdownState::Forceful),
+    )
+    .await?;
     runtime.status().set_export_count(0).await;
 
-    // Clean shutdown: remove the state file after teardown to avoid retaining stale session info.
     if let Err(err) = runtime.state_store().remove_file() {
         warn!(error = ?err, "failed to remove state file on shutdown");
     } else {
@@ -580,7 +1076,7 @@ async fn run_event_loop(
 }
 
 async fn handle_request(
-    pump: &IoPumpHandle,
+    pump: IoPumpHandle,
     inflight: &Arc<Mutex<HashMap<u32, HashMap<u32, InflightRequest>>>>,
     export_id: u32,
     queues: Arc<UblkQueueRuntime>,
@@ -680,20 +1176,29 @@ async fn handle_request(
         "queueing smoo Request through pump"
     );
 
-    if let Err(err) = pump
-        .submit(IoWork {
+    let inflight_map = inflight.clone();
+    tokio::spawn(async move {
+        let work = IoWork {
             request: proto_req,
             req_len,
             queue_id: req.queue_id,
             tag: req.tag,
             op: opcode,
             queues: queues.clone(),
-        })
-        .await
-    {
-        drop_inflight_entry(inflight, export_id, request_id).await;
-        return Err(err);
-    }
+        };
+        if let Err(err) = pump.submit(work).await {
+            if let Some(entry) = take_inflight_entry(&inflight_map, export_id, request_id).await {
+                let _ = entry.queues.complete_io(entry.request, -libc::ENOLINK);
+            }
+            warn!(
+                export_id,
+                queue = req.queue_id,
+                tag = req.tag,
+                error = ?err,
+                "io pump error dispatching request"
+            );
+        }
+    });
 
     Ok(())
 }
@@ -702,38 +1207,45 @@ async fn control_loop(
     mut custom: Custom,
     handler: GadgetControl,
     status: GadgetStatusShared,
-    tx: mpsc::Sender<ControlMessage>,
+    signals: Ep0Signals,
+    mut stop: watch::Receiver<bool>,
+    tx: mpsc::Sender<ConfigExportsV0>,
 ) -> Result<()> {
     loop {
-        custom
-            .wait_event()
-            .await
-            .context("wait for FunctionFS event")?;
+        tokio::select! {
+            _ = stop.changed() => {
+                debug!("control loop stopping on shutdown signal");
+                return Ok(());
+            }
+            result = custom.wait_event() => {
+                result.context("wait for FunctionFS event")?;
+            }
+        }
         let event = custom.event().context("read FunctionFS event")?;
         match event {
             usb_gadget::function::custom::Event::Bind => {
                 debug!("FunctionFS bind event (control loop)");
-                let _ = tx.send(ControlMessage::Ep0Event(Event::Bind)).await;
+                signals.push_lifecycle(Event::Bind).await;
             }
             usb_gadget::function::custom::Event::Unbind => {
                 debug!("FunctionFS unbind event (control loop)");
-                let _ = tx.send(ControlMessage::Ep0Event(Event::Unbind)).await;
+                signals.push_lifecycle(Event::Unbind).await;
             }
             usb_gadget::function::custom::Event::Enable => {
                 debug!("FunctionFS enable event (control loop)");
-                let _ = tx.send(ControlMessage::Ep0Event(Event::Enable)).await;
+                signals.push_lifecycle(Event::Enable).await;
             }
             usb_gadget::function::custom::Event::Disable => {
                 debug!("FunctionFS disable event (control loop)");
-                let _ = tx.send(ControlMessage::Ep0Event(Event::Disable)).await;
+                signals.push_lifecycle(Event::Disable).await;
             }
             usb_gadget::function::custom::Event::Suspend => {
                 debug!("FunctionFS suspend event (control loop)");
-                let _ = tx.send(ControlMessage::Ep0Event(Event::Suspend)).await;
+                signals.push_lifecycle(Event::Suspend).await;
             }
             usb_gadget::function::custom::Event::Resume => {
                 debug!("FunctionFS resume event (control loop)");
-                let _ = tx.send(ControlMessage::Ep0Event(Event::Resume)).await;
+                signals.push_lifecycle(Event::Resume).await;
             }
             usb_gadget::function::custom::Event::SetupDeviceToHost(sender) => {
                 let report = status.report().await;
@@ -743,7 +1255,7 @@ async fn control_loop(
                     warn!(error = ?err, "vendor setup handling failed");
                     let _ = io.stall().await;
                 } else if is_status_setup(&setup) {
-                    let _ = tx.send(ControlMessage::StatusPing).await;
+                    signals.mark_status_ping();
                 }
             }
             usb_gadget::function::custom::Event::SetupHostToDevice(receiver) => {
@@ -751,14 +1263,18 @@ async fn control_loop(
                 let setup = setup_from_ctrl_req(receiver.ctrl_req());
                 let mut io = UsbControlIo::from_receiver(receiver);
                 match handler.handle_setup_packet(&mut io, setup, &report).await {
-                    Ok(Some(SetupCommand::Config(payload))) => {
-                        if tx.send(ControlMessage::Config(payload)).await.is_err() {
-                            anyhow::bail!("control channel closed");
+                    Ok(Some(SetupCommand::Config(payload))) => match tx.try_send(payload) {
+                        Ok(()) => {}
+                        Err(TrySendError::Closed(_)) => {
+                            warn!("CONFIG_EXPORTS channel closed; dropping payload");
                         }
-                    }
+                        Err(TrySendError::Full(_)) => {
+                            warn!("CONFIG_EXPORTS channel full; dropping payload");
+                        }
+                    },
                     Ok(None) => {
                         if is_status_setup(&setup) {
-                            let _ = tx.send(ControlMessage::StatusPing).await;
+                            signals.mark_status_ping();
                         }
                     }
                     Err(err) => {
@@ -880,20 +1396,6 @@ async fn response_loop(
         }
     }
     drain_inflight(&inflight).await;
-}
-
-async fn drop_inflight_entry(
-    inflight: &Arc<Mutex<HashMap<u32, HashMap<u32, InflightRequest>>>>,
-    export_id: u32,
-    request_id: u32,
-) {
-    let mut guard = inflight.lock().await;
-    if let Some(map) = guard.get_mut(&export_id) {
-        map.remove(&request_id);
-        if map.is_empty() {
-            guard.remove(&export_id);
-        }
-    }
 }
 
 fn request_byte_len(req: &UblkIoRequest, block_size: usize) -> io::Result<usize> {
@@ -1143,28 +1645,6 @@ fn count_active_exports(exports: &HashMap<u32, ExportController>) -> u32 {
         .count() as u32
 }
 
-async fn process_control_message(
-    msg: ControlMessage,
-    ublk: &mut SmooUblk,
-    runtime: &mut RuntimeState,
-    link: &mut LinkController,
-) -> Result<()> {
-    match msg {
-        ControlMessage::Config(config) => {
-            if let Err(err) = apply_config(ublk, runtime, config).await {
-                warn!(error = ?err, "CONFIG_EXPORTS application failed");
-            }
-        }
-        ControlMessage::Ep0Event(event) => {
-            link.on_ep0_event(event);
-        }
-        ControlMessage::StatusPing => {
-            link.on_status_ping();
-        }
-    }
-    Ok(())
-}
-
 async fn apply_config(
     ublk: &mut SmooUblk,
     runtime: &mut RuntimeState,
@@ -1187,6 +1667,7 @@ async fn apply_config(
             }
         }
         runtime.exports.clear();
+        runtime.reconcile_queue.clear();
         runtime.state_store().replace_all(Vec::new());
         if let Err(err) = runtime.state_store().persist() {
             warn!(error = ?err, "failed to clear state file");
@@ -1239,6 +1720,9 @@ async fn apply_config(
     if let Err(err) = runtime.state_store().persist() {
         warn!(error = ?err, "failed to write state store");
     }
+    runtime
+        .reconcile_queue
+        .retain(|export_id| runtime.exports.contains_key(export_id));
     runtime
         .status()
         .set_export_count(count_active_exports(&runtime.exports))
@@ -1339,25 +1823,39 @@ fn to_owned_fd(file: File) -> OwnedFd {
     unsafe { OwnedFd::from_raw_fd(raw) }
 }
 
-async fn cleanup_ublk_devices(ublk: &mut SmooUblk, runtime: &mut RuntimeState) -> Result<()> {
+async fn cleanup_ublk_devices(
+    ublk: &mut SmooUblk,
+    runtime: &mut RuntimeState,
+    forceful: bool,
+) -> Result<()> {
     for (_, tasks) in runtime.queue_tasks.drain() {
-        tasks.shutdown().await;
+        if forceful {
+            tasks.abort();
+        } else {
+            tasks.shutdown().await;
+        }
     }
     let mut force_remove_ids = Vec::new();
     for controller in runtime.exports.values_mut() {
         if let Some((ctrl, queues)) = controller.take_device_handles() {
             let dev_id = ctrl.dev_id();
-            info!(dev_id, "stopping ublk device");
-            if let Err(err) = ublk
-                .stop_dev(SmooUblkDevice::from_parts(ctrl, queues), true)
-                .await
-            {
-                warn!(
-                    dev_id,
-                    error = ?err,
-                    "graceful stop failed; will force-remove"
-                );
+            if forceful {
+                info!(dev_id, "forceful shutdown: dropping ublk device handles");
+                drop(SmooUblkDevice::from_parts(ctrl, queues));
                 force_remove_ids.push(dev_id);
+            } else {
+                info!(dev_id, "stopping ublk device");
+                if let Err(err) = ublk
+                    .stop_dev(SmooUblkDevice::from_parts(ctrl, queues), true)
+                    .await
+                {
+                    warn!(
+                        dev_id,
+                        error = ?err,
+                        "graceful stop failed; will force-remove"
+                    );
+                    force_remove_ids.push(dev_id);
+                }
             }
         } else if let Some(dev_id) = controller.dev_id() {
             force_remove_ids.push(dev_id);
@@ -1427,7 +1925,11 @@ async fn process_link_commands(
         match cmd {
             LinkCommand::DropLink => {
                 if let Some(pump) = runtime.io_pump.take() {
-                    pump.shutdown().await;
+                    drop(pump);
+                }
+                if let Some(task) = runtime.io_pump_task.take() {
+                    task.abort();
+                    let _ = task.await;
                 }
                 runtime.gadget = None;
                 debug!("link controller requested drop; data plane closed");
@@ -1440,10 +1942,10 @@ async fn process_link_commands(
                     Ok(endpoints) => match SmooGadget::new(endpoints, runtime.gadget_config) {
                         Ok(gadget) => {
                             let gadget = Arc::new(gadget);
-                            runtime.io_pump = Some(IoPumpHandle::spawn(
-                                gadget.clone(),
-                                runtime.io_pump_capacity,
-                            ));
+                            let (handle, task) =
+                                IoPumpHandle::spawn(gadget.clone(), runtime.io_pump_capacity);
+                            runtime.io_pump = Some(handle);
+                            runtime.io_pump_task = Some(task);
                             runtime.gadget = Some(gadget);
                             debug!("link controller reopened data plane");
                         }
@@ -1511,8 +2013,9 @@ async fn handle_queue_event(
                 num_sectors = request.num_sectors,
                 "dispatch ublk request to host"
             );
-            let result = handle_request(pump, inflight, export_id, queues.clone(), request).await;
-            if let Err(err) = result {
+            if let Err(err) =
+                handle_request(pump.clone(), inflight, export_id, queues.clone(), request).await
+            {
                 let io_err = io_error_from_anyhow(&err);
                 link.on_io_error(&io_err);
                 park_request(outstanding, export_id, dev_id, queues.clone(), request);
@@ -1575,131 +2078,6 @@ fn prune_outstanding_for_missing_exports(
     }
 }
 
-async fn drain_outstanding(
-    runtime: &mut RuntimeState,
-    link: &mut LinkController,
-    inflight: &Arc<Mutex<HashMap<u32, HashMap<u32, InflightRequest>>>>,
-    outstanding: &mut HashMap<u32, HashMap<(u16, u16), OutstandingRequest>>,
-) -> Result<()> {
-    if outstanding.is_empty() {
-        return Ok(());
-    }
-    if link.state() != LinkState::Online {
-        trace!(
-            outstanding_exports = outstanding.len(),
-            "link not online; deferring outstanding IO drain"
-        );
-        return Ok(());
-    }
-    let Some(pump) = runtime.io_pump.as_ref() else {
-        trace!(
-            outstanding_exports = outstanding.len(),
-            "no gadget endpoints available; deferring outstanding IO drain"
-        );
-        return Ok(());
-    };
-    loop {
-        let next = {
-            let mut next = None;
-            for (export_id, reqs) in outstanding.iter() {
-                if let Some((&(queue_id, tag), _)) = reqs.iter().next() {
-                    next = Some((*export_id, queue_id, tag));
-                    break;
-                }
-            }
-            next
-        };
-        let Some((export_id, queue_id, tag)) = next else {
-            break;
-        };
-        let pending = {
-            let map = outstanding.get_mut(&export_id);
-            let req = map.and_then(|m| m.remove(&(queue_id, tag)));
-            if let Some(map) = outstanding.get(&export_id) {
-                if map.is_empty() {
-                    outstanding.remove(&export_id);
-                }
-            }
-            req
-        };
-        let Some(pending) = pending else {
-            continue;
-        };
-        let Some(ctrl) = runtime.exports.get(&export_id) else {
-            let _ = pending.queues.complete_io(pending.request, -libc::ENODEV);
-            continue;
-        };
-        let Some(handle) = ctrl.device_handle() else {
-            park_request(
-                outstanding,
-                export_id,
-                pending.dev_id,
-                pending.queues.clone(),
-                pending.request,
-            );
-            break;
-        };
-        if handle.dev_id() != pending.dev_id {
-            trace!(
-                export_id,
-                stale_dev = pending.dev_id,
-                current_dev = handle.dev_id(),
-                "dropping outstanding for stale device"
-            );
-            continue;
-        }
-        if !handle.is_online() {
-            park_request(
-                outstanding,
-                export_id,
-                pending.dev_id,
-                pending.queues.clone(),
-                pending.request,
-            );
-            break;
-        }
-        let Some(queues) = handle.queues() else {
-            park_request(
-                outstanding,
-                export_id,
-                pending.dev_id,
-                pending.queues.clone(),
-                pending.request,
-            );
-            break;
-        };
-        let req = pending.request;
-        trace!(
-            export_id,
-            dev_id = pending.dev_id,
-            queue = req.queue_id,
-            tag = req.tag,
-            "replaying outstanding IO to host"
-        );
-        let result = handle_request(pump, inflight, export_id, queues.clone(), req).await;
-        if let Err(err) = result {
-            let io_err = io_error_from_anyhow(&err);
-            link.on_io_error(&io_err);
-            park_request(
-                outstanding,
-                export_id,
-                pending.dev_id,
-                pending.queues.clone(),
-                req,
-            );
-            warn!(
-                export_id,
-                queue = req.queue_id,
-                tag = req.tag,
-                error = ?err,
-                "link error replaying outstanding IO; parked again"
-            );
-            break;
-        }
-    }
-    Ok(())
-}
-
 async fn drain_inflight(inflight: &Arc<Mutex<HashMap<u32, HashMap<u32, InflightRequest>>>>) {
     let mut guard = inflight.lock().await;
     for (_export, mut requests) in guard.drain() {
@@ -1744,20 +2122,6 @@ fn pid_is_alive(pid: i32) -> bool {
     }
     let err = std::io::Error::last_os_error();
     !matches!(err.raw_os_error(), Some(libc::ESRCH))
-}
-
-fn export_state_tag(controller: &ExportController) -> &'static str {
-    match &controller.state {
-        ExportState::New => "new",
-        ExportState::RecoveringPending { .. } => "recovering_pending",
-        ExportState::Device(handle) => match handle {
-            DeviceHandle::Starting { .. } => "starting",
-            DeviceHandle::Online { .. } => "online",
-            DeviceHandle::ShuttingDown { .. } => "shutting_down",
-            DeviceHandle::Failed { .. } => "failed",
-        },
-        ExportState::Deleted => "deleted",
-    }
 }
 
 fn parse_hex_u16(input: &str) -> Result<u16, String> {
