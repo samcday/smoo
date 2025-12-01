@@ -189,7 +189,11 @@ const ERRNO_EINVAL: u32 = 22;
 const ERRNO_EIO: u32 = 5;
 const ERRNO_EOPNOTSUPP: u32 = 95;
 
-async fn handle_request<S>(pump: HostIoPumpHandle, source: S, request: Request) -> HostResult<Response>
+async fn handle_request<S>(
+    pump: HostIoPumpHandle,
+    source: S,
+    request: Request,
+) -> HostResult<Response>
 where
     S: BlockSource + ExportIdentity + Clone + Send + 'static,
 {
@@ -269,7 +273,11 @@ where
     ))
 }
 
-async fn handle_write<S>(pump: HostIoPumpHandle, source: S, request: Request) -> HostResult<Response>
+async fn handle_write<S>(
+    pump: HostIoPumpHandle,
+    source: S,
+    request: Request,
+) -> HostResult<Response>
 where
     S: BlockSource + ExportIdentity + Clone + Send + 'static,
 {

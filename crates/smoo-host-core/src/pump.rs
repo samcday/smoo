@@ -1,13 +1,17 @@
 use crate::{Transport, TransportError, TransportErrorKind, TransportResult};
 use alloc::{collections::VecDeque, format, vec::Vec};
-use core::{future::Future, pin::Pin, task::{Context, Poll}};
+use core::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll},
+};
 use futures_channel::{mpsc, oneshot};
 use futures_util::{
     future::{BoxFuture, Fuse, FusedFuture, FutureExt, OptionFuture},
     select_biased,
     stream::StreamExt,
 };
-use smoo_proto::{Request, Response, REQUEST_LEN, RESPONSE_LEN};
+use smoo_proto::{REQUEST_LEN, RESPONSE_LEN, Request, Response};
 
 /// Stream of Requests produced by the pump.
 pub type HostIoPumpRequestRx = mpsc::UnboundedReceiver<Request>;
@@ -35,7 +39,9 @@ impl Future for HostIoPumpTask {
 ///
 /// Returns a handle for issuing commands, a request receiver for incoming Requests, and a pump
 /// future that must be spawned by the caller.
-pub fn start_host_io_pump<T>(transport: T) -> (HostIoPumpHandle, HostIoPumpRequestRx, HostIoPumpTask)
+pub fn start_host_io_pump<T>(
+    transport: T,
+) -> (HostIoPumpHandle, HostIoPumpRequestRx, HostIoPumpTask)
 where
     T: Transport + Clone + Send + Sync + 'static,
 {
@@ -51,8 +57,11 @@ impl HostIoPumpHandle {
     /// Send a Response over interrupt OUT.
     pub async fn send_response(&self, response: Response) -> TransportResult<()> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.send_cmd(PumpCmd::SendResponse { response, reply: reply_tx })
-            .await?;
+        self.send_cmd(PumpCmd::SendResponse {
+            response,
+            reply: reply_tx,
+        })
+        .await?;
         reply_rx.await.unwrap_or_else(|_| Err(disconnected_err()))
     }
 
@@ -70,8 +79,11 @@ impl HostIoPumpHandle {
     /// Write a bulk payload to the gadget.
     pub async fn write_bulk(&self, buf: Vec<u8>) -> TransportResult<()> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.send_cmd(PumpCmd::WriteBulk { buf, reply: reply_tx })
-            .await?;
+        self.send_cmd(PumpCmd::WriteBulk {
+            buf,
+            reply: reply_tx,
+        })
+        .await?;
         reply_rx.await.unwrap_or_else(|_| Err(disconnected_err()))
     }
 
@@ -126,7 +138,10 @@ type BulkInFuture = Fuse<OptionFuture<BoxFuture<'static, BulkInResult>>>;
 type BulkOutFuture = Fuse<OptionFuture<BoxFuture<'static, BulkOutResult>>>;
 
 type InterruptOutResult = (oneshot::Sender<TransportResult<()>>, TransportResult<()>);
-type BulkInResult = (oneshot::Sender<TransportResult<Vec<u8>>>, TransportResult<Vec<u8>>);
+type BulkInResult = (
+    oneshot::Sender<TransportResult<Vec<u8>>>,
+    TransportResult<Vec<u8>>,
+);
 type BulkOutResult = (oneshot::Sender<TransportResult<()>>, TransportResult<()>);
 
 async fn run_pump<T>(
@@ -231,17 +246,19 @@ fn arm_interrupt_in<T>(transport: T) -> InterruptInFuture
 where
     T: Transport + Clone + Send + Sync + 'static,
 {
-    OptionFuture::from(Some(async move {
-        let mut buf = [0u8; REQUEST_LEN];
-        let len = transport.read_interrupt(&mut buf).await?;
-        if len != REQUEST_LEN {
-            return Err(protocol_error(format!(
-                "request transfer truncated (expected {REQUEST_LEN}, got {len})"
-            )));
+    OptionFuture::from(Some(
+        async move {
+            let mut buf = [0u8; REQUEST_LEN];
+            let len = transport.read_interrupt(&mut buf).await?;
+            if len != REQUEST_LEN {
+                return Err(protocol_error(format!(
+                    "request transfer truncated (expected {REQUEST_LEN}, got {len})"
+                )));
+            }
+            Request::decode(buf).map_err(|err| protocol_error(format!("decode request: {err}")))
         }
-        Request::decode(buf).map_err(|err| protocol_error(format!("decode request: {err}")))
-    }
-    .boxed()))
+        .boxed(),
+    ))
     .fuse()
 }
 
@@ -249,19 +266,21 @@ fn arm_interrupt_out<T>(transport: T, op: InterruptOutOp) -> InterruptOutFuture
 where
     T: Transport + Clone + Send + Sync + 'static,
 {
-    OptionFuture::from(Some(async move {
-        let data = op.response.encode();
-        let reply = op.reply;
-        let result = match transport.write_interrupt(&data).await {
-            Ok(len) if len == RESPONSE_LEN => Ok(()),
-            Ok(len) => Err(protocol_error(format!(
-                "response transfer truncated (expected {RESPONSE_LEN}, wrote {len})"
-            ))),
-            Err(err) => Err(err),
-        };
-        (reply, result)
-    }
-    .boxed()))
+    OptionFuture::from(Some(
+        async move {
+            let data = op.response.encode();
+            let reply = op.reply;
+            let result = match transport.write_interrupt(&data).await {
+                Ok(len) if len == RESPONSE_LEN => Ok(()),
+                Ok(len) => Err(protocol_error(format!(
+                    "response transfer truncated (expected {RESPONSE_LEN}, wrote {len})"
+                ))),
+                Err(err) => Err(err),
+            };
+            (reply, result)
+        }
+        .boxed(),
+    ))
     .fuse()
 }
 
@@ -269,21 +288,23 @@ fn arm_bulk_in<T>(transport: T, op: BulkInOp) -> BulkInFuture
 where
     T: Transport + Clone + Send + Sync + 'static,
 {
-    OptionFuture::from(Some(async move {
-        let mut buf = op.buf;
-        let reply = op.reply;
-        let len = transport.read_bulk(&mut buf).await;
-        let result = match len {
-            Ok(read) if read == buf.len() => Ok(buf),
-            Ok(read) => Err(protocol_error(format!(
-                "bulk read truncated (expected {}, got {read})",
-                buf.len()
-            ))),
-            Err(err) => Err(err),
-        };
-        (reply, result)
-    }
-    .boxed()))
+    OptionFuture::from(Some(
+        async move {
+            let mut buf = op.buf;
+            let reply = op.reply;
+            let len = transport.read_bulk(&mut buf).await;
+            let result = match len {
+                Ok(read) if read == buf.len() => Ok(buf),
+                Ok(read) => Err(protocol_error(format!(
+                    "bulk read truncated (expected {}, got {read})",
+                    buf.len()
+                ))),
+                Err(err) => Err(err),
+            };
+            (reply, result)
+        }
+        .boxed(),
+    ))
     .fuse()
 }
 
@@ -291,19 +312,21 @@ fn arm_bulk_out<T>(transport: T, op: BulkOutOp) -> BulkOutFuture
 where
     T: Transport + Clone + Send + Sync + 'static,
 {
-    OptionFuture::from(Some(async move {
-        let reply = op.reply;
-        let len = op.buf.len();
-        let result = match transport.write_bulk(&op.buf).await {
-            Ok(written) if written == len => Ok(()),
-            Ok(written) => Err(protocol_error(format!(
-                "bulk write truncated (expected {len}, wrote {written})"
-            ))),
-            Err(err) => Err(err),
-        };
-        (reply, result)
-    }
-    .boxed()))
+    OptionFuture::from(Some(
+        async move {
+            let reply = op.reply;
+            let len = op.buf.len();
+            let result = match transport.write_bulk(&op.buf).await {
+                Ok(written) if written == len => Ok(()),
+                Ok(written) => Err(protocol_error(format!(
+                    "bulk write truncated (expected {len}, wrote {written})"
+                ))),
+                Err(err) => Err(err),
+            };
+            (reply, result)
+        }
+        .boxed(),
+    ))
     .fuse()
 }
 
@@ -312,8 +335,5 @@ fn protocol_error(message: impl Into<String>) -> TransportError {
 }
 
 fn disconnected_err() -> TransportError {
-    TransportError::with_message(
-        TransportErrorKind::Disconnected,
-        "pump not running",
-    )
+    TransportError::with_message(TransportErrorKind::Disconnected, "pump not running")
 }

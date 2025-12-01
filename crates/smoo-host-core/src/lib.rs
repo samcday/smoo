@@ -17,7 +17,7 @@ pub use export_id::{
     derive_export_id_with,
 };
 pub use host::{HostError, HostErrorKind, HostResult, SmooHost};
-pub use pump::{start_host_io_pump, HostIoPumpHandle, HostIoPumpRequestRx, HostIoPumpTask};
+pub use pump::{HostIoPumpHandle, HostIoPumpRequestRx, HostIoPumpTask, start_host_io_pump};
 pub use transport::{
     ControlTransport, Transport, TransportError, TransportErrorKind, TransportResult,
 };
