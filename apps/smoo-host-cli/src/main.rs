@@ -1,5 +1,8 @@
 use anyhow::{anyhow, ensure, Context, Result};
 use clap::{ArgGroup, Parser};
+use hyper::service::{make_service_fn, service_fn};
+use hyper::{Body, Request, Response, Server, StatusCode};
+use metrics_exporter_prometheus::PrometheusBuilder;
 use smoo_host_blocksource_cached::{CachedBlockSource, MemoryCacheStore};
 use smoo_host_blocksource_http::HttpBlockSource;
 use smoo_host_blocksources::device::DeviceBlockSource;
@@ -8,12 +11,15 @@ use smoo_host_blocksources::random::RandomBlockSource;
 use smoo_host_core::{
     control::{fetch_ident, read_status, send_config_exports_v0, ConfigExportsV0},
     derive_export_id_from_source, start_host_io_pump, BlockSource, BlockSourceHandle,
-    BlockSourceResult, ExportIdentity, HostErrorKind, MetricsSnapshot, SmooHost, TransportError,
-    TransportErrorKind,
+    BlockSourceResult, ExportIdentity, HostErrorKind, SmooHost, TransportError, TransportErrorKind,
 };
 use smoo_host_transport_rusb::{RusbControl, RusbTransport};
 use smoo_proto::SmooStatusV0;
-use std::{collections::BTreeMap, fmt, fs, path::PathBuf, time::Duration};
+use std::{
+    collections::BTreeMap, convert::Infallible, fmt, fs, net::SocketAddr, path::PathBuf,
+    time::Duration,
+};
+use tokio::task::JoinHandle;
 use tokio::{signal, sync::mpsc, time};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -70,9 +76,9 @@ struct Args {
     /// Per-transfer timeout in milliseconds (clamped to 200ms for cancellation)
     #[arg(long, default_value_t = 1000)]
     timeout_ms: u64,
-    /// Log transport metrics every N seconds (0 disables)
+    /// Expose Prometheus metrics on this TCP port (0 disables)
     #[arg(long, default_value_t = 0)]
-    metrics_log_interval_secs: u64,
+    metrics_port: u16,
 }
 
 enum HostSource {
@@ -173,7 +179,7 @@ async fn main() -> Result<()> {
         let _ = signal::ctrl_c().await;
         shutdown_watch.cancel();
     });
-    let _metrics_task = spawn_metrics_logger(args.metrics_log_interval_secs, shutdown.clone());
+    let _metrics_task = spawn_metrics_listener(args.metrics_port, shutdown.clone())?;
     let (sources, config_payload) = open_sources(&args).await.context("open block sources")?;
     let mut expected_session_id = None;
     let mut has_connected = false;
@@ -599,46 +605,55 @@ fn parse_hex_u16(s: &str) -> Result<u16, std::num::ParseIntError> {
     u16::from_str_radix(trimmed, 16)
 }
 
-fn spawn_metrics_logger(
-    interval_secs: u64,
+fn spawn_metrics_listener(
+    port: u16,
     shutdown: CancellationToken,
-) -> Option<tokio::task::JoinHandle<()>> {
-    if interval_secs == 0 {
-        return None;
+) -> Result<Option<JoinHandle<()>>> {
+    if port == 0 {
+        return Ok(None);
     }
-    let period = Duration::from_secs(interval_secs.max(1));
-    Some(tokio::spawn(async move {
-        let mut ticker = time::interval(period);
-        ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
-        let mut prev = MetricsSnapshot::default();
-        loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => break,
-                _ = ticker.tick() => {
-                    let snap = smoo_host_core::metrics::snapshot();
-                    let dt = period.as_secs_f64().max(0.000_001);
-                    let out_bytes = snap.bulk_out.bytes.saturating_sub(prev.bulk_out.bytes);
-                    let in_bytes = snap.bulk_in.bytes.saturating_sub(prev.bulk_in.bytes);
-                    let out_mib = out_bytes as f64 / (1024.0 * 1024.0);
-                    let in_mib = in_bytes as f64 / (1024.0 * 1024.0);
-                    let out_throughput = out_mib / dt;
-                    let in_throughput = in_mib / dt;
-                    info!(
-                        bulk_out_mibps = format_args!("{:.2}", out_throughput),
-                        bulk_in_mibps = format_args!("{:.2}", in_throughput),
-                        bulk_out_count = snap.bulk_out.count,
-                        bulk_in_count = snap.bulk_in.count,
-                        bulk_out_avg_ms = format_args!("{:.2}", snap.bulk_out.avg_ns / 1_000_000.0),
-                        bulk_out_max_ms = format_args!("{:.2}", snap.bulk_out.max_ns as f64 / 1_000_000.0),
-                        bulk_in_avg_ms = format_args!("{:.2}", snap.bulk_in.avg_ns / 1_000_000.0),
-                        bulk_in_max_ms = format_args!("{:.2}", snap.bulk_in.max_ns as f64 / 1_000_000.0),
-                        bulk_out_queue_max = snap.bulk_out_queue.max_depth,
-                        bulk_in_queue_max = snap.bulk_in_queue.max_depth,
-                        "metrics: bulk throughput"
-                    );
-                    prev = snap;
-                }
+    let handle = PrometheusBuilder::new()
+        .install_recorder()
+        .context("install Prometheus metrics recorder")?;
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let task = tokio::spawn(async move {
+        let make_svc = make_service_fn(move |_conn| {
+            let handle = handle.clone();
+            async move {
+                Ok::<_, Infallible>(service_fn(move |req: Request<Body>| {
+                    let handle = handle.clone();
+                    async move {
+                        if req.uri().path() != "/metrics" {
+                            return Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::NOT_FOUND)
+                                    .body(Body::from("not found"))
+                                    .unwrap(),
+                            );
+                        }
+                        let body = handle.render();
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .header(hyper::header::CONTENT_TYPE, "text/plain; version=0.0.4")
+                                .body(Body::from(body))
+                                .unwrap(),
+                        )
+                    }
+                }))
             }
+        });
+
+        let server = Server::bind(&addr).serve(make_svc);
+        let graceful = server.with_graceful_shutdown(async {
+            shutdown.cancelled().await;
+        });
+
+        if let Err(err) = graceful.await {
+            warn!(error = %err, %addr, "metrics server error");
         }
-    }))
+    });
+
+    info!(%addr, "metrics listener started");
+    Ok(Some(task))
 }
