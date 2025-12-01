@@ -7,7 +7,7 @@ use core::{
 };
 use futures_channel::{mpsc, oneshot};
 use futures_util::{
-    future::{poll_fn, BoxFuture, Fuse, FusedFuture, FutureExt, OptionFuture},
+    future::{BoxFuture, Fuse, FusedFuture, FutureExt, OptionFuture, poll_fn},
     stream::{Fuse as StreamFuse, StreamExt},
 };
 use smoo_proto::{REQUEST_LEN, RESPONSE_LEN, Request, Response};
@@ -140,15 +140,35 @@ struct BulkOutOp {
 
 type InterruptInFuture = Fuse<OptionFuture<BoxFuture<'static, TransportResult<Request>>>>;
 type InterruptOutFuture = Fuse<OptionFuture<BoxFuture<'static, InterruptOutResult>>>;
-type BulkInFuture = Fuse<OptionFuture<BoxFuture<'static, BulkInResult>>>;
-type BulkOutFuture = Fuse<OptionFuture<BoxFuture<'static, BulkOutResult>>>;
-
 type InterruptOutResult = (oneshot::Sender<TransportResult<()>>, TransportResult<()>);
 type BulkInResult = (
     oneshot::Sender<TransportResult<Vec<u8>>>,
     TransportResult<Vec<u8>>,
 );
 type BulkOutResult = (oneshot::Sender<TransportResult<()>>, TransportResult<()>);
+
+struct InFlightBulkIn {
+    fut: Fuse<BoxFuture<'static, BulkInResult>>,
+}
+
+impl InFlightBulkIn {
+    fn new(fut: BoxFuture<'static, BulkInResult>) -> Self {
+        Self { fut: fut.fuse() }
+    }
+}
+
+struct InFlightBulkOut {
+    fut: Fuse<BoxFuture<'static, BulkOutResult>>,
+}
+
+impl InFlightBulkOut {
+    fn new(fut: BoxFuture<'static, BulkOutResult>) -> Self {
+        Self { fut: fut.fuse() }
+    }
+}
+
+const BULK_IN_MAX_IN_FLIGHT: usize = 4;
+const BULK_OUT_MAX_IN_FLIGHT: usize = 4;
 
 enum PumpProgress {
     Continue,
@@ -166,8 +186,8 @@ where
     let mut cmd_rx: StreamFuse<mpsc::UnboundedReceiver<PumpCmd>> = cmd_rx.fuse();
     let mut interrupt_in: InterruptInFuture = arm_interrupt_in(transport.clone());
     let mut interrupt_out: InterruptOutFuture = OptionFuture::from(None).fuse();
-    let mut bulk_in: BulkInFuture = OptionFuture::from(None).fuse();
-    let mut bulk_out: BulkOutFuture = OptionFuture::from(None).fuse();
+    let mut bulk_in_inflight: VecDeque<InFlightBulkIn> = VecDeque::new();
+    let mut bulk_out_inflight: VecDeque<InFlightBulkOut> = VecDeque::new();
     let mut interrupt_out_queue: VecDeque<InterruptOutOp> = VecDeque::new();
     let mut bulk_in_queue: VecDeque<BulkInOp> = VecDeque::new();
     let mut bulk_out_queue: VecDeque<BulkOutOp> = VecDeque::new();
@@ -181,8 +201,8 @@ where
                 &mut cmd_rx,
                 &mut interrupt_in,
                 &mut interrupt_out,
-                &mut bulk_in,
-                &mut bulk_out,
+                &mut bulk_in_inflight,
+                &mut bulk_out_inflight,
                 &mut interrupt_out_queue,
                 &mut bulk_in_queue,
                 &mut bulk_out_queue,
@@ -205,8 +225,8 @@ fn poll_pump<T>(
     cmd_rx: &mut StreamFuse<mpsc::UnboundedReceiver<PumpCmd>>,
     interrupt_in: &mut InterruptInFuture,
     interrupt_out: &mut InterruptOutFuture,
-    bulk_in: &mut BulkInFuture,
-    bulk_out: &mut BulkOutFuture,
+    bulk_in_inflight: &mut VecDeque<InFlightBulkIn>,
+    bulk_out_inflight: &mut VecDeque<InFlightBulkOut>,
     interrupt_out_queue: &mut VecDeque<InterruptOutOp>,
     bulk_in_queue: &mut VecDeque<BulkInOp>,
     bulk_out_queue: &mut VecDeque<BulkOutOp>,
@@ -216,6 +236,8 @@ fn poll_pump<T>(
 where
     T: Transport + Clone + Send + Sync + 'static,
 {
+    let mut made_progress = false;
+
     if interrupt_in.is_terminated() {
         *interrupt_in = arm_interrupt_in(transport.clone());
     }
@@ -224,14 +246,26 @@ where
             *interrupt_out = arm_interrupt_out(transport.clone(), op);
         }
     }
-    if bulk_in.is_terminated() {
+
+    while bulk_in_inflight.len() < BULK_IN_MAX_IN_FLIGHT {
         if let Some(op) = bulk_in_queue.pop_front() {
-            *bulk_in = arm_bulk_in(transport.clone(), op);
+            bulk_in_inflight.push_back(InFlightBulkIn::new(arm_bulk_in_future(
+                transport.clone(),
+                op,
+            )));
+        } else {
+            break;
         }
     }
-    if bulk_out.is_terminated() {
+
+    while bulk_out_inflight.len() < BULK_OUT_MAX_IN_FLIGHT {
         if let Some(op) = bulk_out_queue.pop_front() {
-            *bulk_out = arm_bulk_out(transport.clone(), op);
+            bulk_out_inflight.push_back(InFlightBulkOut::new(arm_bulk_out_future(
+                transport.clone(),
+                op,
+            )));
+        } else {
+            break;
         }
     }
 
@@ -256,7 +290,7 @@ where
             Some(PumpCmd::Shutdown) => return Poll::Ready(Ok(PumpProgress::Finished(Ok(())))),
             None => *cmd_closed = true,
         }
-        return Poll::Ready(Ok(PumpProgress::Continue));
+        made_progress = true;
     }
 
     if let Poll::Ready(req) = interrupt_in.poll_unpin(cx) {
@@ -273,7 +307,7 @@ where
             }
             None => {}
         }
-        return Poll::Ready(Ok(PumpProgress::Continue));
+        made_progress = true;
     }
 
     if let Poll::Ready(res) = interrupt_out.poll_unpin(cx) {
@@ -285,30 +319,36 @@ where
             }
             let _ = reply.send(result);
         }
-        return Poll::Ready(Ok(PumpProgress::Continue));
+        made_progress = true;
     }
 
-    if let Poll::Ready(res) = bulk_in.poll_unpin(cx) {
-        if let Some((reply, result)) = res {
-            match &result {
-                Ok(buf) => tracing::trace!(bytes = buf.len(), "pump: bulk-in done"),
-                Err(err) => tracing::warn!(%err, "pump: bulk-in failed"),
+    if let Some(front) = bulk_in_inflight.front_mut() {
+        if let Poll::Ready(res) = front.fut.poll_unpin(cx) {
+            if let Some((reply, result)) = Some(res) {
+                match &result {
+                    Ok(buf) => tracing::trace!(bytes = buf.len(), "pump: bulk-in done"),
+                    Err(err) => tracing::warn!(%err, "pump: bulk-in failed"),
+                }
+                let _ = reply.send(result);
             }
-            let _ = reply.send(result);
+            bulk_in_inflight.pop_front();
+            made_progress = true;
         }
-        return Poll::Ready(Ok(PumpProgress::Continue));
     }
 
-    if let Poll::Ready(res) = bulk_out.poll_unpin(cx) {
-        if let Some((reply, result)) = res {
-            if let Err(ref err) = result {
-                tracing::warn!(%err, "pump: bulk-out failed");
-            } else {
-                tracing::trace!("pump: bulk-out done");
+    if let Some(front) = bulk_out_inflight.front_mut() {
+        if let Poll::Ready(res) = front.fut.poll_unpin(cx) {
+            if let Some((reply, result)) = Some(res) {
+                if let Err(ref err) = result {
+                    tracing::warn!(%err, "pump: bulk-out failed");
+                } else {
+                    tracing::trace!("pump: bulk-out done");
+                }
+                let _ = reply.send(result);
             }
-            let _ = reply.send(result);
+            bulk_out_inflight.pop_front();
+            made_progress = true;
         }
-        return Poll::Ready(Ok(PumpProgress::Continue));
     }
 
     if *cmd_closed
@@ -316,13 +356,17 @@ where
         && bulk_in_queue.is_empty()
         && bulk_out_queue.is_empty()
         && interrupt_out.is_terminated()
-        && bulk_in.is_terminated()
-        && bulk_out.is_terminated()
+        && bulk_in_inflight.is_empty()
+        && bulk_out_inflight.is_empty()
     {
         return Poll::Ready(Ok(PumpProgress::Finished(Ok(()))));
     }
 
-    Poll::Pending
+    if made_progress {
+        Poll::Ready(Ok(PumpProgress::Continue))
+    } else {
+        Poll::Pending
+    }
 }
 
 fn arm_interrupt_in<T>(transport: T) -> InterruptInFuture
@@ -367,55 +411,49 @@ where
     .fuse()
 }
 
-fn arm_bulk_in<T>(transport: T, op: BulkInOp) -> BulkInFuture
+fn arm_bulk_in_future<T>(transport: T, op: BulkInOp) -> BoxFuture<'static, BulkInResult>
 where
     T: Transport + Clone + Send + Sync + 'static,
 {
-    OptionFuture::from(Some(
-        async move {
-            let mut buf = op.buf;
-            let reply = op.reply;
-            let len = transport.read_bulk(&mut buf).await;
-            let result = match len {
-                Ok(read) if read == buf.len() => Ok(buf),
-                Ok(read) => Err(protocol_error(format!(
-                    "bulk read truncated (expected {}, got {read})",
-                    buf.len()
-                ))),
-                Err(err) => Err(err),
-            };
-            (reply, result)
-        }
-        .boxed(),
-    ))
-    .fuse()
+    async move {
+        let mut buf = op.buf;
+        let reply = op.reply;
+        let len = transport.read_bulk(&mut buf).await;
+        let result = match len {
+            Ok(read) if read == buf.len() => Ok(buf),
+            Ok(read) => Err(protocol_error(format!(
+                "bulk read truncated (expected {}, got {read})",
+                buf.len()
+            ))),
+            Err(err) => Err(err),
+        };
+        (reply, result)
+    }
+    .boxed()
 }
 
-fn arm_bulk_out<T>(transport: T, op: BulkOutOp) -> BulkOutFuture
+fn arm_bulk_out_future<T>(transport: T, op: BulkOutOp) -> BoxFuture<'static, BulkOutResult>
 where
     T: Transport + Clone + Send + Sync + 'static,
 {
-    OptionFuture::from(Some(
-        async move {
-            let reply = op.reply;
-            let len = op.buf.len();
-            tracing::trace!(bytes = len, "pump: bulk-out transport write start");
-            let result = match transport.write_bulk(&op.buf).await {
-                Ok(written) if written == len => Ok(()),
-                Ok(written) => Err(protocol_error(format!(
-                    "bulk write truncated (expected {len}, wrote {written})"
-                ))),
-                Err(err) => Err(err),
-            };
-            match &result {
-                Ok(_) => tracing::trace!("pump: bulk-out transport write done"),
-                Err(err) => tracing::warn!(%err, "pump: bulk-out transport write failed"),
-            }
-            (reply, result)
+    async move {
+        let reply = op.reply;
+        let len = op.buf.len();
+        tracing::trace!(bytes = len, "pump: bulk-out transport write start");
+        let result = match transport.write_bulk(&op.buf).await {
+            Ok(written) if written == len => Ok(()),
+            Ok(written) => Err(protocol_error(format!(
+                "bulk write truncated (expected {len}, wrote {written})"
+            ))),
+            Err(err) => Err(err),
+        };
+        match &result {
+            Ok(_) => tracing::trace!("pump: bulk-out transport write done"),
+            Err(err) => tracing::warn!(%err, "pump: bulk-out transport write failed"),
         }
-        .boxed(),
-    ))
-    .fuse()
+        (reply, result)
+    }
+    .boxed()
 }
 
 fn protocol_error(message: impl Into<String>) -> TransportError {

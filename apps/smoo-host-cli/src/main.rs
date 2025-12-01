@@ -14,6 +14,7 @@ use smoo_host_transport_rusb::{RusbControl, RusbTransport};
 use smoo_proto::SmooStatusV0;
 use std::{collections::BTreeMap, fmt, fs, path::PathBuf, time::Duration};
 use tokio::{signal, sync::mpsc, time};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 const SMOO_INTERFACE_CLASS: u8 = 0xFF;
@@ -162,16 +163,23 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    let shutdown = CancellationToken::new();
+    let shutdown_watch = shutdown.clone();
+    tokio::spawn(async move {
+        let _ = signal::ctrl_c().await;
+        shutdown_watch.cancel();
+    });
     let (sources, config_payload) = open_sources(&args).await.context("open block sources")?;
     let mut expected_session_id = None;
     let mut has_connected = false;
-    loop {
+    while !shutdown.is_cancelled() {
         match run_session(
             &args,
             sources.clone(),
             &config_payload,
             &mut expected_session_id,
             has_connected,
+            shutdown.clone(),
         )
         .await?
         {
@@ -198,10 +206,8 @@ async fn run_session(
     config_payload: &ConfigExportsV0,
     expected_session_id: &mut Option<u64>,
     has_connected: bool,
+    shutdown: CancellationToken,
 ) -> Result<SessionEnd> {
-    let shutdown = signal::ctrl_c();
-    tokio::pin!(shutdown);
-
     let mut attempts = 0usize;
     let mut delay = DISCOVERY_DELAY_INITIAL;
     let transfer_timeout = Duration::from_millis(args.timeout_ms.min(200));
@@ -224,7 +230,7 @@ async fn run_session(
                     debug!(error = %err, "gadget not present; retrying discovery");
                 }
                 tokio::select! {
-                    _ = &mut shutdown => {
+                    _ = shutdown.cancelled() => {
                         info!("shutdown requested");
                         return Ok(SessionEnd::Shutdown);
                     }
@@ -298,6 +304,10 @@ async fn run_session(
 
     let outcome = loop {
         tokio::select! {
+            _ = shutdown.cancelled() => {
+                info!("shutdown requested");
+                break SessionEnd::Shutdown;
+            }
             res = host.run_once() => {
                 match res {
                     Ok(()) => {}
@@ -328,7 +338,7 @@ async fn run_session(
                     }
                 }
             }
-            event = heartbeat_rx.recv() => {
+            event = heartbeat_rx.recv(), if !shutdown.is_cancelled() => {
                 match event {
                     Some(HeartbeatFailure::TransferFailed(reason)) => {
                         warn!(reason = %reason, "heartbeat transfer failed");
@@ -341,10 +351,6 @@ async fn run_session(
                         break SessionEnd::TransportLost;
                     }
                 }
-            }
-            _ = &mut shutdown => {
-                info!("shutdown requested");
-                break SessionEnd::Shutdown;
             }
         }
     };
