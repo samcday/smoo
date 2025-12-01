@@ -7,29 +7,31 @@ constraints. All fields are little‑endian unless noted.
 ## Control plane (interrupt endpoints)
 
 ### Request (gadget → host)
-Fixed 24 bytes.
+Fixed 28 bytes.
 
-| offset | size | field        | notes                          |
-| ------ | ---- | ------------ | ------------------------------ |
-| 0      | 1    | op           | `OpCode` (0=Read,1=Write,2=Flush,3=Discard) |
-| 1..3   | 3    | reserved     | zero                           |
-| 4..8   | 4    | export_id    | u32, must be non‑zero          |
-| 8..16  | 8    | lba          | starting logical block address |
-| 16..20 | 4    | num_blocks   | block count (not bytes)        |
-| 20..24 | 4    | flags        | currently zero                 |
+| offset | size | field        | notes                                                     |
+| ------ | ---- | ------------ | --------------------------------------------------------- |
+| 0      | 1    | op           | `OpCode` (0=Read,1=Write,2=Flush,3=Discard)               |
+| 1..3   | 3    | reserved     | zero                                                      |
+| 4..8   | 4    | request_id   | u32, unique **per export** while in flight                |
+| 8..12  | 4    | export_id    | u32, must be non‑zero                                     |
+| 12..20 | 8    | lba          | starting logical block address                            |
+| 20..24 | 4    | num_blocks   | block count (not bytes)                                   |
+| 24..28 | 4    | flags        | currently zero                                            |
 
 ### Response (host → gadget)
-Fixed 24 bytes.
+Fixed 28 bytes.
 
-| offset | size | field        | notes                              |
-| ------ | ---- | ------------ | ---------------------------------- |
-| 0      | 1    | op           | echoes request op                  |
-| 1      | 1    | status       | 0=OK, else errno/host status byte  |
-| 2..3   | 2    | reserved     | zero                               |
-| 4..8   | 4    | export_id    | echoes request export_id           |
-| 8..16  | 8    | lba          | echoes request lba                 |
-| 16..20 | 4    | num_blocks   | block count serviced/attempted     |
-| 20..24 | 4    | flags        | currently zero                     |
+| offset | size | field        | notes                                                     |
+| ------ | ---- | ------------ | --------------------------------------------------------- |
+| 0      | 1    | op           | echoes request op                                         |
+| 1      | 1    | status       | 0=OK, else errno/host status byte                         |
+| 2..3   | 2    | reserved     | zero                                                      |
+| 4..8   | 4    | request_id   | echoes request request_id                                 |
+| 8..12  | 4    | export_id    | echoes request export_id                                  |
+| 12..20 | 8    | lba          | echoes request lba                                        |
+| 20..24 | 4    | num_blocks   | block count serviced/attempted                            |
+| 24..28 | 4    | flags        | currently zero                                            |
 
 ### CONFIG_EXPORTS (host → gadget, ep0 OUT)
 
@@ -78,12 +80,18 @@ Payload: 16 bytes, versioned v0:
 ## Data plane (bulk endpoints)
 
 Bulk payloads are block‑aligned and sized according to `num_blocks *
-block_size` for the associated export. Request/Response ordering is strict:
-each Request maps to exactly one Response.
+block_size` for the associated export. Each Request maps to exactly one
+Response; Responses may be returned out‑of‑order. Multiple Requests per
+export MAY be in flight simultaneously, and a host is expected to keep
+queues full (e.g. queue_depth × export_count outstanding). Matching is done
+by the composite key `(export_id, request_id)`.
 
 ## Constraints & invariants
 
-- `export_id` is the primary key for all control/data paths.
+- `export_id` is the primary key for all control/data paths; `(export_id,
+  request_id)` identifies an in‑flight I/O.
+- `request_id` MUST NOT be reused for an export until its Response is
+  observed; reuse may be monotonic or wraparound after completion.
 - `num_blocks` is always in units of `block_size` for that export; neither
   Requests nor Responses carry byte lengths.
 - All reserved fields must be zero; gadgets/hosts should reject payloads that

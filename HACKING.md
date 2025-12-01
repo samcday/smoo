@@ -23,9 +23,9 @@ USB interface has **4 endpoints**:
 Control messages:
 
 * ≤ 1024 bytes
-* fixed-size LE structs
-* synchronous per-operation
-* strict ordering required
+* fixed-size LE structs keyed by `(export_id, request_id)`
+* pipelined; multiple requests may be in flight per export
+* Responses may return out-of-order; request_id used for matching
 
 Bulk transfers:
 
@@ -44,6 +44,9 @@ Bulk transfers:
 6. gadget completes ublk request
 
 **Invariant:** each ublk request maps to **exactly one Request + one Response**.
+Hosts/gadgets SHOULD keep queues full: multiple outstanding requests per export
+and across exports are expected (bounded by queue depth), using `(export_id,
+request_id)` as the uniqueness key.
 
 ---
 
@@ -76,13 +79,14 @@ Control-plane (`Request` / `Response`):
 * fixed-size, LE
 * fields:
 
+  * export_id
   * op: read/write/flush/discard
-  * request_id (unique per request)
+  * request_id (unique per export while in flight)
   * LBA
   * byte length (block-aligned)
   * flags (future)
 * MUST fit in one interrupt transfer
-* Responses carry the same `request_id` and MAY arrive out-of-order
+* Responses carry the same `(export_id, request_id)` and MAY arrive out-of-order
 
 Data (bulk):
 
@@ -129,11 +133,15 @@ Responsible for shuttling control + payload data.
 
 **Requirements:**
 
-* MUST preserve strict ordering (interrupt + bulk)
+* MUST correlate interrupt + bulk transfers by `(export_id, request_id)`; do not
+  drop or duplicate
+* MUST allow pipelining (multiple outstanding Requests per export); Responses
+  may be delivered out-of-order
 * MUST be cancellation-safe
 * MUST be async-first (Tokio)
 * MAY block internally if safe
-* Each `read_bulk` / `write_bulk` MUST correspond to one payload for one ublk op
+* Each `read_bulk` / `write_bulk` MUST correspond to one payload for one
+  `(export_id, request_id)` pair
 
 Implementations:
 
@@ -220,5 +228,5 @@ Failure to service ep0 promptly leads to EP0 STALL + possible gadget reset.
 * Agents MUST uphold:
 
   * cancellation safety
-  * ordering guarantees
+  * `(export_id, request_id)` matching guarantees
   * all invariants in this document
