@@ -7,6 +7,8 @@ pub mod control;
 pub mod export_id;
 #[cfg(feature = "std")]
 pub mod host;
+#[cfg(feature = "metrics")]
+pub mod metrics;
 #[cfg(feature = "std")]
 pub mod pump;
 pub mod transport;
@@ -20,6 +22,8 @@ pub use export_id::{
 };
 #[cfg(feature = "std")]
 pub use host::{HostError, HostErrorKind, HostResult, SmooHost};
+#[cfg(feature = "metrics")]
+pub use metrics::{MetricsSnapshot, QueueSnapshot, StatSnapshot};
 #[cfg(feature = "std")]
 pub use pump::{HostIoPumpHandle, HostIoPumpRequestRx, HostIoPumpTask, start_host_io_pump};
 pub use transport::{

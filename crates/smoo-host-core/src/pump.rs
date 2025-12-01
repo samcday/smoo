@@ -64,6 +64,8 @@ impl HostIoPumpHandle {
         self.send_cmd(PumpCmd::SendResponse {
             response,
             reply: reply_tx,
+            #[cfg(feature = "metrics")]
+            start: std::time::Instant::now(),
         })
         .await?;
         reply_rx.await.unwrap_or_else(|_| Err(disconnected_err()))
@@ -76,6 +78,8 @@ impl HostIoPumpHandle {
         self.send_cmd(PumpCmd::ReadBulk {
             buf: vec![0u8; len],
             reply: reply_tx,
+            #[cfg(feature = "metrics")]
+            start: std::time::Instant::now(),
         })
         .await?;
         reply_rx.await.unwrap_or_else(|_| Err(disconnected_err()))
@@ -88,6 +92,8 @@ impl HostIoPumpHandle {
         self.send_cmd(PumpCmd::WriteBulk {
             buf,
             reply: reply_tx,
+            #[cfg(feature = "metrics")]
+            start: std::time::Instant::now(),
         })
         .await?;
         reply_rx.await.unwrap_or_else(|_| Err(disconnected_err()))
@@ -111,14 +117,20 @@ enum PumpCmd {
     SendResponse {
         response: Response,
         reply: oneshot::Sender<TransportResult<()>>,
+        #[cfg(feature = "metrics")]
+        start: std::time::Instant,
     },
     ReadBulk {
         buf: Vec<u8>,
         reply: oneshot::Sender<TransportResult<Vec<u8>>>,
+        #[cfg(feature = "metrics")]
+        start: std::time::Instant,
     },
     WriteBulk {
         buf: Vec<u8>,
         reply: oneshot::Sender<TransportResult<()>>,
+        #[cfg(feature = "metrics")]
+        start: std::time::Instant,
     },
     Shutdown,
 }
@@ -126,16 +138,22 @@ enum PumpCmd {
 struct InterruptOutOp {
     response: Response,
     reply: oneshot::Sender<TransportResult<()>>,
+    #[cfg(feature = "metrics")]
+    start: std::time::Instant,
 }
 
 struct BulkInOp {
     buf: Vec<u8>,
     reply: oneshot::Sender<TransportResult<Vec<u8>>>,
+    #[cfg(feature = "metrics")]
+    start: std::time::Instant,
 }
 
 struct BulkOutOp {
     buf: Vec<u8>,
     reply: oneshot::Sender<TransportResult<()>>,
+    #[cfg(feature = "metrics")]
+    start: std::time::Instant,
 }
 
 type InterruptInFuture = Fuse<OptionFuture<BoxFuture<'static, TransportResult<Request>>>>;
@@ -264,6 +282,8 @@ where
                 transport.clone(),
                 op,
             )));
+            #[cfg(feature = "metrics")]
+            crate::metrics::record_bulk_out_queue(bulk_out_queue.len() + bulk_out_inflight.len());
         } else {
             break;
         }
@@ -271,21 +291,58 @@ where
 
     if let Poll::Ready(cmd) = cmd_rx.poll_next_unpin(cx) {
         match cmd {
-            Some(PumpCmd::SendResponse { response, reply }) => {
+            Some(PumpCmd::SendResponse {
+                response,
+                reply,
+                #[cfg(feature = "metrics")]
+                start,
+                ..
+            }) => {
                 tracing::trace!(
                     export_id = response.export_id,
                     request_id = response.request_id,
                     "pump: enqueue response"
                 );
-                interrupt_out_queue.push_back(InterruptOutOp { response, reply });
+                interrupt_out_queue.push_back(InterruptOutOp {
+                    response,
+                    reply,
+                    #[cfg(feature = "metrics")]
+                    start,
+                });
             }
-            Some(PumpCmd::ReadBulk { buf, reply }) => {
+            Some(PumpCmd::ReadBulk {
+                buf,
+                reply,
+                #[cfg(feature = "metrics")]
+                start,
+                ..
+            }) => {
                 tracing::trace!(bytes = buf.len(), "pump: enqueue bulk-in");
-                bulk_in_queue.push_back(BulkInOp { buf, reply });
+                #[cfg(feature = "metrics")]
+                crate::metrics::record_bulk_in_queue(bulk_in_queue.len() + 1);
+                bulk_in_queue.push_back(BulkInOp {
+                    buf,
+                    reply,
+                    #[cfg(feature = "metrics")]
+                    start,
+                });
             }
-            Some(PumpCmd::WriteBulk { buf, reply }) => {
+            Some(PumpCmd::WriteBulk {
+                buf,
+                reply,
+                #[cfg(feature = "metrics")]
+                start,
+                ..
+            }) => {
                 tracing::trace!(bytes = buf.len(), "pump: enqueue bulk-out");
-                bulk_out_queue.push_back(BulkOutOp { buf, reply });
+                #[cfg(feature = "metrics")]
+                crate::metrics::record_bulk_out_queue(bulk_out_queue.len() + 1);
+                bulk_out_queue.push_back(BulkOutOp {
+                    buf,
+                    reply,
+                    #[cfg(feature = "metrics")]
+                    start,
+                });
             }
             Some(PumpCmd::Shutdown) => return Poll::Ready(Ok(PumpProgress::Finished(Ok(())))),
             None => *cmd_closed = true,
@@ -332,6 +389,8 @@ where
                 let _ = reply.send(result);
             }
             bulk_in_inflight.pop_front();
+            #[cfg(feature = "metrics")]
+            crate::metrics::record_bulk_in_queue(bulk_in_queue.len() + bulk_in_inflight.len());
             made_progress = true;
         }
     }
@@ -375,6 +434,8 @@ where
 {
     OptionFuture::from(Some(
         async move {
+            #[cfg(feature = "metrics")]
+            let start = std::time::Instant::now();
             let mut buf = [0u8; REQUEST_LEN];
             let len = transport.read_interrupt(&mut buf).await?;
             if len != REQUEST_LEN {
@@ -382,6 +443,8 @@ where
                     "request transfer truncated (expected {REQUEST_LEN}, got {len})"
                 )));
             }
+            #[cfg(feature = "metrics")]
+            crate::metrics::observe_interrupt_in(len, start.elapsed());
             Request::decode(buf).map_err(|err| protocol_error(format!("decode request: {err}")))
         }
         .boxed(),
@@ -395,6 +458,8 @@ where
 {
     OptionFuture::from(Some(
         async move {
+            #[cfg(feature = "metrics")]
+            let start = op.start;
             let data = op.response.encode();
             let reply = op.reply;
             let result = match transport.write_interrupt(&data).await {
@@ -404,6 +469,10 @@ where
                 ))),
                 Err(err) => Err(err),
             };
+            #[cfg(feature = "metrics")]
+            if result.is_ok() {
+                crate::metrics::observe_interrupt_out(data.len(), start.elapsed());
+            }
             (reply, result)
         }
         .boxed(),
@@ -416,6 +485,8 @@ where
     T: Transport + Clone + Send + Sync + 'static,
 {
     async move {
+        #[cfg(feature = "metrics")]
+        let start = op.start;
         let mut buf = op.buf;
         let reply = op.reply;
         let len = transport.read_bulk(&mut buf).await;
@@ -427,6 +498,10 @@ where
             ))),
             Err(err) => Err(err),
         };
+        #[cfg(feature = "metrics")]
+        if let Ok(ref data) = result {
+            crate::metrics::observe_bulk_in(data.len(), start.elapsed());
+        }
         (reply, result)
     }
     .boxed()
@@ -437,6 +512,8 @@ where
     T: Transport + Clone + Send + Sync + 'static,
 {
     async move {
+        #[cfg(feature = "metrics")]
+        let start = op.start;
         let reply = op.reply;
         let len = op.buf.len();
         tracing::trace!(bytes = len, "pump: bulk-out transport write start");
@@ -450,6 +527,10 @@ where
         match &result {
             Ok(_) => tracing::trace!("pump: bulk-out transport write done"),
             Err(err) => tracing::warn!(%err, "pump: bulk-out transport write failed"),
+        }
+        #[cfg(feature = "metrics")]
+        if result.is_ok() {
+            crate::metrics::observe_bulk_out(len, start.elapsed());
         }
         (reply, result)
     }
