@@ -15,10 +15,10 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             cc: gcc
-            pkgs: ""
+            pkgs: "libssl-dev pkg-config"
           - target: aarch64-unknown-linux-gnu
             cc: aarch64-linux-gnu-gcc
-            pkgs: "gcc-aarch64-linux-gnu libc6-arm64-cross"
+            pkgs: "gcc-aarch64-linux-gnu libc6-arm64-cross libssl-dev pkg-config"
 
     env:
       CARGO_TERM_COLOR: always
@@ -34,8 +34,20 @@ jobs:
       - name: Install cross build deps (if needed)
         if: matrix.pkgs != ''
         run: |
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            sudo dpkg --add-architecture arm64
+            cat <<'EOF' | sudo tee /etc/apt/sources.list.d/arm64-ports.list
+            deb [arch=arm64] http://ports.ubuntu.com/ noble main restricted universe multiverse
+            deb [arch=arm64] http://ports.ubuntu.com/ noble-updates main restricted universe multiverse
+            deb [arch=arm64] http://ports.ubuntu.com/ noble-security main restricted universe multiverse
+            deb [arch=arm64] http://ports.ubuntu.com/ noble-backports main restricted universe multiverse
+          EOF
+          fi
           sudo apt-get update
           sudo apt-get install -y ${{ matrix.pkgs }}
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            sudo apt-get install -y libssl-dev:arm64
+          fi
 
 
       - name: Configure cross linkers
@@ -44,6 +56,7 @@ jobs:
             aarch64-unknown-linux-gnu)
               echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
               echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+              echo "PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig" >> $GITHUB_ENV
               ;;
             x86_64-unknown-linux-gnu)
               # native build; nothing special

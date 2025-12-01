@@ -11,6 +11,7 @@ makedepends="
 	cargo
 	clang-dev
 	libusb-dev
+	openssl-dev
 	linux-headers
 	llvm-dev
 	pkgconf

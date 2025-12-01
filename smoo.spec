@@ -15,6 +15,7 @@ Source:         %{url}/archive/%{version}/%{name}-%{version}.tar.gz
 
 BuildRequires:  cargo-rpm-macros >= 24
 BuildRequires:  clang-devel
+BuildRequires:  pkgconfig(openssl)
 
 %description
 smoo provides both sides of an inverted USB mass-storage protocol: a gadget
