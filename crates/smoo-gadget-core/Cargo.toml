@@ -8,6 +8,7 @@ license = "GPL-3.0-only"
 [features]
 default = []
 apkbuild = ["smoo-gadget-ublk/apkbuild"]
+metrics = ["dep:metrics"]
 
 [dependencies]
 anyhow = "1.0.100"
@@ -25,6 +26,7 @@ tokio = { version = "1.48.0", features = ["fs", "io-util", "rt", "sync"] }
 tracing = "0.1.41"
 async-trait = "0.1.83"
 usb-gadget = { version = "0.7.6", features = ["tokio"] }
+metrics = { version = "0.22", optional = true }
 
 [dev-dependencies]
 tempfile = "3.14.0"

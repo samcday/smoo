@@ -1,5 +1,8 @@
 use anyhow::{anyhow, ensure, Context, Result};
 use clap::{Parser, ValueEnum};
+use hyper::service::{make_service_fn, service_fn};
+use hyper::{Body, Request as HttpRequest, Response as HttpResponse, Server, StatusCode};
+use metrics_exporter_prometheus::PrometheusBuilder;
 use smoo_gadget_core::{
     ConfigExport, ConfigExportsV0, ControlIo, DmaHeap, ExportController, ExportFlags,
     ExportReconcileContext, ExportSpec, ExportState, FunctionfsEndpoints, GadgetConfig,
@@ -10,8 +13,10 @@ use smoo_gadget_core::{
 use smoo_proto::{Ident, OpCode, Request, Response, SMOO_STATUS_REQUEST, SMOO_STATUS_REQ_TYPE};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    convert::Infallible,
     fs::File,
     io,
+    net::SocketAddr,
     os::fd::{FromRawFd, IntoRawFd, OwnedFd},
     path::{Path, PathBuf},
     sync::{
@@ -31,6 +36,7 @@ use tokio::{
     },
     task::JoinHandle,
 };
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
 use tracing_subscriber::prelude::*;
 use usb_gadget::{
@@ -83,6 +89,9 @@ struct Args {
     /// Adopt existing ublk devices via user recovery.
     #[arg(long)]
     adopt: bool,
+    /// Expose Prometheus metrics on this TCP port (0 disables).
+    #[arg(long, default_value_t = 0)]
+    metrics_port: u16,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -112,6 +121,8 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    let metrics_shutdown = CancellationToken::new();
+    let metrics_task = spawn_metrics_listener(args.metrics_port, metrics_shutdown.clone())?;
     let mut ublk = SmooUblk::new().context("init ublk")?;
     let mut state_store = if let Some(path) = args.state_file.as_ref() {
         info!(path = ?path, "state file configured");
@@ -205,10 +216,67 @@ async fn main() -> Result<()> {
         control_stop_tx.clone(),
     )
     .await;
+    metrics_shutdown.cancel();
+    if let Some(task) = metrics_task {
+        let _ = task.await;
+    }
     let _ = control_stop_tx.send(true);
     control_task.abort();
     let _ = control_task.await;
     result
+}
+
+fn spawn_metrics_listener(
+    port: u16,
+    shutdown: CancellationToken,
+) -> Result<Option<JoinHandle<()>>> {
+    if port == 0 {
+        return Ok(None);
+    }
+    let handle = PrometheusBuilder::new()
+        .install_recorder()
+        .context("install Prometheus metrics recorder")?;
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let task = tokio::spawn(async move {
+        let make_svc = make_service_fn(move |_conn| {
+            let handle = handle.clone();
+            async move {
+                Ok::<_, Infallible>(service_fn(move |req: HttpRequest<Body>| {
+                    let handle = handle.clone();
+                    async move {
+                        if req.uri().path() != "/metrics" {
+                            return Ok::<_, Infallible>(
+                                HttpResponse::builder()
+                                    .status(StatusCode::NOT_FOUND)
+                                    .body(Body::from("not found"))
+                                    .unwrap(),
+                            );
+                        }
+                        let body = handle.render();
+                        Ok::<_, Infallible>(
+                            HttpResponse::builder()
+                                .status(StatusCode::OK)
+                                .header(hyper::header::CONTENT_TYPE, "text/plain; version=0.0.4")
+                                .body(Body::from(body))
+                                .unwrap(),
+                        )
+                    }
+                }))
+            }
+        });
+
+        let server = Server::bind(&addr).serve(make_svc);
+        let graceful = server.with_graceful_shutdown(async {
+            shutdown.cancelled().await;
+        });
+
+        if let Err(err) = graceful.await {
+            warn!(error = %err, %addr, "metrics server error");
+        }
+    });
+
+    info!(%addr, "metrics listener started");
+    Ok(Some(task))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -378,6 +446,11 @@ struct InflightRequest {
     block_size: usize,
 }
 
+fn update_inflight_gauge(map: &HashMap<u32, HashMap<u32, InflightRequest>>) {
+    let total = map.values().map(|m| m.len()).sum::<usize>();
+    smoo_gadget_core::record_inflight_requests(total);
+}
+
 async fn take_inflight_entry(
     inflight: &Arc<Mutex<HashMap<u32, HashMap<u32, InflightRequest>>>>,
     export_id: u32,
@@ -392,6 +465,7 @@ async fn take_inflight_entry(
             guard.remove(&export_id);
         }
     }
+    update_inflight_gauge(&guard);
     entry
 }
 
@@ -1158,6 +1232,7 @@ async fn handle_request(
             .entry(export_id)
             .or_default()
             .insert(request_id, entry);
+        update_inflight_gauge(&guard);
     }
     trace!(
         export_id,
@@ -1317,6 +1392,7 @@ async fn response_loop(
     loop {
         let response = {
             let mut buf = [0u8; smoo_proto::RESPONSE_LEN];
+            let start = Instant::now();
             let read_res = {
                 let mut lock = interrupt_out.lock().await;
                 lock.read_exact(&mut buf).await
@@ -1325,6 +1401,7 @@ async fn response_loop(
                 warn!(error = ?err, "response reader exiting after error");
                 break;
             }
+            smoo_gadget_core::observe_interrupt_out(buf.len(), start.elapsed());
             match Response::try_from(buf.as_slice()) {
                 Ok(resp) => resp,
                 Err(err) => {
@@ -1333,12 +1410,7 @@ async fn response_loop(
                 }
             }
         };
-        let entry = {
-            let mut guard = inflight.lock().await;
-            guard
-                .get_mut(&response.export_id)
-                .and_then(|m| m.remove(&response.request_id))
-        };
+        let entry = take_inflight_entry(&inflight, response.export_id, response.request_id).await;
         let Some(entry) = entry else {
             warn!(
                 request_id = response.request_id,
@@ -2079,6 +2151,7 @@ async fn drain_inflight(inflight: &Arc<Mutex<HashMap<u32, HashMap<u32, InflightR
             let _ = req.queues.complete_io(req.request, -libc::ENOLINK);
         }
     }
+    update_inflight_gauge(&guard);
 }
 
 fn io_error_from_anyhow(err: &anyhow::Error) -> io::Error {
