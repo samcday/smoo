@@ -90,9 +90,9 @@ impl NusbTransport {
             .map_err(|err| map_nusb_error("open bulk_out endpoint", err))?;
 
         let interrupt_in_mps = interrupt_in_ep.max_packet_size() as usize;
-        let interrupt_out_mps = interrupt_out_ep.max_packet_size() as usize;
+        let _interrupt_out_mps = interrupt_out_ep.max_packet_size() as usize;
         let bulk_in_mps = bulk_in_ep.max_packet_size() as usize;
-        let bulk_out_mps = bulk_out_ep.max_packet_size() as usize;
+        let _bulk_out_mps = bulk_out_ep.max_packet_size() as usize;
         let interrupt_transfer_size = interrupt_in_mps.max(1024);
         let bulk_transfer_size = bulk_in_mps.max(64 * 1024);
 
@@ -144,15 +144,15 @@ impl NusbTransport {
             .map_err(|err| map_nusb_error("list devices", err))?;
         let mut selected = None;
         for info in devices {
-            if let Some(v) = vendor_id {
-                if info.vendor_id() != v {
-                    continue;
-                }
+            if let Some(v) = vendor_id
+                && info.vendor_id() != v
+            {
+                continue;
             }
-            if let Some(p) = product_id {
-                if info.product_id() != p {
-                    continue;
-                }
+            if let Some(p) = product_id
+                && info.product_id() != p
+            {
+                continue;
             }
             if info.interfaces().any(|iface| {
                 iface.class() == class
@@ -175,7 +175,7 @@ impl NusbTransport {
             .map(|iface| iface.interface_number())
             .ok_or_else(|| TransportError::new(TransportErrorKind::NotReady))?;
 
-        let mut device = info
+        let device = info
             .open()
             .await
             .map_err(|err| map_nusb_error("open device", err))?;

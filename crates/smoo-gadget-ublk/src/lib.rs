@@ -918,7 +918,7 @@ impl SmooUblkDevice {
     }
 
     pub fn into_parts(self) -> (UblkCtrlHandle, Arc<UblkQueueRuntime>) {
-        let mut this = ManuallyDrop::new(self);
+        let this = ManuallyDrop::new(self);
         // Safe because ManuallyDrop prevents Drop; we take ownership of the fields.
         let ctrl = unsafe { std::ptr::read(&this.ctrl) };
         let queues = unsafe { std::ptr::read(&this.queues) };

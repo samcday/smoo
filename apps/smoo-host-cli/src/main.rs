@@ -304,7 +304,7 @@ async fn run_session(
         }
     });
     let (pump_handle, request_rx, pump_task) = start_host_io_pump(transport);
-    let mut pump_task = tokio::spawn(async move { pump_task.await });
+    let mut pump_task = tokio::spawn(pump_task);
     let mut host = SmooHost::new(pump_handle.clone(), request_rx, sources);
     host.record_ident(ident);
     info!(

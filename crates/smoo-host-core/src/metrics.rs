@@ -1,5 +1,3 @@
-#![cfg(feature = "metrics")]
-
 use core::time::Duration;
 use metrics::{counter, gauge, histogram};
 use std::sync::atomic::{AtomicU64, Ordering};

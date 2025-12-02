@@ -446,12 +446,8 @@ async fn queue_task_loop(
 ) {
     loop {
         tokio::select! {
-            changed = stop.changed() => {
-                if changed.is_ok() {
-                    break;
-                } else {
-                    break;
-                }
+            _changed = stop.changed() => {
+                break;
             }
             req = queues.next_io(queue_id) => {
                 match req {
@@ -799,6 +795,7 @@ async fn run_reconcile_slice(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn drive_runtime(
     ublk: &mut SmooUblk,
     runtime: &mut RuntimeState,
@@ -942,31 +939,28 @@ async fn run_event_loop(
                 }
             }
             maybe_evt = queue_rx.recv(), if !matches!(shutdown_state, ShutdownState::Forceful) => {
-                match maybe_evt {
-                    Some(evt) => {
-                        if let Err(err) = handle_queue_event(&mut runtime, &mut link, &inflight, &mut outstanding, evt).await {
-                            io_error = Some(err);
-                            break;
-                        }
-                        if let Err(err) = drain_queue_batch(&mut runtime, &mut link, &inflight, &mut outstanding, &mut queue_rx).await {
-                            io_error = Some(err);
-                            break;
-                        }
-                        if let Err(err) = drive_runtime(
-                            ublk,
-                            &mut runtime,
-                            &mut link,
-                            &inflight,
-                            &mut outstanding,
-                            queue_tx.as_ref(),
-                            &mut response_task,
-                            false,
-                        ).await {
-                            io_error = Some(err);
-                            break;
-                        }
+                if let Some(evt) = maybe_evt {
+                    if let Err(err) = handle_queue_event(&mut runtime, &mut link, &inflight, &mut outstanding, evt).await {
+                        io_error = Some(err);
+                        break;
                     }
-                    None => {}
+                    if let Err(err) = drain_queue_batch(&mut runtime, &mut link, &inflight, &mut outstanding, &mut queue_rx).await {
+                        io_error = Some(err);
+                        break;
+                    }
+                    if let Err(err) = drive_runtime(
+                        ublk,
+                        &mut runtime,
+                        &mut link,
+                        &inflight,
+                        &mut outstanding,
+                        queue_tx.as_ref(),
+                        &mut response_task,
+                        false,
+                    ).await {
+                        io_error = Some(err);
+                        break;
+                    }
                 }
             }
             _ = ep0_notified.as_mut() => {
