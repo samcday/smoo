@@ -29,6 +29,10 @@ pub fn observe_bulk_out(bytes: usize, dur: Duration) {
     histogram!("smoo_gadget_bulk_out_latency_ns").record(ns as f64);
 }
 
+pub fn record_pending_requests(count: usize) {
+    gauge!("smoo_gadget_pending_requests").set(count as f64);
+}
+
 pub fn record_inflight_requests(count: usize) {
     gauge!("smoo_gadget_inflight_requests").set(count as f64);
 }

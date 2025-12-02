@@ -32,7 +32,7 @@ use tokio::{
     sync::{
         mpsc,
         mpsc::error::{TryRecvError, TrySendError},
-        watch, Mutex, Notify, RwLock,
+        oneshot, watch, Mutex, Notify, RwLock,
     },
     task::JoinHandle,
 };
@@ -444,11 +444,17 @@ struct InflightRequest {
     queues: Arc<UblkQueueRuntime>,
     req_len: usize,
     block_size: usize,
+    sent: bool,
 }
 
-fn update_inflight_gauge(map: &HashMap<u32, HashMap<u32, InflightRequest>>) {
-    let total = map.values().map(|m| m.len()).sum::<usize>();
-    smoo_gadget_core::record_inflight_requests(total);
+fn update_request_gauges(map: &HashMap<u32, HashMap<u32, InflightRequest>>) {
+    let pending = map.values().map(|m| m.len()).sum::<usize>();
+    let inflight = map
+        .values()
+        .map(|m| m.values().filter(|req| req.sent).count())
+        .sum::<usize>();
+    smoo_gadget_core::record_pending_requests(pending);
+    smoo_gadget_core::record_inflight_requests(inflight);
 }
 
 async fn take_inflight_entry(
@@ -465,8 +471,23 @@ async fn take_inflight_entry(
             guard.remove(&export_id);
         }
     }
-    update_inflight_gauge(&guard);
+    update_request_gauges(&guard);
     entry
+}
+
+async fn mark_request_sent(
+    inflight: &Arc<Mutex<HashMap<u32, HashMap<u32, InflightRequest>>>>,
+    export_id: u32,
+    request_id: u32,
+) {
+    let mut guard = inflight.lock().await;
+    if let Some(entry) = guard
+        .get_mut(&export_id)
+        .and_then(|map| map.get_mut(&request_id))
+    {
+        entry.sent = true;
+    }
+    update_request_gauges(&guard);
 }
 
 fn build_initial_exports(state_store: &StateStore) -> HashMap<u32, ExportController> {
@@ -1227,12 +1248,13 @@ async fn handle_request(
             queues: queues.clone(),
             req_len,
             block_size,
+            sent: false,
         };
         guard
             .entry(export_id)
             .or_default()
             .insert(request_id, entry);
-        update_inflight_gauge(&guard);
+        update_request_gauges(&guard);
     }
     trace!(
         export_id,
@@ -1246,6 +1268,13 @@ async fn handle_request(
     );
 
     let inflight_map = inflight.clone();
+    let inflight_for_sent = inflight.clone();
+    let (sent_tx, sent_rx) = oneshot::channel();
+    let sent_marker = tokio::spawn(async move {
+        if sent_rx.await.is_ok() {
+            mark_request_sent(&inflight_for_sent, export_id, request_id).await;
+        }
+    });
     tokio::spawn(async move {
         let work = IoWork {
             request: proto_req,
@@ -1254,6 +1283,7 @@ async fn handle_request(
             tag: req.tag,
             op: opcode,
             queues: queues.clone(),
+            on_request_sent: Some(sent_tx),
         };
         if let Err(err) = pump.submit(work).await {
             if let Some(entry) = take_inflight_entry(&inflight_map, export_id, request_id).await {
@@ -1267,6 +1297,7 @@ async fn handle_request(
                 "io pump error dispatching request"
             );
         }
+        let _ = sent_marker.await;
     });
 
     Ok(())
@@ -2151,7 +2182,7 @@ async fn drain_inflight(inflight: &Arc<Mutex<HashMap<u32, HashMap<u32, InflightR
             let _ = req.queues.complete_io(req.request, -libc::ENOLINK);
         }
     }
-    update_inflight_gauge(&guard);
+    update_request_gauges(&guard);
 }
 
 fn io_error_from_anyhow(err: &anyhow::Error) -> io::Error {

@@ -18,6 +18,7 @@ pub struct IoWork {
     pub tag: u16,
     pub op: OpCode,
     pub queues: Arc<UblkQueueRuntime>,
+    pub on_request_sent: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 struct IoCommand {
@@ -58,16 +59,39 @@ impl IoPumpHandle {
 }
 
 async fn run_pump(gadget: Arc<SmooGadget>, mut rx: mpsc::Receiver<IoCommand>) {
-    while let Some(IoCommand { work, completion }) = rx.recv().await {
-        let result = process_work(&gadget, work).await;
-        if completion.send(result).is_err() {
-            trace!("io pump: completion receiver dropped");
+    let (bulk_tx, mut bulk_rx) =
+        mpsc::channel::<(IoWork, oneshot::Sender<Result<()>>)>(rx.capacity());
+
+    let bulk_gadget = gadget.clone();
+    let bulk_task = tokio::spawn(async move {
+        while let Some((work, completion)) = bulk_rx.recv().await {
+            let result = process_bulk(&bulk_gadget, work).await;
+            if completion.send(result).is_err() {
+                trace!("io pump: completion receiver dropped");
+            }
+        }
+    });
+
+    while let Some(mut cmd) = rx.recv().await {
+        let send_result = process_send(&gadget, &mut cmd.work).await;
+        if let Err(err) = send_result {
+            if cmd.completion.send(Err(err)).is_err() {
+                trace!("io pump: completion receiver dropped");
+            }
+            continue;
+        }
+        if bulk_tx.send((cmd.work, cmd.completion)).await.is_err() {
+            trace!("io pump: bulk worker closed; exiting");
+            break;
         }
     }
+
+    drop(bulk_tx);
+    let _ = bulk_task.await;
     trace!("io pump: channel closed; exiting");
 }
 
-async fn process_work(gadget: &SmooGadget, work: IoWork) -> Result<()> {
+async fn process_send(gadget: &SmooGadget, work: &mut IoWork) -> Result<()> {
     trace!(
         export_id = work.request.export_id,
         request_id = work.request.request_id,
@@ -81,6 +105,23 @@ async fn process_work(gadget: &SmooGadget, work: IoWork) -> Result<()> {
         .send_request(work.request)
         .await
         .map_err(|err| anyhow!("send smoo request: {err:#}"))?;
+
+    if let Some(sent) = work.on_request_sent.take() {
+        let _ = sent.send(());
+    }
+    Ok(())
+}
+
+async fn process_bulk(gadget: &SmooGadget, work: IoWork) -> Result<()> {
+    trace!(
+        export_id = work.request.export_id,
+        request_id = work.request.request_id,
+        queue = work.queue_id,
+        tag = work.tag,
+        op = ?work.op,
+        bytes = work.req_len,
+        "io pump: process bulk"
+    );
 
     if work.req_len == 0 {
         return Ok(());
