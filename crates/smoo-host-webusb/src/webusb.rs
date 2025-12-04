@@ -5,10 +5,12 @@ use js_sys::{Promise, Uint8Array};
 use smoo_host_core::{
     ControlTransport, Transport, TransportError, TransportErrorKind, TransportResult,
 };
+use tracing::{debug, trace};
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    UsbControlTransferParameters, UsbDevice, UsbInTransferResult, UsbOutTransferResult,
+    UsbAlternateInterface, UsbConfiguration, UsbControlTransferParameters, UsbDevice, UsbDirection,
+    UsbEndpoint, UsbEndpointType, UsbInTransferResult, UsbInterface, UsbOutTransferResult,
     UsbRecipient, UsbRequestType, UsbTransferStatus,
 };
 
@@ -71,10 +73,19 @@ impl WebUsbTransport {
     /// This will `open()` the device and `claim_interface()` using the supplied config.
     pub async fn new(device: UsbDevice, config: WebUsbTransportConfig) -> TransportResult<Self> {
         open_and_claim(&device, config.interface).await?;
+        let resolved = resolve_endpoints(&device, config)?;
+        debug!(
+            interface = resolved.interface,
+            interrupt_in = resolved.interrupt_in,
+            interrupt_out = resolved.interrupt_out,
+            bulk_in = resolved.bulk_in,
+            bulk_out = resolved.bulk_out,
+            "webusb: endpoints resolved"
+        );
         let control = WebUsbControl::new(device.clone(), config.interface);
         Ok(Self {
             device: SendUsbDevice(device),
-            config,
+            config: resolved,
             control,
         })
     }
@@ -94,10 +105,19 @@ impl ControlTransport for WebUsbControl {
         buf: &mut [u8],
     ) -> TransportResult<usize> {
         self.ensure_open()?;
-        let len: u16 = buf
-            .len()
-            .try_into()
-            .map_err(|_| TransportError::with_message(TransportErrorKind::Protocol, "control_in length exceeds u16"))?;
+        let len: u16 = buf.len().try_into().map_err(|_| {
+            TransportError::with_message(
+                TransportErrorKind::Protocol,
+                "control_in length exceeds u16",
+            )
+        })?;
+        trace!(
+            req_type = request_type,
+            request,
+            len = buf.len(),
+            interface = self.interface,
+            "webusb: control_in"
+        );
         let promise = {
             let params = control_params(request_type, request, self.interface);
             self.device.control_transfer_in(&params, len)
@@ -115,9 +135,25 @@ impl ControlTransport for WebUsbControl {
                     .ok_or_else(|| TransportError::new(TransportErrorKind::Protocol))?;
                 let view = Uint8Array::new(&data);
                 let read = view.length() as usize;
-                let copy_len = buf.len().min(read);
-                view.slice(0, copy_len as u32).copy_to(buf);
-                Ok(copy_len)
+                trace!(
+                    req_type = request_type,
+                    request,
+                    expected = buf.len(),
+                    read,
+                    "webusb: control_in status OK"
+                );
+                if read != buf.len() {
+                    return Err(TransportError::with_message(
+                        TransportErrorKind::Protocol,
+                        format!(
+                            "control_in length mismatch (expected {}, got {})",
+                            buf.len(),
+                            read
+                        ),
+                    ));
+                }
+                view.copy_to(buf);
+                Ok(read)
             }
             status => Err(TransportError::with_message(
                 map_transfer_status(status),
@@ -133,6 +169,13 @@ impl ControlTransport for WebUsbControl {
         data: &[u8],
     ) -> TransportResult<usize> {
         self.ensure_open()?;
+        trace!(
+            req_type = request_type,
+            request,
+            len = data.len(),
+            interface = self.interface,
+            "webusb: control_out"
+        );
         let promise = {
             let params = control_params(request_type, request, self.interface);
             let payload = Uint8Array::from(data);
@@ -180,19 +223,47 @@ impl ControlTransport for WebUsbTransport {
 #[async_trait]
 impl Transport for WebUsbTransport {
     async fn read_interrupt(&self, buf: &mut [u8]) -> TransportResult<usize> {
-        transfer_in(self.device.clone(), self.config.interrupt_in, buf).await
+        transfer_in(
+            self.device.clone(),
+            self.config
+                .interrupt_in
+                .expect("interrupt_in resolved during construction"),
+            buf,
+        )
+        .await
     }
 
     async fn write_interrupt(&self, buf: &[u8]) -> TransportResult<usize> {
-        transfer_out(self.device.clone(), self.config.interrupt_out, buf).await
+        transfer_out(
+            self.device.clone(),
+            self.config
+                .interrupt_out
+                .expect("interrupt_out resolved during construction"),
+            buf,
+        )
+        .await
     }
 
     async fn read_bulk(&self, buf: &mut [u8]) -> TransportResult<usize> {
-        transfer_in(self.device.clone(), self.config.bulk_in, buf).await
+        transfer_in(
+            self.device.clone(),
+            self.config
+                .bulk_in
+                .expect("bulk_in resolved during construction"),
+            buf,
+        )
+        .await
     }
 
     async fn write_bulk(&self, buf: &[u8]) -> TransportResult<usize> {
-        transfer_out(self.device.clone(), self.config.bulk_out, buf).await
+        transfer_out(
+            self.device.clone(),
+            self.config
+                .bulk_out
+                .expect("bulk_out resolved during construction"),
+            buf,
+        )
+        .await
     }
 }
 
@@ -223,11 +294,11 @@ impl std::ops::Deref for SendUsbDevice {
 fn control_params(request_type: u8, request: u8, interface: u8) -> UsbControlTransferParameters {
     let (req_type, recipient) = decode_request_type(request_type);
     UsbControlTransferParameters::new(
-        0,
+        interface as u16,
         recipient.unwrap_or(UsbRecipient::Interface),
         request,
         req_type,
-        interface as u16,
+        0,
     )
 }
 
@@ -268,17 +339,24 @@ async fn open_and_claim(device: &UsbDevice, interface: u8) -> TransportResult<()
     Ok(())
 }
 
-async fn transfer_in(device: SendUsbDevice, endpoint: u8, buf: &mut [u8]) -> TransportResult<usize> {
+async fn transfer_in(
+    device: SendUsbDevice,
+    endpoint: u8,
+    buf: &mut [u8],
+) -> TransportResult<usize> {
     if buf.is_empty() {
         return Ok(0);
     }
     if !device.opened() {
         return Err(TransportError::new(TransportErrorKind::NotReady));
     }
-    let len: u32 = buf
-        .len()
-        .try_into()
-        .map_err(|_| TransportError::with_message(TransportErrorKind::Protocol, "transfer_in length exceeds u32"))?;
+    trace!(endpoint, len = buf.len(), "webusb: transfer_in");
+    let len: u32 = buf.len().try_into().map_err(|_| {
+        TransportError::with_message(
+            TransportErrorKind::Protocol,
+            "transfer_in length exceeds u32",
+        )
+    })?;
     let promise = device.clone_inner().transfer_in(endpoint, len);
     let result = SendJsFuture::from(promise)
         .await
@@ -295,6 +373,13 @@ async fn transfer_in(device: SendUsbDevice, endpoint: u8, buf: &mut [u8]) -> Tra
             let read = view.length() as usize;
             let copy_len = buf.len().min(read);
             view.slice(0, copy_len as u32).copy_to(buf);
+            trace!(
+                endpoint,
+                requested = buf.len(),
+                read,
+                copied = copy_len,
+                "webusb: transfer_in status OK"
+            );
             Ok(copy_len)
         }
         status => Err(TransportError::with_message(
@@ -311,6 +396,7 @@ async fn transfer_out(device: SendUsbDevice, endpoint: u8, buf: &[u8]) -> Transp
     if !device.opened() {
         return Err(TransportError::new(TransportErrorKind::NotReady));
     }
+    trace!(endpoint, len = buf.len(), "webusb: transfer_out");
     let promise = {
         let payload = Uint8Array::from(buf);
         let promise = device
@@ -353,4 +439,144 @@ fn js_as_string(js: &wasm_bindgen::JsValue) -> Option<String> {
         js.dyn_ref::<js_sys::Error>()
             .and_then(|e| e.message().as_string())
     })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EndpointInfo {
+    number: u8,
+    direction: UsbDirection,
+    kind: UsbEndpointType,
+}
+
+fn resolve_endpoints(
+    device: &UsbDevice,
+    preferred: WebUsbTransportConfig,
+) -> TransportResult<WebUsbTransportConfig> {
+    let configuration = device
+        .configuration()
+        .ok_or_else(|| TransportError::new(TransportErrorKind::NotReady))?;
+    let interface = find_interface(&configuration, preferred.interface)?.ok_or_else(|| {
+        TransportError::with_message(
+            TransportErrorKind::NotReady,
+            format!("interface {} not present", preferred.interface),
+        )
+    })?;
+    let active = interface.alternate();
+    let endpoints = collect_endpoints(&active)?;
+    trace!(
+        interface = interface.interface_number(),
+        endpoints = %describe_endpoints(&endpoints),
+        "webusb: discovered endpoints"
+    );
+
+    let interrupt_in = choose_endpoint(
+        &endpoints,
+        preferred.interrupt_in,
+        UsbDirection::In,
+        UsbEndpointType::Interrupt,
+        "interrupt_in",
+    )?;
+    let interrupt_out = choose_endpoint(
+        &endpoints,
+        preferred.interrupt_out,
+        UsbDirection::Out,
+        UsbEndpointType::Interrupt,
+        "interrupt_out",
+    )?;
+    let bulk_in = choose_endpoint(
+        &endpoints,
+        preferred.bulk_in,
+        UsbDirection::In,
+        UsbEndpointType::Bulk,
+        "bulk_in",
+    )?;
+    let bulk_out = choose_endpoint(
+        &endpoints,
+        preferred.bulk_out,
+        UsbDirection::Out,
+        UsbEndpointType::Bulk,
+        "bulk_out",
+    )?;
+
+    Ok(WebUsbTransportConfig {
+        interface: preferred.interface,
+        interrupt_in: Some(interrupt_in),
+        interrupt_out: Some(interrupt_out),
+        bulk_in: Some(bulk_in),
+        bulk_out: Some(bulk_out),
+    })
+}
+
+fn find_interface(
+    configuration: &UsbConfiguration,
+    interface_number: u8,
+) -> TransportResult<Option<UsbInterface>> {
+    let mut found = None;
+    for iface in configuration.interfaces().iter() {
+        let iface: UsbInterface = iface
+            .dyn_into()
+            .map_err(|err| js_error("interface cast", err))?;
+        if iface.interface_number() == interface_number {
+            found = Some(iface);
+            break;
+        }
+    }
+    Ok(found)
+}
+
+fn collect_endpoints(alternate: &UsbAlternateInterface) -> TransportResult<Vec<EndpointInfo>> {
+    let mut endpoints = Vec::new();
+    for ep in alternate.endpoints().iter() {
+        let ep: UsbEndpoint = ep
+            .dyn_into()
+            .map_err(|err| js_error("endpoint cast", err))?;
+        endpoints.push(EndpointInfo {
+            number: ep.endpoint_number(),
+            direction: ep.direction(),
+            kind: ep.type_(),
+        });
+    }
+    Ok(endpoints)
+}
+
+fn choose_endpoint(
+    endpoints: &[EndpointInfo],
+    preferred: Option<u8>,
+    direction: UsbDirection,
+    kind: UsbEndpointType,
+    label: &str,
+) -> TransportResult<u8> {
+    if let Some(pref) = preferred {
+        if let Some(ep) = endpoints
+            .iter()
+            .find(|ep| ep.number == pref && ep.direction == direction && ep.kind == kind)
+        {
+            return Ok(ep.number);
+        }
+    }
+    if let Some(ep) = endpoints
+        .iter()
+        .find(|ep| ep.direction == direction && ep.kind == kind)
+    {
+        return Ok(ep.number);
+    }
+
+    Err(TransportError::with_message(
+        TransportErrorKind::Protocol,
+        format!(
+            "{label} endpoint not found (direction={direction:?}, type={kind:?}); available={}",
+            describe_endpoints(endpoints)
+        ),
+    ))
+}
+
+fn describe_endpoints(endpoints: &[EndpointInfo]) -> String {
+    if endpoints.is_empty() {
+        return "[]".to_string();
+    }
+    let parts: Vec<String> = endpoints
+        .iter()
+        .map(|ep| format!("#{}:{:?}/{:?}", ep.number, ep.direction, ep.kind))
+        .collect();
+    format!("[{}]", parts.join(", "))
 }
