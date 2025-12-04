@@ -5,6 +5,7 @@ extern crate alloc;
 pub mod block;
 pub mod control;
 pub mod export_id;
+pub mod exports;
 #[cfg(feature = "std")]
 pub mod host;
 #[cfg(feature = "metrics")]
@@ -20,6 +21,7 @@ pub use export_id::{
     ExportHasher32, ExportIdentity, derive_export_id, derive_export_id_from_source,
     derive_export_id_with,
 };
+pub use exports::{ExportConfigError, ExportConfigErrorKind, register_export};
 #[cfg(feature = "std")]
 pub use host::{HostError, HostErrorKind, HostResult, SmooHost};
 #[cfg(feature = "metrics")]

@@ -10,8 +10,8 @@ use smoo_host_blocksources::file::FileBlockSource;
 use smoo_host_blocksources::random::RandomBlockSource;
 use smoo_host_core::{
     control::{fetch_ident, read_status, send_config_exports_v0, ConfigExportsV0},
-    derive_export_id_from_source, start_host_io_pump, BlockSource, BlockSourceHandle,
-    BlockSourceResult, ExportIdentity, HostErrorKind, SmooHost, TransportError, TransportErrorKind,
+    register_export, start_host_io_pump, BlockSource, BlockSourceHandle, BlockSourceResult,
+    ExportIdentity, HostErrorKind, SmooHost, TransportError, TransportErrorKind,
 };
 use smoo_host_transport_rusb::{RusbControl, RusbTransport};
 use smoo_proto::SmooStatusV0;
@@ -399,7 +399,15 @@ async fn open_sources(args: &Args) -> Result<(BTreeMap<u32, BlockSourceHandle>, 
             HostSource::File(FileBlockSource::open(path, block_size).await?),
             identity.clone(),
         );
-        register_export(&mut sources, &mut entries, source, block_size, size_bytes)?;
+        register_export(
+            &mut sources,
+            &mut entries,
+            source,
+            identity,
+            block_size,
+            size_bytes,
+        )
+        .map_err(|err| anyhow!(err.to_string()))?;
     }
 
     for path in &args.devices {
@@ -410,7 +418,15 @@ async fn open_sources(args: &Args) -> Result<(BTreeMap<u32, BlockSourceHandle>, 
             HostSource::Device(DeviceBlockSource::open(path, block_size).await?),
             identity.clone(),
         );
-        register_export(&mut sources, &mut entries, source, block_size, size_bytes)?;
+        register_export(
+            &mut sources,
+            &mut entries,
+            source,
+            identity,
+            block_size,
+            size_bytes,
+        )
+        .map_err(|err| anyhow!(err.to_string()))?;
     }
 
     for url_str in &args.http {
@@ -431,7 +447,15 @@ async fn open_sources(args: &Args) -> Result<(BTreeMap<u32, BlockSourceHandle>, 
         );
         let source_id = format!("http:{}", url);
         let shared = BlockSourceHandle::new(HostSource::Http(source), source_id);
-        register_export(&mut sources, &mut entries, shared, block_size, size_bytes)?;
+        register_export(
+            &mut sources,
+            &mut entries,
+            shared,
+            format!("http:{url}"),
+            block_size,
+            size_bytes,
+        )
+        .map_err(|err| anyhow!(err.to_string()))?;
     }
 
     for url_str in &args.cached_http {
@@ -458,7 +482,15 @@ async fn open_sources(args: &Args) -> Result<(BTreeMap<u32, BlockSourceHandle>, 
             .context("init cached HTTP block source")?;
         let source_id = format!("cached-http:{}", url);
         let shared = BlockSourceHandle::new(HostSource::CachedHttp(cached), source_id);
-        register_export(&mut sources, &mut entries, shared, block_size, size_bytes)?;
+        register_export(
+            &mut sources,
+            &mut entries,
+            shared,
+            format!("cached-http:{url}"),
+            block_size,
+            size_bytes,
+        )
+        .map_err(|err| anyhow!(err.to_string()))?;
     }
 
     for (idx, blocks) in args.random.iter().copied().enumerate() {
@@ -471,45 +503,20 @@ async fn open_sources(args: &Args) -> Result<(BTreeMap<u32, BlockSourceHandle>, 
             HostSource::Random(RandomBlockSource::new(block_size, blocks, seed)?),
             format!("random:{seed}"),
         );
-        register_export(&mut sources, &mut entries, source, block_size, size_bytes)?;
+        register_export(
+            &mut sources,
+            &mut entries,
+            source,
+            format!("random:{seed}"),
+            block_size,
+            size_bytes,
+        )
+        .map_err(|err| anyhow!(err.to_string()))?;
     }
 
     let payload = ConfigExportsV0::from_slice(&entries)
         .map_err(|err| anyhow!("build CONFIG_EXPORTS payload: {err:?}"))?;
     Ok((sources, payload))
-}
-
-fn register_export(
-    sources: &mut BTreeMap<u32, BlockSourceHandle>,
-    entries: &mut Vec<smoo_proto::ConfigExport>,
-    source: BlockSourceHandle,
-    block_size: u32,
-    size_bytes: u64,
-) -> Result<()> {
-    let identity = source.identity().to_string();
-    ensure!(
-        source.block_size() == block_size,
-        "backing {identity} block size {} disagrees with configuration {}",
-        source.block_size(),
-        block_size
-    );
-    ensure!(
-        size_bytes.is_multiple_of(block_size as u64),
-        "backing size for {identity} must align to block size"
-    );
-    let block_count = size_bytes / block_size as u64;
-    let export_id = derive_export_id_from_source(&source, block_count);
-    ensure!(
-        !sources.contains_key(&export_id),
-        "derived duplicate export_id {export_id} for backing {identity}; check for repeated inputs or adjust backing parameters to avoid collisions"
-    );
-    sources.insert(export_id, source);
-    entries.push(smoo_proto::ConfigExport {
-        export_id,
-        block_size,
-        size_bytes,
-    });
-    Ok(())
 }
 
 fn file_size_bytes(path: &PathBuf) -> Result<u64> {
