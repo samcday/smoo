@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>smoo web host demo</title>
+  <style>
+    :root {
+      font-family: "Fira Sans", "Segoe UI", system-ui, sans-serif;
+      background: #0f1115;
+      color: #e8ecf0;
+    }
+    body {
+      max-width: 720px;
+      margin: 0 auto;
+      padding: 32px 20px 48px;
+      line-height: 1.5;
+    }
+    h1 {
+      font-size: 1.6rem;
+      margin: 0 0 12px;
+      letter-spacing: 0.01em;
+    }
+    .panel {
+      background: #151821;
+      border: 1px solid #242a36;
+      border-radius: 14px;
+      padding: 18px;
+      box-shadow: 0 12px 28px rgba(0, 0, 0, 0.28);
+    }
+    label {
+      display: block;
+      font-weight: 600;
+      margin-bottom: 6px;
+    }
+    input[type="text"] {
+      width: 100%;
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid #2c3240;
+      background: #0f121a;
+      color: #e8ecf0;
+      outline: none;
+    }
+    input[type="text"]:focus {
+      border-color: #4da1ff;
+      box-shadow: 0 0 0 2px rgba(77, 161, 255, 0.15);
+    }
+    button {
+      margin-top: 12px;
+      padding: 10px 14px;
+      border: none;
+      border-radius: 12px;
+      font-weight: 700;
+      background: linear-gradient(135deg, #4da1ff, #35d0ff);
+      color: #0c1018;
+      cursor: pointer;
+    }
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    pre {
+      background: #0f121a;
+      border: 1px solid #2c3240;
+      border-radius: 12px;
+      padding: 12px;
+      overflow: auto;
+      min-height: 120px;
+      margin-top: 14px;
+    }
+    .status {
+      margin-left: 8px;
+      font-weight: 600;
+    }
+  </style>
+</head>
+<body>
+  <div class="panel">
+    <h1>smoo web host demo</h1>
+    <p>This minimal page talks WebUSB to a smoo gadget and serves a single HTTP-backed export.</p>
+    <label for="backing">HTTP backing URL</label>
+    <input id="backing" type="text" value="https://example.com/disk.img" />
+    <div>
+      <button id="connect">Connect</button>
+      <span class="status" id="status">idle</span>
+    </div>
+    <pre id="log"></pre>
+  </div>
+
+  <script type="module">
+    const logEl = document.getElementById("log");
+    const statusEl = document.getElementById("status");
+    const connectBtn = document.getElementById("connect");
+    const backingInput = document.getElementById("backing");
+
+    function log(line) {
+      const time = new Date().toLocaleTimeString();
+      logEl.textContent += `[${time}] ${line}\n`;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function setStatus(text) {
+      statusEl.textContent = text;
+    }
+
+    async function ensureModule() {
+      if (!window._smoo) {
+        const mod = await import("./pkg/web_host.js");
+        await mod.default();
+        window._smoo = mod;
+      }
+      return window._smoo;
+    }
+
+    connectBtn.addEventListener("click", async () => {
+      if (!("usb" in navigator)) {
+        log("WebUSB not available in this browser.");
+        setStatus("unsupported");
+        return;
+      }
+      connectBtn.disabled = true;
+      setStatus("requesting device...");
+      try {
+        const { start } = await ensureModule();
+        const device = await navigator.usb.requestDevice({
+          filters: [{ classCode: 0xff, subclassCode: 0x53, protocolCode: 0x4d }],
+        });
+        setStatus("connecting...");
+        await start(device, backingInput.value.trim());
+        setStatus("pumping");
+        log("connected; host loop started");
+      } catch (err) {
+        console.error(err);
+        log(`error: ${err}`);
+        setStatus("error");
+      } finally {
+        connectBtn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
