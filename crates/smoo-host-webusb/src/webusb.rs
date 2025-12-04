@@ -1,6 +1,7 @@
 use crate::WebUsbTransportConfig;
 use async_trait::async_trait;
-use js_sys::Uint8Array;
+use futures_util::future::FutureExt;
+use js_sys::{Promise, Uint8Array};
 use smoo_host_core::{
     ControlTransport, Transport, TransportError, TransportErrorKind, TransportResult,
 };
@@ -10,6 +11,31 @@ use web_sys::{
     UsbControlTransferParameters, UsbDevice, UsbInTransferResult, UsbOutTransferResult,
     UsbRecipient, UsbRequestType, UsbTransferStatus,
 };
+
+use std::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll},
+};
+
+/// Wrapper to mark `JsFuture` as `Send` on wasm (single-threaded).
+struct SendJsFuture(JsFuture);
+
+unsafe impl Send for SendJsFuture {}
+
+impl From<Promise> for SendJsFuture {
+    fn from(promise: Promise) -> Self {
+        Self(JsFuture::from(promise))
+    }
+}
+
+impl Future for SendJsFuture {
+    type Output = Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        FutureExt::poll_unpin(&mut self.0, cx)
+    }
+}
 
 /// Clonable control handle for issuing vendor requests alongside the transport.
 #[derive(Clone)]
@@ -34,7 +60,7 @@ impl WebUsbControl {
 /// [`Transport`] implementation backed by WebUSB.
 #[derive(Clone)]
 pub struct WebUsbTransport {
-    device: UsbDevice,
+    device: SendUsbDevice,
     config: WebUsbTransportConfig,
     control: WebUsbControl,
 }
@@ -47,7 +73,7 @@ impl WebUsbTransport {
         open_and_claim(&device, config.interface).await?;
         let control = WebUsbControl::new(device.clone(), config.interface);
         Ok(Self {
-            device,
+            device: SendUsbDevice(device),
             config,
             control,
         })
@@ -68,12 +94,15 @@ impl ControlTransport for WebUsbControl {
         buf: &mut [u8],
     ) -> TransportResult<usize> {
         self.ensure_open()?;
-        let params = control_params(request_type, request, self.interface);
-        let promise = self
-            .device
-            .control_transfer_in_with_length(&params, buf.len() as u32)
-            .map_err(|err| js_error("control_in", err))?;
-        let result = JsFuture::from(promise)
+        let len: u16 = buf
+            .len()
+            .try_into()
+            .map_err(|_| TransportError::with_message(TransportErrorKind::Protocol, "control_in length exceeds u16"))?;
+        let promise = {
+            let params = control_params(request_type, request, self.interface);
+            self.device.control_transfer_in(&params, len)
+        };
+        let result = SendJsFuture::from(promise)
             .await
             .map_err(|err| js_error("control_in", err))?;
         let result: UsbInTransferResult = result
@@ -92,7 +121,7 @@ impl ControlTransport for WebUsbControl {
             }
             status => Err(TransportError::with_message(
                 map_transfer_status(status),
-                format!("control_in status {:?}", status.as_string()),
+                format!("control_in status {:?}", status),
             )),
         }
     }
@@ -104,13 +133,14 @@ impl ControlTransport for WebUsbControl {
         data: &[u8],
     ) -> TransportResult<usize> {
         self.ensure_open()?;
-        let params = control_params(request_type, request, self.interface);
-        let payload = Uint8Array::from(data);
-        let promise = self
-            .device
-            .control_transfer_out_with_u8_array(&params, &payload)
-            .map_err(|err| js_error("control_out", err))?;
-        let result = JsFuture::from(promise)
+        let promise = {
+            let params = control_params(request_type, request, self.interface);
+            let payload = Uint8Array::from(data);
+            self.device
+                .control_transfer_out_with_u8_array(&params, &payload)
+                .map_err(|err| js_error("control_out", err))?
+        };
+        let result = SendJsFuture::from(promise)
             .await
             .map_err(|err| js_error("control_out", err))?;
         let result: UsbOutTransferResult = result
@@ -120,28 +150,49 @@ impl ControlTransport for WebUsbControl {
             UsbTransferStatus::Ok => Ok(result.bytes_written() as usize),
             status => Err(TransportError::with_message(
                 map_transfer_status(status),
-                format!("control_out status {:?}", status.as_string()),
+                format!("control_out status {:?}", status),
             )),
         }
     }
 }
 
 #[async_trait]
+impl ControlTransport for WebUsbTransport {
+    async fn control_in(
+        &self,
+        request_type: u8,
+        request: u8,
+        buf: &mut [u8],
+    ) -> TransportResult<usize> {
+        self.control.control_in(request_type, request, buf).await
+    }
+
+    async fn control_out(
+        &self,
+        request_type: u8,
+        request: u8,
+        data: &[u8],
+    ) -> TransportResult<usize> {
+        self.control.control_out(request_type, request, data).await
+    }
+}
+
+#[async_trait]
 impl Transport for WebUsbTransport {
     async fn read_interrupt(&self, buf: &mut [u8]) -> TransportResult<usize> {
-        transfer_in(&self.device, self.config.interrupt_in, buf).await
+        transfer_in(self.device.clone(), self.config.interrupt_in, buf).await
     }
 
     async fn write_interrupt(&self, buf: &[u8]) -> TransportResult<usize> {
-        transfer_out(&self.device, self.config.interrupt_out, buf).await
+        transfer_out(self.device.clone(), self.config.interrupt_out, buf).await
     }
 
     async fn read_bulk(&self, buf: &mut [u8]) -> TransportResult<usize> {
-        transfer_in(&self.device, self.config.bulk_in, buf).await
+        transfer_in(self.device.clone(), self.config.bulk_in, buf).await
     }
 
     async fn write_bulk(&self, buf: &[u8]) -> TransportResult<usize> {
-        transfer_out(&self.device, self.config.bulk_out, buf).await
+        transfer_out(self.device.clone(), self.config.bulk_out, buf).await
     }
 }
 
@@ -149,16 +200,35 @@ unsafe impl Send for WebUsbTransport {}
 unsafe impl Sync for WebUsbTransport {}
 unsafe impl Send for WebUsbControl {}
 unsafe impl Sync for WebUsbControl {}
+unsafe impl Send for SendUsbDevice {}
+unsafe impl Sync for SendUsbDevice {}
+
+#[derive(Clone)]
+struct SendUsbDevice(UsbDevice);
+
+impl SendUsbDevice {
+    fn clone_inner(&self) -> UsbDevice {
+        self.0.clone()
+    }
+}
+
+impl std::ops::Deref for SendUsbDevice {
+    type Target = UsbDevice;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 fn control_params(request_type: u8, request: u8, interface: u8) -> UsbControlTransferParameters {
-    let params = UsbControlTransferParameters::new();
     let (req_type, recipient) = decode_request_type(request_type);
-    params.set_request_type(req_type);
-    params.set_recipient(recipient.unwrap_or(UsbRecipient::Interface));
-    params.set_request(request);
-    params.set_value(0);
-    params.set_index(interface as u16);
-    params
+    UsbControlTransferParameters::new(
+        0,
+        recipient.unwrap_or(UsbRecipient::Interface),
+        request,
+        req_type,
+        interface as u16,
+    )
 }
 
 fn decode_request_type(bm_request_type: u8) -> (UsbRequestType, Option<UsbRecipient>) {
@@ -180,42 +250,39 @@ fn decode_request_type(bm_request_type: u8) -> (UsbRequestType, Option<UsbRecipi
 
 async fn open_and_claim(device: &UsbDevice, interface: u8) -> TransportResult<()> {
     if !device.opened() {
-        JsFuture::from(device.open().map_err(|err| js_error("open", err))?)
+        let promise = device.open();
+        SendJsFuture::from(promise)
             .await
-            .map_err(|err| js_error("open", err))?;
+            .map_err(|err| js_error("open await", err))?;
     }
     if device.configuration().is_none() {
-        JsFuture::from(
-            device
-                .select_configuration(1)
-                .map_err(|err| js_error("select_configuration", err))?,
-        )
-        .await
-        .map_err(|err| js_error("select_configuration", err))?;
+        let promise = device.select_configuration(1);
+        SendJsFuture::from(promise)
+            .await
+            .map_err(|err| js_error("select_configuration await", err))?;
     }
-    JsFuture::from(
-        device
-            .claim_interface(interface as u8)
-            .map_err(|err| js_error("claim_interface", err))?,
-    )
-    .await
-    .map_err(|err| js_error("claim_interface", err))?;
+    let promise = device.claim_interface(interface as u8);
+    SendJsFuture::from(promise)
+        .await
+        .map_err(|err| js_error("claim_interface await", err))?;
     Ok(())
 }
 
-async fn transfer_in(device: &UsbDevice, endpoint: u8, buf: &mut [u8]) -> TransportResult<usize> {
+async fn transfer_in(device: SendUsbDevice, endpoint: u8, buf: &mut [u8]) -> TransportResult<usize> {
     if buf.is_empty() {
         return Ok(0);
     }
     if !device.opened() {
         return Err(TransportError::new(TransportErrorKind::NotReady));
     }
-    let promise = device
-        .transfer_in(endpoint, buf.len() as u32)
-        .map_err(|err| js_error("transfer_in", err))?;
-    let result = JsFuture::from(promise)
+    let len: u32 = buf
+        .len()
+        .try_into()
+        .map_err(|_| TransportError::with_message(TransportErrorKind::Protocol, "transfer_in length exceeds u32"))?;
+    let promise = device.clone_inner().transfer_in(endpoint, len);
+    let result = SendJsFuture::from(promise)
         .await
-        .map_err(|err| js_error("transfer_in", err))?;
+        .map_err(|err| js_error("transfer_in await", err))?;
     let result: UsbInTransferResult = result
         .dyn_into()
         .map_err(|err| js_error("transfer_in cast", err))?;
@@ -232,25 +299,29 @@ async fn transfer_in(device: &UsbDevice, endpoint: u8, buf: &mut [u8]) -> Transp
         }
         status => Err(TransportError::with_message(
             map_transfer_status(status),
-            format!("transfer_in status {:?}", status.as_string()),
+            format!("transfer_in status {:?}", status),
         )),
     }
 }
 
-async fn transfer_out(device: &UsbDevice, endpoint: u8, buf: &[u8]) -> TransportResult<usize> {
+async fn transfer_out(device: SendUsbDevice, endpoint: u8, buf: &[u8]) -> TransportResult<usize> {
     if buf.is_empty() {
         return Ok(0);
     }
     if !device.opened() {
         return Err(TransportError::new(TransportErrorKind::NotReady));
     }
-    let payload = Uint8Array::from(buf);
-    let promise = device
-        .transfer_out(endpoint, &payload)
-        .map_err(|err| js_error("transfer_out", err))?;
-    let result = JsFuture::from(promise)
+    let promise = {
+        let payload = Uint8Array::from(buf);
+        let promise = device
+            .transfer_out_with_u8_array(endpoint, &payload)
+            .map_err(|err| js_error("transfer_out", err))?;
+        drop(payload);
+        promise
+    };
+    let result = SendJsFuture::from(promise)
         .await
-        .map_err(|err| js_error("transfer_out", err))?;
+        .map_err(|err| js_error("transfer_out await", err))?;
     let result: UsbOutTransferResult = result
         .dyn_into()
         .map_err(|err| js_error("transfer_out cast", err))?;
@@ -258,7 +329,7 @@ async fn transfer_out(device: &UsbDevice, endpoint: u8, buf: &[u8]) -> Transport
         UsbTransferStatus::Ok => Ok(result.bytes_written() as usize),
         status => Err(TransportError::with_message(
             map_transfer_status(status),
-            format!("transfer_out status {:?}", status.as_string()),
+            format!("transfer_out status {:?}", status),
         )),
     }
 }
