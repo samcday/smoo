@@ -1,4 +1,5 @@
 use crate::HttpError;
+use futures_util::FutureExt;
 use http::header::{CONTENT_LENGTH, CONTENT_RANGE, RANGE};
 use js_sys::{Promise, Uint8Array};
 use std::{
@@ -11,7 +12,6 @@ use url::Url;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{Headers, Request, RequestInit, RequestMode, Response};
-use futures_util::FutureExt;
 
 /// Wrapper to mark `JsFuture` as `Send` on wasm targets.
 struct SendJsFuture(JsFuture);
@@ -119,7 +119,9 @@ impl Client {
         if !(resp.ok() || resp.status() == 206) {
             return Err(HttpError::Msg(format!("GET status {}", resp.status())));
         }
-        let promise = resp.array_buffer().map_err(|err| HttpError::Msg(format!("array_buffer: {err:?}")))?;
+        let promise = resp
+            .array_buffer()
+            .map_err(|err| HttpError::Msg(format!("array_buffer: {err:?}")))?;
         let buffer = SendJsFuture::from(promise)
             .await
             .map_err(|err| HttpError::Msg(format!("array_buffer await: {err:?}")))?;
@@ -131,23 +133,13 @@ impl Client {
         Ok(copy_len)
     }
 
-    async fn send_request(&self, url: &Url, range: Option<&str>, method: &str) -> Result<SendResponse, HttpError> {
-        let promise = {
-            let window = web_sys::window().ok_or_else(|| HttpError::Msg("window unavailable".into()))?;
-            let init = RequestInit::new();
-            init.set_method(method);
-            init.set_mode(RequestMode::Cors);
-            let headers = Headers::new().map_err(|err| HttpError::Msg(format!("{err:?}")))?;
-            if let Some(range) = range {
-                headers
-                    .append(RANGE.as_str(), range)
-                    .map_err(|err| HttpError::Msg(format!("set range: {err:?}")))?;
-            }
-            init.set_headers(&headers);
-            let request = Request::new_with_str_and_init(url.as_str(), &init)
-                .map_err(|err| HttpError::Msg(format!("build request: {err:?}")))?;
-            window.fetch_with_request(&request)
-        };
+    async fn send_request(
+        &self,
+        url: &Url,
+        range: Option<&str>,
+        method: &str,
+    ) -> Result<SendResponse, HttpError> {
+        let promise = build_request_promise(url, range, method)?;
         let resp = SendJsFuture::from(promise)
             .await
             .map_err(|err| HttpError::Msg(format!("fetch await: {err:?}")))?;
@@ -156,6 +148,27 @@ impl Client {
             .map_err(|err| HttpError::Msg(format!("fetch dyn_into Response: {err:?}")))?;
         Ok(SendResponse(resp))
     }
+}
+
+fn build_request_promise(
+    url: &Url,
+    range: Option<&str>,
+    method: &str,
+) -> Result<Promise, HttpError> {
+    let window = web_sys::window().ok_or_else(|| HttpError::Msg("window unavailable".into()))?;
+    let init = RequestInit::new();
+    init.set_method(method);
+    init.set_mode(RequestMode::Cors);
+    let headers = Headers::new().map_err(|err| HttpError::Msg(format!("{err:?}")))?;
+    if let Some(range) = range {
+        headers
+            .append(RANGE.as_str(), range)
+            .map_err(|err| HttpError::Msg(format!("set range: {err:?}")))?;
+    }
+    init.set_headers(&headers);
+    let request = Request::new_with_str_and_init(url.as_str(), &init)
+        .map_err(|err| HttpError::Msg(format!("build request: {err:?}")))?;
+    Ok(window.fetch_with_request(&request))
 }
 
 fn parse_content_range_total(hdr: &str) -> Option<u64> {
