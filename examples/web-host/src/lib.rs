@@ -1,14 +1,17 @@
-use wasm_bindgen::prelude::*;
+#[cfg(not(target_arch = "wasm32"))]
+use wasm_bindgen::prelude::wasm_bindgen;
 
 #[cfg(target_arch = "wasm32")]
 mod wasm_host {
     use smoo_host_blocksource_http::HttpBlockSource;
     use smoo_host_core::{
-        control::ConfigExportsV0, register_export, start_host_io_pump, BlockSource, BlockSourceHandle,
-        SmooHost,
+        BlockSource, BlockSourceHandle, SmooHost, control::ConfigExportsV0, register_export,
+        start_host_io_pump,
     };
     use smoo_host_webusb::{WebUsbTransport, WebUsbTransportConfig};
+    use std::sync::Once;
     use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
+    use tracing_wasm::WASMLayerConfigBuilder;
     use wasm_bindgen::prelude::*;
     use wasm_bindgen_futures::spawn_local;
     use web_sys::console;
@@ -16,6 +19,7 @@ mod wasm_host {
     #[wasm_bindgen]
     pub async fn start(device: web_sys::UsbDevice, backing_url: String) -> Result<(), JsValue> {
         console_error_panic_hook::set_once();
+        init_tracing();
 
         let url = url::Url::parse(&backing_url)
             .map_err(|err| JsValue::from_str(&format!("parse backing URL: {err}")))?;
@@ -64,6 +68,18 @@ mod wasm_host {
         let state = Rc::new(RefCell::new(Some(HostState { host })));
         schedule_host_loop(state)?;
         Ok(())
+    }
+
+    static TRACING_INIT: Once = Once::new();
+
+    fn init_tracing() {
+        TRACING_INIT.call_once(|| {
+            let _ = tracing_wasm::set_as_global_default_with_config(
+                WASMLayerConfigBuilder::default()
+                    .set_max_level(tracing::Level::DEBUG)
+                    .build(),
+            );
+        });
     }
 
     struct HostState {
@@ -128,6 +144,11 @@ pub use wasm_host::start;
 
 #[cfg(not(target_arch = "wasm32"))]
 #[wasm_bindgen]
-pub async fn start(_device: wasm_bindgen::JsValue, _backing_url: String) -> Result<(), wasm_bindgen::JsValue> {
-    Err(wasm_bindgen::JsValue::from_str("web-host is only available for wasm32 targets"))
+pub async fn start(
+    _device: wasm_bindgen::JsValue,
+    _backing_url: String,
+) -> Result<(), wasm_bindgen::JsValue> {
+    Err(wasm_bindgen::JsValue::from_str(
+        "web-host is only available for wasm32 targets",
+    ))
 }
