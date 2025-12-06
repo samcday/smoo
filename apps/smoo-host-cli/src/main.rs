@@ -10,7 +10,7 @@ use smoo_host_blocksources::file::FileBlockSource;
 use smoo_host_blocksources::random::RandomBlockSource;
 use smoo_host_core::{
     control::{fetch_ident, read_status, send_config_exports_v0, ConfigExportsV0},
-    heartbeat::{heartbeat_once, HeartbeatError},
+    heartbeat::heartbeat_once,
     register_export, start_host_io_pump, BlockSource, BlockSourceHandle, BlockSourceResult,
     ExportIdentity, HostErrorKind, SmooHost, TransportError, TransportErrorKind,
 };
@@ -182,14 +182,12 @@ async fn main() -> Result<()> {
     });
     let _metrics_task = spawn_metrics_listener(args.metrics_port, shutdown.clone())?;
     let (sources, config_payload) = open_sources(&args).await.context("open block sources")?;
-    let mut expected_session_id = None;
     let mut has_connected = false;
     while !shutdown.is_cancelled() {
         match run_session(
             &args,
             sources.clone(),
             &config_payload,
-            &mut expected_session_id,
             has_connected,
             shutdown.clone(),
         )
@@ -201,6 +199,10 @@ async fn main() -> Result<()> {
                 has_connected = true;
                 time::sleep(RECONNECT_PAUSE).await;
             }
+            SessionEnd::SessionRestart => {
+                info!("gadget session changed; restarting host session");
+                has_connected = true;
+            }
         }
     }
 
@@ -210,13 +212,13 @@ async fn main() -> Result<()> {
 enum SessionEnd {
     Shutdown,
     TransportLost,
+    SessionRestart,
 }
 
 async fn run_session(
     args: &Args,
     sources: BTreeMap<u32, BlockSourceHandle>,
     config_payload: &ConfigExportsV0,
-    expected_session_id: &mut Option<u64>,
     has_connected: bool,
     shutdown: CancellationToken,
 ) -> Result<SessionEnd> {
@@ -277,19 +279,6 @@ async fn run_session(
                 return Ok(SessionEnd::TransportLost);
             }
         };
-    match expected_session_id {
-        Some(expected) => {
-            let recorded = *expected;
-            ensure!(
-                recorded == initial_status.session_id,
-                "gadget session changed (expected 0x{recorded:016x}, got 0x{:016x})",
-                initial_status.session_id
-            );
-        }
-        None => {
-            *expected_session_id = Some(initial_status.session_id);
-        }
-    }
     debug!(
         session_id = initial_status.session_id,
         export_count = initial_status.export_count,
@@ -352,12 +341,17 @@ async fn run_session(
             }
             event = heartbeat_rx.recv(), if !shutdown.is_cancelled() => {
                 match event {
-                    Some(HeartbeatFailure::TransferFailed(reason)) => {
+                    Some(HeartbeatEvent::TransferFailed(reason)) => {
                         warn!(reason = %reason, "heartbeat transfer failed");
                         break SessionEnd::TransportLost;
                     }
-                    Some(other) => {
-                        return Err(anyhow!(other.to_string()));
+                    Some(HeartbeatEvent::SessionChanged { previous, current }) => {
+                        info!(
+                            previous = format_args!("0x{previous:016x}"),
+                            current = format_args!("0x{current:016x}"),
+                            "gadget session changed; restarting"
+                        );
+                        break SessionEnd::SessionRestart;
                     }
                     None => {
                         break SessionEnd::TransportLost;
@@ -530,19 +524,19 @@ fn canonicalize_path(path: &PathBuf) -> Result<PathBuf> {
 }
 
 #[derive(Debug, Clone)]
-enum HeartbeatFailure {
+enum HeartbeatEvent {
     SessionChanged { previous: u64, current: u64 },
     TransferFailed(String),
 }
 
-impl fmt::Display for HeartbeatFailure {
+impl fmt::Display for HeartbeatEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            HeartbeatFailure::SessionChanged { previous, current } => write!(
+            HeartbeatEvent::SessionChanged { previous, current } => write!(
                 f,
                 "gadget session changed (0x{previous:016x} → 0x{current:016x})"
             ),
-            HeartbeatFailure::TransferFailed(err) => {
+            HeartbeatEvent::TransferFailed(err) => {
                 write!(f, "heartbeat control transfer failed: {err}")
             }
         }
@@ -553,24 +547,27 @@ async fn run_heartbeat(
     client: RusbControl,
     initial_session_id: u64,
     interval: Duration,
-) -> Result<(), HeartbeatFailure> {
+) -> Result<(), HeartbeatEvent> {
     let mut ticker = time::interval(interval);
     ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
-        match heartbeat_once(&client, Some(initial_session_id)).await {
+        match heartbeat_once(&client).await {
             Ok(status) => {
+                if status.session_id != initial_session_id {
+                    return Err(HeartbeatEvent::SessionChanged {
+                        previous: initial_session_id,
+                        current: status.session_id,
+                    });
+                }
                 debug!(
                     session_id = status.session_id,
                     export_count = status.export_count,
                     "heartbeat successful"
                 );
             }
-            Err(HeartbeatError::SessionChanged { previous, current }) => {
-                return Err(HeartbeatFailure::SessionChanged { previous, current });
-            }
-            Err(HeartbeatError::Transfer(err)) => {
-                return Err(HeartbeatFailure::TransferFailed(err.to_string()));
+            Err(err) => {
+                return Err(HeartbeatEvent::TransferFailed(err.to_string()));
             }
         }
     }

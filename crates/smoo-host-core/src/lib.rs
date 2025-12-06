@@ -23,7 +23,7 @@ pub use export_id::{
     derive_export_id_with,
 };
 pub use exports::{ExportConfigError, ExportConfigErrorKind, register_export};
-pub use heartbeat::{HeartbeatError, heartbeat_once};
+pub use heartbeat::heartbeat_once;
 #[cfg(feature = "std")]
 pub use host::{HostError, HostErrorKind, HostResult, SmooHost};
 #[cfg(feature = "metrics")]
