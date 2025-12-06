@@ -6,21 +6,86 @@ mod wasm_host {
     use futures_util::future::{AbortHandle, Abortable};
     use smoo_host_blocksource_http::HttpBlockSource;
     use smoo_host_core::{
-        BlockSourceHandle, HostIoPumpHandle, SmooHost, control::ConfigExportsV0, heartbeat_once,
-        register_export, start_host_io_pump,
+        BlockSource, BlockSourceHandle, CountingTransport, HostIoPumpHandle, SmooHost,
+        TransportCounters, control::ConfigExportsV0, heartbeat_once, register_export,
+        start_host_io_pump,
     };
-    use smoo_host_webusb::{WebUsbControl, WebUsbTransport, WebUsbTransportConfig};
-    use std::sync::Once;
-    use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
-    use tracing_wasm::WASMLayerConfigBuilder;
+    use smoo_host_webusb::{WebUsbTransport, WebUsbTransportConfig};
+    use std::{cell::RefCell, collections::BTreeMap, io, rc::Rc, sync::OnceLock};
+    use tracing::{Level, info, warn};
+    use tracing_subscriber::{
+        filter::LevelFilter,
+        fmt::{self, format},
+        layer::SubscriberExt,
+        prelude::*,
+        registry::Registry,
+        reload,
+    };
+    use tracing_wasm::{WASMLayer, WASMLayerConfigBuilder};
+    use wasm_bindgen::JsCast;
     use wasm_bindgen::prelude::*;
     use wasm_bindgen_futures::spawn_local;
-    use web_sys::console;
+    use web_sys::window;
+
+    type CountingWebUsbTransport = CountingTransport<WebUsbTransport>;
+
+    #[wasm_bindgen]
+    pub fn set_log_sink(callback: js_sys::Function) {
+        init_tracing();
+        LOG_SINK.with(|cell| {
+            *cell.borrow_mut() = Some(callback);
+        });
+    }
+
+    #[wasm_bindgen]
+    pub fn set_log_level(level: String) -> Result<(), JsValue> {
+        init_tracing();
+        let filter = parse_level_filter(&level)?;
+        let handle = TRACING_HANDLE
+            .get()
+            .ok_or_else(|| JsValue::from_str("tracing not initialised"))?;
+        handle
+            .filter
+            .modify(|current| *current = filter)
+            .map_err(|err| JsValue::from_str(&format!("update log level: {err}")))?;
+        Ok(())
+    }
+
+    #[wasm_bindgen]
+    pub fn counters_snapshot() -> Option<CounterSnapshot> {
+        ACTIVE_COUNTERS.with(|cell| {
+            cell.borrow().as_ref().map(|counters| {
+                let snap = counters.snapshot();
+                CounterSnapshot {
+                    bytes_up: snap.bytes_up,
+                    bytes_down: snap.bytes_down,
+                }
+            })
+        })
+    }
+
+    #[wasm_bindgen]
+    pub struct CounterSnapshot {
+        bytes_up: u64,
+        bytes_down: u64,
+    }
+
+    #[wasm_bindgen]
+    impl CounterSnapshot {
+        pub fn bytes_up(&self) -> u64 {
+            self.bytes_up
+        }
+
+        pub fn bytes_down(&self) -> u64 {
+            self.bytes_down
+        }
+    }
 
     #[wasm_bindgen]
     pub async fn start(device: web_sys::UsbDevice, backing_url: String) -> Result<(), JsValue> {
         console_error_panic_hook::set_once();
         init_tracing();
+        set_active_counters(None);
 
         let url = url::Url::parse(&backing_url)
             .map_err(|err| JsValue::from_str(&format!("parse backing URL: {err}")))?;
@@ -72,21 +137,21 @@ mod wasm_host {
         Ok(())
     }
 
-    static TRACING_INIT: Once = Once::new();
-
-    fn init_tracing() {
-        TRACING_INIT.call_once(|| {
-            let _ = tracing_wasm::set_as_global_default_with_config(
-                WASMLayerConfigBuilder::default()
-                    .set_max_level(tracing::Level::INFO)
-                    .build(),
-            );
-        });
+    #[derive(Clone)]
+    struct TracingHandle {
+        filter: reload::Handle<LevelFilter, Registry>,
     }
+
+    thread_local! {
+        static ACTIVE_COUNTERS: RefCell<Option<TransportCounters>> = RefCell::new(None);
+        static LOG_SINK: RefCell<Option<js_sys::Function>> = RefCell::new(None);
+    }
+
+    static TRACING_HANDLE: OnceLock<TracingHandle> = OnceLock::new();
 
     struct HostState {
         host: SmooHost<BlockSourceHandle>,
-        control: WebUsbControl,
+        control: CountingWebUsbTransport,
         pump_handle: HostIoPumpHandle,
         pump_abort: AbortHandle,
         session_id: u64,
@@ -102,8 +167,12 @@ mod wasm_host {
         let transport = WebUsbTransport::new(device, transport_config)
             .await
             .map_err(to_js_err)?;
-        let control = transport.control_handle();
-        let (pump_handle, request_rx, pump_task) = start_host_io_pump(transport);
+        let counting = CountingTransport::new(transport);
+        let control = counting.clone();
+        let counters = counting.counters();
+        set_active_counters(Some(counters));
+
+        let (pump_handle, request_rx, pump_task) = start_host_io_pump(counting);
         let (abort_handle, abort_reg) = AbortHandle::new_pair();
         let pump_abort = abort_handle.clone();
         let pump_future = Abortable::new(pump_task, abort_reg);
@@ -111,17 +180,17 @@ mod wasm_host {
             match pump_future.await {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => {
-                    log_warn(&format!("pump exited: {err}"));
+                    warn!(%err, "pump exited");
                 }
                 Err(_) => {
-                    log_info("pump task aborted");
+                    info!("pump task aborted");
                 }
             }
         });
 
         let mut host = SmooHost::new(pump_handle.clone(), request_rx, sources);
         let ident = host.setup(&control).await.map_err(to_js_err)?;
-        log_info(&format!("IDENT {}.{}", ident.major, ident.minor));
+        info!(version = %format!("{}.{}", ident.major, ident.minor), "IDENT");
         host.configure_exports_v0(&control, &payload)
             .await
             .map_err(to_js_err)?;
@@ -129,10 +198,11 @@ mod wasm_host {
         let status = heartbeat_once(&control)
             .await
             .map_err(|err| JsValue::from_str(&format!("initial heartbeat failed: {err}")))?;
-        log_info(&format!(
-            "SMOO_STATUS session=0x{:016x} exports={}",
-            status.session_id, status.export_count
-        ));
+        info!(
+            session = format_args!("0x{:016x}", status.session_id),
+            exports = status.export_count,
+            "SMOO_STATUS ok"
+        );
 
         Ok(HostState {
             host,
@@ -146,6 +216,7 @@ mod wasm_host {
 
     fn teardown_state(state: &mut Option<HostState>) {
         if let Some(ctx) = state.take() {
+            set_active_counters(None);
             let pump = ctx.pump_handle.clone();
             let abort = ctx.pump_abort;
             spawn_local(async move {
@@ -180,7 +251,7 @@ mod wasm_host {
                     state.replace(Some(new_state));
                 }
                 Err(err) => {
-                    log_warn(&format!("session restart failed: {err:?}"));
+                    warn!(?err, "session restart failed");
                 }
             }
             *restart_flag_clone.borrow_mut() = false;
@@ -189,6 +260,55 @@ mod wasm_host {
                     *next_restart_ms_clone.borrow_mut() = now + 1000.0;
                 }
             }
+        });
+    }
+
+    fn init_tracing() {
+        let _ = TRACING_HANDLE.get_or_init(|| {
+            let (filter_layer, filter_handle) = reload::Layer::new(LevelFilter::INFO);
+            let wasm_layer = WASMLayer::new(
+                WASMLayerConfigBuilder::default()
+                    .set_max_level(Level::TRACE)
+                    .set_report_logs_in_timings(true)
+                    .build(),
+            );
+            let fmt_layer = fmt::layer()
+                .event_format(
+                    format::format()
+                        .compact()
+                        .with_level(true)
+                        .with_target(false)
+                        .without_time(),
+                )
+                .with_ansi(false)
+                .with_writer(UiMakeWriter);
+
+            Registry::default()
+                .with(filter_layer)
+                .with(wasm_layer)
+                .with(fmt_layer)
+                .init();
+
+            TracingHandle {
+                filter: filter_handle,
+            }
+        });
+    }
+
+    fn parse_level_filter(level: &str) -> Result<LevelFilter, JsValue> {
+        match level.to_ascii_lowercase().as_str() {
+            "trace" => Ok(LevelFilter::TRACE),
+            "debug" => Ok(LevelFilter::DEBUG),
+            "info" => Ok(LevelFilter::INFO),
+            "warn" | "warning" => Ok(LevelFilter::WARN),
+            "error" => Ok(LevelFilter::ERROR),
+            other => Err(JsValue::from_str(&format!("unknown log level '{other}'"))),
+        }
+    }
+
+    fn set_active_counters(counters: Option<TransportCounters>) {
+        ACTIVE_COUNTERS.with(|cell| {
+            *cell.borrow_mut() = counters;
         });
     }
 
@@ -201,7 +321,7 @@ mod wasm_host {
         restart_in_progress: Rc<RefCell<bool>>,
         next_restart_ms: Rc<RefCell<f64>>,
     ) -> Result<(), JsValue> {
-        let window = web_sys::window().ok_or_else(|| JsValue::from_str("window unavailable"))?;
+        let win = window().ok_or_else(|| JsValue::from_str("window unavailable"))?;
         let cb_state = state.clone();
         let raf_cb: Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>> = Rc::new(RefCell::new(None));
         let raf_cb_clone = raf_cb.clone();
@@ -225,11 +345,8 @@ mod wasm_host {
                         }
                     }
                     if let Some(ctx) = guard.as_mut() {
-                        match ctx.host.run_once().await {
-                            Ok(()) => {}
-                            Err(err) => {
-                                log_warn(&format!("host loop error: {err}"));
-                            }
+                        if let Err(err) = ctx.host.run_once().await {
+                            warn!(%err, "host loop error");
                         }
                         if let Some(ts) = now {
                             if ts - ctx.last_heartbeat_ms >= 1000.0 {
@@ -242,20 +359,22 @@ mod wasm_host {
                 if let Some((control, expected_session)) = heartbeat {
                     match heartbeat_once(&control).await {
                         Ok(status) => {
-                            log_info(&format!(
-                                "heartbeat ok session=0x{:016x} exports={}",
-                                status.session_id, status.export_count
-                            ));
+                            info!(
+                                session = format_args!("0x{:016x}", status.session_id),
+                                exports = status.export_count,
+                                "heartbeat ok"
+                            );
                             if status.session_id != expected_session {
-                                log_info(&format!(
-                                    "session changed (0x{expected_session:016x} -> 0x{:016x}); restarting",
-                                    status.session_id
-                                ));
+                                info!(
+                                    previous = format_args!("0x{expected_session:016x}"),
+                                    current = format_args!("0x{:016x}", status.session_id),
+                                    "session changed; restarting"
+                                );
                                 request_restart = true;
                             }
                         }
                         Err(err) => {
-                            log_warn(&format!("heartbeat error: {err}"));
+                            warn!(%err, "heartbeat error");
                             request_restart = true;
                         }
                     }
@@ -271,7 +390,7 @@ mod wasm_host {
                         transport_config,
                     );
                 }
-                if let Some(win) = web_sys::window() {
+                if let Some(win) = window() {
                     if let Some(cb) = raf_cb_inner.borrow().as_ref() {
                         let _ = win.request_animation_frame(cb.as_ref().unchecked_ref());
                     }
@@ -279,25 +398,63 @@ mod wasm_host {
             });
         }) as Box<dyn FnMut(f64)>));
         if let Some(cb) = raf_cb_clone.borrow().as_ref() {
-            window
-                .request_animation_frame(cb.as_ref().unchecked_ref())
+            win.request_animation_frame(cb.as_ref().unchecked_ref())
                 .map_err(JsValue::from)?;
         }
         Ok(())
     }
 
-    fn log_info(msg: &str) {
-        console::log_1(&JsValue::from_str(msg));
-    }
-
-    fn log_warn(msg: &str) {
-        console::warn_1(&JsValue::from_str(msg));
-    }
-
     fn now_ms() -> Option<f64> {
-        let window = web_sys::window()?;
+        let window = window()?;
         let perf = window.performance()?;
         Some(perf.now())
+    }
+
+    #[derive(Clone)]
+    struct UiMakeWriter;
+
+    impl<'a> fmt::MakeWriter<'a> for UiMakeWriter {
+        type Writer = UiWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            UiWriter::default()
+        }
+    }
+
+    #[derive(Default)]
+    struct UiWriter {
+        buf: String,
+    }
+
+    impl io::Write for UiWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.buf.push_str(&String::from_utf8_lossy(buf));
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if !self.buf.is_empty() {
+                emit_log_line(&self.buf);
+                self.buf.clear();
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for UiWriter {
+        fn drop(&mut self) {
+            if !self.buf.is_empty() {
+                emit_log_line(&self.buf);
+            }
+        }
+    }
+
+    fn emit_log_line(line: &str) {
+        LOG_SINK.with(|cell| {
+            if let Some(cb) = cell.borrow().as_ref() {
+                let _ = cb.call1(&JsValue::NULL, &JsValue::from_str(line));
+            }
+        });
     }
 
     fn to_js_err(err: impl core::fmt::Display) -> JsValue {

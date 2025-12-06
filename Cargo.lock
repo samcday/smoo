@@ -2731,11 +2731,13 @@ name = "web-host"
 version = "0.0.1"
 dependencies = [
  "console_error_panic_hook",
+ "futures-util",
  "js-sys",
  "smoo-host-blocksource-http",
  "smoo-host-core",
  "smoo-host-webusb",
  "tracing",
+ "tracing-subscriber",
  "tracing-wasm",
  "url",
  "wasm-bindgen",

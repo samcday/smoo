@@ -38,6 +38,13 @@ console_error_panic_hook = "0.1.7"
 url = "2.5.4"
 tracing = { version = "0.1.41", features = ["release_max_level_debug"] }
 tracing-wasm = "0.2.1"
+tracing-subscriber = { version = "0.3.18", default-features = false, features = [
+    "ansi",
+    "fmt",
+    "registry",
+    "std",
+] }
+futures-util = "0.3.31"
 
 [package.metadata.wasm-pack.profile.dev]
 wasm-opt = false
