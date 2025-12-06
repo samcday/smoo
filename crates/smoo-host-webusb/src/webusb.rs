@@ -128,14 +128,26 @@ impl ControlTransport for WebUsbControl {
         let result: UsbInTransferResult = result
             .dyn_into()
             .map_err(|err| js_error("control_in cast", err))?;
-        match result.status() {
+        let status = result.status();
+        match status {
             UsbTransferStatus::Ok => {
                 let data = result
                     .data()
                     .ok_or_else(|| TransportError::new(TransportErrorKind::Protocol))?;
-                let view = Uint8Array::new(&data);
-                let read = view.length() as usize;
+                let read = data.byte_length() as usize;
+                let offset: u32 = data.byte_offset().try_into().map_err(|_| {
+                    TransportError::with_message(
+                        TransportErrorKind::Protocol,
+                        "control_in data offset exceeds u32",
+                    )
+                })?;
+                let view = Uint8Array::new_with_byte_offset_and_length(
+                    &data.buffer(),
+                    offset,
+                    read as u32,
+                );
                 trace!(
+                    status = ?status,
                     req_type = request_type,
                     request,
                     expected = buf.len(),
@@ -146,7 +158,7 @@ impl ControlTransport for WebUsbControl {
                     return Err(TransportError::with_message(
                         TransportErrorKind::Protocol,
                         format!(
-                            "control_in length mismatch (expected {}, got {})",
+                            "control_in length mismatch (status={status:?}, expected {}, got {})",
                             buf.len(),
                             read
                         ),
@@ -155,9 +167,9 @@ impl ControlTransport for WebUsbControl {
                 view.copy_to(buf);
                 Ok(read)
             }
-            status => Err(TransportError::with_message(
+            _ => Err(TransportError::with_message(
                 map_transfer_status(status),
-                format!("control_in status {:?}", status),
+                format!("control_in status {:?}, len=0", status),
             )),
         }
     }
@@ -364,13 +376,21 @@ async fn transfer_in(
     let result: UsbInTransferResult = result
         .dyn_into()
         .map_err(|err| js_error("transfer_in cast", err))?;
-    match result.status() {
+    let status = result.status();
+    match status {
         UsbTransferStatus::Ok => {
             let data = result
                 .data()
                 .ok_or_else(|| TransportError::new(TransportErrorKind::Protocol))?;
-            let view = Uint8Array::new(&data);
-            let read = view.length() as usize;
+            let read = data.byte_length() as usize;
+            let offset: u32 = data.byte_offset().try_into().map_err(|_| {
+                TransportError::with_message(
+                    TransportErrorKind::Protocol,
+                    "transfer_in data offset exceeds u32",
+                )
+            })?;
+            let view =
+                Uint8Array::new_with_byte_offset_and_length(&data.buffer(), offset, read as u32);
             let copy_len = buf.len().min(read);
             view.slice(0, copy_len as u32).copy_to(buf);
             trace!(
@@ -382,7 +402,7 @@ async fn transfer_in(
             );
             Ok(copy_len)
         }
-        status => Err(TransportError::with_message(
+        _ => Err(TransportError::with_message(
             map_transfer_status(status),
             format!("transfer_in status {:?}", status),
         )),
