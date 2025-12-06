@@ -6,6 +6,7 @@ pub mod block;
 pub mod control;
 pub mod export_id;
 pub mod exports;
+pub mod heartbeat;
 #[cfg(feature = "std")]
 pub mod host;
 #[cfg(feature = "metrics")]
@@ -22,6 +23,7 @@ pub use export_id::{
     derive_export_id_with,
 };
 pub use exports::{ExportConfigError, ExportConfigErrorKind, register_export};
+pub use heartbeat::{HeartbeatError, heartbeat_once};
 #[cfg(feature = "std")]
 pub use host::{HostError, HostErrorKind, HostResult, SmooHost};
 #[cfg(feature = "metrics")]

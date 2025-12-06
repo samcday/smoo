@@ -5,10 +5,10 @@ use wasm_bindgen::prelude::wasm_bindgen;
 mod wasm_host {
     use smoo_host_blocksource_http::HttpBlockSource;
     use smoo_host_core::{
-        BlockSource, BlockSourceHandle, SmooHost, control::ConfigExportsV0, register_export,
-        start_host_io_pump,
+        BlockSource, BlockSourceHandle, HeartbeatError, SmooHost, control::ConfigExportsV0,
+        heartbeat_once, register_export, start_host_io_pump,
     };
-    use smoo_host_webusb::{WebUsbTransport, WebUsbTransportConfig};
+    use smoo_host_webusb::{WebUsbControl, WebUsbTransport, WebUsbTransportConfig};
     use std::sync::Once;
     use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
     use tracing_wasm::WASMLayerConfigBuilder;
@@ -65,7 +65,20 @@ mod wasm_host {
             .await
             .map_err(to_js_err)?;
 
-        let state = Rc::new(RefCell::new(Some(HostState { host })));
+        let status = heartbeat_once(&control, None)
+            .await
+            .map_err(|err| JsValue::from_str(&format!("initial heartbeat failed: {err:?}")))?;
+        log_info(&format!(
+            "initial SMOO_STATUS session=0x{:016x} exports={}",
+            status.session_id, status.export_count
+        ));
+
+        let state = Rc::new(RefCell::new(Some(HostState {
+            host,
+            control,
+            session_id: status.session_id,
+            last_heartbeat_ms: now_ms().unwrap_or(0.0),
+        })));
         schedule_host_loop(state)?;
         Ok(())
     }
@@ -84,6 +97,9 @@ mod wasm_host {
 
     struct HostState {
         host: SmooHost<BlockSourceHandle>,
+        control: WebUsbControl,
+        session_id: u64,
+        last_heartbeat_ms: f64,
     }
 
     fn schedule_host_loop(state: Rc<RefCell<Option<HostState>>>) -> Result<(), JsValue> {
@@ -95,20 +111,48 @@ mod wasm_host {
             let inner_state = cb_state.clone();
             let raf_cb_inner = raf_cb.clone();
             spawn_local(async move {
-                let keep_running = {
+                let mut keep_running = false;
+                let mut heartbeat = None;
+                {
                     let mut guard = inner_state.borrow_mut();
                     if let Some(ctx) = guard.as_mut() {
                         match ctx.host.run_once().await {
-                            Ok(()) => true,
+                            Ok(()) => {
+                                keep_running = true;
+                            }
                             Err(err) => {
                                 log_warn(&format!("host loop error: {err}"));
-                                false
+                            }
+                        }
+                        if let Some(now) = now_ms() {
+                            if now - ctx.last_heartbeat_ms >= 1000.0 {
+                                ctx.last_heartbeat_ms = now;
+                                heartbeat = Some((ctx.control.clone(), ctx.session_id));
                             }
                         }
                     } else {
-                        false
+                        keep_running = false;
                     }
                 };
+                if let Some((control, expected_session)) = heartbeat {
+                    match heartbeat_once(&control, Some(expected_session)).await {
+                        Ok(status) => {
+                            log_info(&format!(
+                                "heartbeat ok session=0x{:016x} exports={}",
+                                status.session_id, status.export_count
+                            ));
+                        }
+                        Err(HeartbeatError::SessionChanged { previous, current }) => {
+                            log_warn(&format!(
+                                "heartbeat: session changed (0x{previous:016x} -> 0x{current:016x}); stopping host loop"
+                            ));
+                            keep_running = false;
+                        }
+                        Err(HeartbeatError::Transfer(err)) => {
+                            log_warn(&format!("heartbeat error: {err}"));
+                        }
+                    }
+                }
                 if keep_running {
                     if let Some(win) = web_sys::window() {
                         if let Some(cb) = raf_cb_inner.borrow().as_ref() {
@@ -132,6 +176,12 @@ mod wasm_host {
 
     fn log_warn(msg: &str) {
         console::warn_1(&JsValue::from_str(msg));
+    }
+
+    fn now_ms() -> Option<f64> {
+        let window = web_sys::window()?;
+        let perf = window.performance()?;
+        Some(perf.now())
     }
 
     fn to_js_err(err: impl core::fmt::Display) -> JsValue {

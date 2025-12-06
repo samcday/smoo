@@ -10,6 +10,7 @@ use smoo_host_blocksources::file::FileBlockSource;
 use smoo_host_blocksources::random::RandomBlockSource;
 use smoo_host_core::{
     control::{fetch_ident, read_status, send_config_exports_v0, ConfigExportsV0},
+    heartbeat::{heartbeat_once, HeartbeatError},
     register_export, start_host_io_pump, BlockSource, BlockSourceHandle, BlockSourceResult,
     ExportIdentity, HostErrorKind, SmooHost, TransportError, TransportErrorKind,
 };
@@ -557,21 +558,18 @@ async fn run_heartbeat(
     ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
-        match read_status(&client).await {
+        match heartbeat_once(&client, Some(initial_session_id)).await {
             Ok(status) => {
                 debug!(
                     session_id = status.session_id,
                     export_count = status.export_count,
                     "heartbeat successful"
                 );
-                if status.session_id != initial_session_id {
-                    return Err(HeartbeatFailure::SessionChanged {
-                        previous: initial_session_id,
-                        current: status.session_id,
-                    });
-                }
             }
-            Err(err) => {
+            Err(HeartbeatError::SessionChanged { previous, current }) => {
+                return Err(HeartbeatFailure::SessionChanged { previous, current });
+            }
+            Err(HeartbeatError::Transfer(err)) => {
                 return Err(HeartbeatFailure::TransferFailed(err.to_string()));
             }
         }
