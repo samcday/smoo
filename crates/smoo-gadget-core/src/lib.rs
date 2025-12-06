@@ -335,6 +335,12 @@ impl GadgetControl {
             io.write_in(&ident[..len])
                 .await
                 .context("reply to GET_IDENT")?;
+            trace!(
+                len,
+                major = self.ident.major,
+                minor = self.ident.minor,
+                "ep0: GET_IDENT reply sent"
+            );
             return Ok(None);
         }
 
@@ -362,6 +368,7 @@ impl GadgetControl {
             io.write_in(&encoded[..len])
                 .await
                 .context("write SMOO_STATUS response")?;
+            trace!(len, "ep0: SMOO_STATUS reply sent");
             return Ok(None);
         }
 
@@ -376,6 +383,7 @@ impl GadgetControl {
             trace!(len, "ep0: CONFIG_EXPORTS setup");
             let mut buf = vec![0u8; len];
             io.read_out(&mut buf).await.context("read CONFIG_EXPORTS")?;
+            trace!(len, "ep0: CONFIG_EXPORTS payload received");
             let payload = ConfigExportsV0::try_from_slice(&buf)
                 .map_err(|err| anyhow!("parse CONFIG_EXPORTS payload: {err}"))?;
             return Ok(Some(SetupCommand::Config(payload)));
