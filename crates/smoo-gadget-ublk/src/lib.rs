@@ -11,7 +11,7 @@ use crate::sys::{
     ublk_param_basic, ublk_params, ublksrv_ctrl_cmd, ublksrv_ctrl_dev_info, ublksrv_io_cmd,
     ublksrv_io_desc,
 };
-use anyhow::{Context, ensure};
+use anyhow::{Context, anyhow, ensure};
 use async_channel::{Receiver, RecvError, Sender};
 use io_uring::{IoUring, cqueue, squeue, types};
 use std::cmp;
@@ -27,7 +27,7 @@ use std::sync::{
     mpsc,
 };
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{Level, debug, error, info, trace, warn};
 /// Top level interface to ublk. Creates SmooUblkDevices
 pub struct SmooUblk {
@@ -38,6 +38,7 @@ pub struct SmooUblk {
 }
 
 const CTRL_RING_DEPTH: u32 = 8;
+const START_DEV_TIMEOUT: Duration = Duration::from_secs(5);
 type CtrlCommand = (
     u32,
     ublksrv_ctrl_cmd,
@@ -81,7 +82,9 @@ pub struct UblkCtrlHandle {
     recovery_pending: bool,
     completion_txs: Vec<Sender<QueueCompletion>>,
     workers: Vec<QueueWorkerHandle>,
-    start_handle: Option<JoinHandle<()>>,
+    start_handle: Option<JoinHandle<anyhow::Result<()>>>,
+    start_deadline: Option<Instant>,
+    start_result: Option<anyhow::Result<()>>,
     shutdown: bool,
 }
 
@@ -509,6 +512,8 @@ impl SmooUblk {
             completion_txs,
             workers,
             start_handle: None,
+            start_deadline: None,
+            start_result: None,
             shutdown: false,
         };
 
@@ -527,13 +532,15 @@ impl SmooUblk {
                     start_cmd,
                     "start device",
                 );
-                match res {
+                match &res {
                     Ok(()) => info!(dev_id = dev_id, "start_dev completed"),
                     Err(err) => error!(dev_id = dev_id, "start_dev failed: {:?}", err),
                 }
+                res
             })
             .context("spawn start_dev thread")?;
 
+        ctrl.start_deadline = Some(Instant::now() + START_DEV_TIMEOUT);
         ctrl.start_handle = Some(start_thread);
         Ok(SmooUblkDevice { ctrl, queues })
     }
@@ -684,6 +691,8 @@ impl SmooUblk {
                 completion_txs,
                 workers,
                 start_handle: None,
+                start_deadline: None,
+                start_result: Some(Ok(())),
                 shutdown: false,
             },
             queues,
@@ -965,11 +974,57 @@ impl UblkCtrlHandle {
         self.recovery_pending = false;
     }
 
+    pub fn poll_start_result(&mut self) -> Option<anyhow::Result<()>> {
+        if self.start_result.is_some() {
+            return self.start_result.take();
+        }
+        if let Some(handle) = &self.start_handle {
+            if handle.is_finished() {
+                let handle = self.start_handle.take();
+                let join_result = handle
+                    .expect("start_handle vanished after is_finished check")
+                    .join();
+                let result = match join_result {
+                    Ok(res) => res,
+                    Err(err) => Err(anyhow!("start_dev thread panicked: {:?}", err)),
+                };
+                self.start_result = Some(result);
+                self.start_deadline = None;
+                return self.start_result.take();
+            }
+        }
+        None
+    }
+
+    pub fn start_deadline_passed(&self, now: Instant) -> bool {
+        self.start_deadline
+            .map(|deadline| now >= deadline)
+            .unwrap_or(false)
+    }
+
+    pub fn mark_start_timed_out(&mut self) {
+        if self.start_result.is_none() {
+            self.start_result = Some(Err(anyhow!(
+                "UBLK_CMD_START_DEV timed out after {:?}",
+                START_DEV_TIMEOUT
+            )));
+        }
+        self.start_deadline = None;
+        self.start_handle = None;
+        self.stop_workers();
+        self.shutdown = true;
+    }
+
     pub fn shutdown(&mut self) {
         if self.shutdown {
             return;
         }
         self.shutdown = true;
+        self.stop_workers();
+        self.join_start_handle();
+    }
+
+    fn stop_workers(&mut self) {
         for worker in &self.workers {
             worker.stop.store(true, Ordering::SeqCst);
         }
@@ -981,10 +1036,15 @@ impl UblkCtrlHandle {
                 error!("queue worker join failed: {:?}", e);
             }
         }
-        if let Some(handle) = self.start_handle.take()
-            && let Err(err) = handle.join()
-        {
-            error!("start_dev thread join failed: {:?}", err);
+    }
+
+    fn join_start_handle(&mut self) {
+        if let Some(handle) = self.start_handle.take() {
+            match handle.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => error!("start_dev thread failed: {:?}", err),
+                Err(err) => error!("start_dev thread join failed: {:?}", err),
+            }
         }
     }
 }

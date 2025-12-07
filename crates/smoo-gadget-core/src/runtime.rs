@@ -337,20 +337,53 @@ impl ExportController {
             ExportState::Device(handle) => match handle {
                 DeviceHandle::Starting {
                     dev_id,
-                    ctrl,
+                    mut ctrl,
                     queues,
                 } => {
-                    let mut device = SmooUblkDevice::from_parts(ctrl, queues.clone());
-                    if device.recovery_pending() {
-                        cx.ublk.finalize_recovery(&mut device).await?;
+                    let start_result = ctrl.poll_start_result();
+                    match start_result {
+                        Some(Ok(())) => {
+                            let mut device = SmooUblkDevice::from_parts(ctrl, queues.clone());
+                            if device.recovery_pending() {
+                                cx.ublk.finalize_recovery(&mut device).await?;
+                            }
+                            let (ctrl, queues) = device.into_parts();
+                            self.next_retry_at = None;
+                            ExportState::Device(DeviceHandle::Online {
+                                dev_id,
+                                ctrl,
+                                queues,
+                            })
+                        }
+                        Some(Err(err)) => {
+                            ctrl.shutdown();
+                            self.next_retry_at = Some(now + self.retry_backoff);
+                            ExportState::Device(DeviceHandle::Failed {
+                                dev_id,
+                                ctrl: Some(ctrl),
+                                queues: Some(queues),
+                                last_error: format!("start_dev failed: {err:#}"),
+                            })
+                        }
+                        None => {
+                            if ctrl.start_deadline_passed(now) {
+                                ctrl.mark_start_timed_out();
+                                self.next_retry_at = Some(now + self.retry_backoff);
+                                ExportState::Device(DeviceHandle::Failed {
+                                    dev_id,
+                                    ctrl: Some(ctrl),
+                                    queues: Some(queues),
+                                    last_error: "start_dev timed out".to_string(),
+                                })
+                            } else {
+                                ExportState::Device(DeviceHandle::Starting {
+                                    dev_id,
+                                    ctrl,
+                                    queues,
+                                })
+                            }
+                        }
                     }
-                    let (ctrl, queues) = device.into_parts();
-                    self.next_retry_at = None;
-                    ExportState::Device(DeviceHandle::Online {
-                        dev_id,
-                        ctrl,
-                        queues,
-                    })
                 }
                 DeviceHandle::Online {
                     dev_id,
