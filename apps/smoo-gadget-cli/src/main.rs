@@ -4,7 +4,7 @@ use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request as HttpRequest, Response as HttpResponse, Server, StatusCode};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use smoo_gadget_core::{
-    ConfigExport, ConfigExportsV0, ControlIo, DmaHeap, ExportController, ExportFlags,
+    ConfigExport, ConfigExportsV0, ControlIo, DeviceHandle, DmaHeap, ExportController, ExportFlags,
     ExportReconcileContext, ExportSpec, ExportState, FunctionfsEndpoints, GadgetConfig,
     GadgetControl, GadgetStatusReport, IoPumpHandle, IoWork, LinkCommand, LinkController,
     LinkState, PersistedExportRecord, RuntimeTunables, SetupCommand, SetupPacket, SmooGadget,
@@ -574,6 +574,10 @@ async fn queue_task_loop(
 }
 
 async fn sync_queue_tasks(runtime: &mut RuntimeState, queue_tx: &QueueSender) {
+    if runtime.io_pump.is_none() {
+        stop_all_queue_tasks(runtime).await;
+        return;
+    }
     let mut to_stop: Vec<u32> = runtime
         .queue_tasks
         .keys()
@@ -584,10 +588,15 @@ async fn sync_queue_tasks(runtime: &mut RuntimeState, queue_tx: &QueueSender) {
     for (&export_id, controller) in runtime.exports.iter() {
         let should_run = controller
             .device_handle()
-            .map(|h| h.is_online())
+            .map(|h| {
+                matches!(
+                    h,
+                    DeviceHandle::Online { .. } | DeviceHandle::Starting { .. }
+                )
+            })
             .unwrap_or(false);
         let running = runtime.queue_tasks.contains_key(&export_id);
-        if should_run && !running {
+        if should_run && runtime.io_pump.is_some() && !running {
             if let Some(handle) = controller.device_handle() {
                 if let Some(queues) = handle.queues() {
                     let tasks =
@@ -631,7 +640,6 @@ async fn ensure_data_plane(
             handle.abort();
             let _ = handle.await;
         }
-        drain_inflight(inflight).await;
         return;
     }
 
@@ -903,7 +911,7 @@ async fn drive_runtime(
 ) -> Result<()> {
     let deadline = Instant::now() + Duration::from_millis(MAINTENANCE_SLICE_MS);
     link.tick(Instant::now());
-    process_link_commands(runtime, link).await?;
+    process_link_commands(runtime, link, inflight, outstanding, response_task).await?;
     ensure_data_plane(runtime, inflight, response_task).await;
     if let Some(tx) = queue_tx {
         sync_queue_tasks(runtime, tx).await;
@@ -922,11 +930,13 @@ async fn handle_config_message(
     runtime: &mut RuntimeState,
     link: &mut LinkController,
     outstanding: &mut HashMap<u32, HashMap<(u16, u16), OutstandingRequest>>,
+    inflight: &Arc<Mutex<HashMap<u32, HashMap<u32, InflightRequest>>>>,
+    response_task: &mut Option<JoinHandle<()>>,
     config: ConfigExportsV0,
 ) -> Result<()> {
     apply_config(ublk, runtime, config).await?;
     prune_outstanding_for_missing_exports(outstanding, &runtime.exports);
-    process_link_commands(runtime, link).await?;
+    process_link_commands(runtime, link, inflight, outstanding, response_task).await?;
     Ok(())
 }
 
@@ -982,7 +992,17 @@ async fn run_event_loop(
             &mut link,
         )
         .await;
-        process_link_commands(&mut runtime, &mut link).await?;
+        process_link_commands(
+            &mut runtime,
+            &mut link,
+            &inflight,
+            &mut outstanding,
+            &mut response_task,
+        )
+        .await?;
+        // Make sure the data plane (io pump + response reader) is up before we
+        // start draining queue events so early responses can't be missed.
+        ensure_data_plane(&mut runtime, &inflight, &mut response_task).await;
 
         if let ShutdownState::Graceful { deadline } = shutdown_state {
             if Instant::now() >= deadline {
@@ -1029,11 +1049,24 @@ async fn run_event_loop(
                 break;
             }
             Some(config) = control_rx.recv(), if matches!(shutdown_state, ShutdownState::Running) => {
-                if let Err(err) = handle_config_message(ublk, &mut runtime, &mut link, &mut outstanding, config).await {
+                if let Err(err) = handle_config_message(
+                    ublk,
+                    &mut runtime,
+                    &mut link,
+                    &mut outstanding,
+                    &inflight,
+                    &mut response_task,
+                    config,
+                )
+                .await
+                {
                     warn!(error = ?err, "CONFIG_EXPORTS application failed");
                 }
             }
-            maybe_evt = queue_rx.recv(), if !matches!(shutdown_state, ShutdownState::Forceful) => {
+            _ = ep0_notified.as_mut() => {
+                continue;
+            }
+            maybe_evt = queue_rx.recv(), if !matches!(shutdown_state, ShutdownState::Forceful) && runtime.io_pump.is_some() => {
                 if let Some(evt) = maybe_evt {
                     if let Err(err) = handle_queue_event(&mut runtime, &mut link, &inflight, &mut outstanding, evt).await {
                         io_error = Some(err);
@@ -1057,9 +1090,6 @@ async fn run_event_loop(
                         break;
                     }
                 }
-            }
-            _ = ep0_notified.as_mut() => {
-                continue;
             }
             _ = liveness_tick.tick() => {
                 if let Err(err) = drive_runtime(
@@ -2014,17 +2044,50 @@ async fn begin_user_recovery(ublk: &mut SmooUblk, runtime: &mut RuntimeState) ->
     Ok(())
 }
 
+async fn park_inflight_requests(
+    inflight: &Arc<Mutex<HashMap<u32, HashMap<u32, InflightRequest>>>>,
+    outstanding: &mut HashMap<u32, HashMap<(u16, u16), OutstandingRequest>>,
+) {
+    let mut guard = inflight.lock().await;
+    let mut drained = Vec::new();
+    for (export_id, mut requests) in guard.drain() {
+        for (_req_id, req) in requests.drain() {
+            drained.push((export_id, req));
+        }
+    }
+    update_request_gauges(&guard);
+    drop(guard);
+
+    for (export_id, req) in drained {
+        park_request(
+            outstanding,
+            export_id,
+            req.request.dev_id,
+            req.queues,
+            req.request,
+        );
+    }
+}
+
 async fn process_link_commands(
     runtime: &mut RuntimeState,
     link: &mut LinkController,
+    inflight: &Arc<Mutex<HashMap<u32, HashMap<u32, InflightRequest>>>>,
+    outstanding: &mut HashMap<u32, HashMap<(u16, u16), OutstandingRequest>>,
+    response_task: &mut Option<JoinHandle<()>>,
 ) -> Result<()> {
     while let Some(cmd) = link.take_command() {
         match cmd {
             LinkCommand::DropLink => {
+                park_inflight_requests(inflight, outstanding).await;
                 if let Some(pump) = runtime.io_pump.take() {
                     drop(pump);
                 }
                 if let Some(task) = runtime.io_pump_task.take() {
+                    task.abort();
+                    let _ = task.await;
+                }
+                if let Some(task) = response_task.take() {
                     task.abort();
                     let _ = task.await;
                 }
@@ -2085,7 +2148,13 @@ async fn handle_queue_event(
                 trace!(export_id, dev_id, "dropping request for stale device id");
                 return Ok(());
             }
-            if link.state() != LinkState::Online || runtime.gadget.is_none() || !handle.is_online()
+            let handle_ready = matches!(
+                handle,
+                DeviceHandle::Online { .. } | DeviceHandle::Starting { .. }
+            );
+            if !matches!(link.state(), LinkState::Online)
+                || runtime.gadget.is_none()
+                || !handle_ready
             {
                 trace!(
                     export_id,

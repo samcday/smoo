@@ -56,8 +56,15 @@ impl LinkController {
             Event::Bind | Event::Enable | Event::Resume => {
                 self.enter_ready();
             }
-            Event::Disable | Event::Unbind | Event::Suspend => {
+            Event::Disable | Event::Unbind => {
                 self.enter_offline();
+            }
+            Event::Suspend => {
+                // The bus may briefly suspend while the host reconfigures; keep the data plane
+                // around and let liveness/status pings drive us back to Online.
+                self.state = LinkState::Ready;
+                self.pending_drop = false;
+                self.pending_reopen = false;
             }
             Event::SetupDeviceToHost(_) | Event::SetupHostToDevice(_) => { /* ignored */ }
             Event::Unknown(_) => {}
