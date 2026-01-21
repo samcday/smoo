@@ -440,7 +440,8 @@ impl SmooUblk {
         submit_ctrl_command(&self.sender, UBLK_CMD_SET_PARAMS, cmd, "set params", None).await?;
 
         let ioctl_encode = (info.flags & (sys::UBLK_F_CMD_IOCTL_ENCODE as u64)) != 0;
-        let max_io_bytes = info.max_io_buf_bytes;
+        let max_io_bytes =
+            usize::try_from(info.max_io_buf_bytes).context("max_io_buf_bytes overflow")?;
         let cdev_path = format!("/dev/ublkc{}", dev_id);
         let base_cdev = File::options()
             .read(true)
@@ -580,7 +581,7 @@ impl SmooUblk {
             block_count,
             queue_count,
             queue_depth,
-            max_io_bytes,
+            info.max_io_buf_bytes,
             ioctl_encode,
         )
         .await

@@ -4,6 +4,7 @@ use smoo_gadget_ublk::{SmooUblk, SmooUblkDevice, UblkCtrlHandle, UblkQueueRuntim
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tracing::info;
 
 #[derive(Clone, Copy, Debug)]
 pub struct RuntimeTunables {
@@ -348,6 +349,18 @@ impl ExportController {
                             if device.recovery_pending() {
                                 cx.ublk.finalize_recovery(&mut device).await?;
                             }
+                            info!(
+                                export_id = self.export_id,
+                                dev_id,
+                                queue_count = queues.queue_count(),
+                                queue_depth = queues.queue_depth(),
+                                block_size = queues.block_size(),
+                                block_count = queues.block_count(),
+                                max_io_bytes = queues.max_io_bytes(),
+                                ioctl_encode = queues.ioctl_encode(),
+                                buffer_len = queues.buffer_len(),
+                                "ublk target online"
+                            );
                             let (ctrl, queues) = device.into_parts();
                             self.next_retry_at = None;
                             ExportState::Device(DeviceHandle::Online {
