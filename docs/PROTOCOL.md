@@ -86,6 +86,15 @@ export MAY be in flight simultaneously, and a host is expected to keep
 queues full (e.g. queue_depth × export_count outstanding). Matching is done
 by the composite key `(export_id, request_id)`.
 
+Bulk ordering follows interrupt serialization per direction, filtered to
+messages that carry payloads. For gadget → host, bulk IN payloads MUST be sent
+in the order their Requests were written to interrupt IN (ignoring Requests
+without payloads). For host → gadget, bulk OUT payloads MUST be sent in the
+order their Responses were written to interrupt OUT (ignoring Responses
+without payloads). Example: Requests [Read1, Write2, Read2, Write1] on
+interrupt IN imply bulk IN order [Write2, Write1]; Responses [Write2, Write1,
+Read1, Read2] on interrupt OUT imply bulk OUT order [Read1, Read2].
+
 ## Constraints & invariants
 
 - `export_id` is the primary key for all control/data paths; `(export_id,

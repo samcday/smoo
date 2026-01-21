@@ -37,10 +37,10 @@ Bulk transfers:
 ## 2. End-to-End I/O Flow
 
 1. ublk on gadget emits a command
-2. gadget → host: send `Request` on interrupt OUT
+2. gadget → host: send `Request` on interrupt IN
 3. host dispatches to `BlockSource`
 4. host performs bulk transfers as needed
-5. host → gadget: send `Response` on interrupt IN
+5. host → gadget: send `Response` on interrupt OUT
 6. gadget completes ublk request
 
 **Invariant:** each ublk request maps to **exactly one Request + one Response**.
@@ -93,6 +93,11 @@ Data (bulk):
 * write path: host → gadget (bulk OUT)
 * read path: gadget → host (bulk IN)
 * MUST send exactly the payload size described in Request
+* Bulk ordering follows interrupt serialization per direction, filtered to
+  payload-bearing messages. For gadget → host, bulk IN payloads must appear in
+  the same order as their corresponding Requests were written to interrupt IN.
+  For host → gadget, bulk OUT payloads must appear in the same order as their
+  corresponding Responses were written to interrupt OUT.
 
 ---
 
@@ -137,6 +142,7 @@ Responsible for shuttling control + payload data.
   drop or duplicate
 * MUST allow pipelining (multiple outstanding Requests per export); Responses
   may be delivered out-of-order
+* MUST preserve bulk ordering as defined in the USB protocol section above
 * MUST be cancellation-safe
 * MUST be async-first (Tokio)
 * MAY block internally if safe
