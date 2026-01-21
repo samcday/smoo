@@ -29,7 +29,9 @@ pub use host::{HostError, HostErrorKind, HostResult, SmooHost};
 #[cfg(feature = "metrics")]
 pub use metrics::{MetricsSnapshot, QueueSnapshot, StatSnapshot};
 #[cfg(feature = "std")]
-pub use pump::{HostIoPumpHandle, HostIoPumpRequestRx, HostIoPumpTask, start_host_io_pump};
+pub use pump::{
+    BulkReadHandle, HostIoPumpHandle, HostIoPumpRequestRx, HostIoPumpTask, start_host_io_pump,
+};
 pub use transport::{
     ControlTransport, CountingTransport, Transport, TransportCounterSnapshot, TransportCounters,
     TransportError, TransportErrorKind, TransportResult,

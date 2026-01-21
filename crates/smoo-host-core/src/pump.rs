@@ -15,6 +15,17 @@ use smoo_proto::{REQUEST_LEN, RESPONSE_LEN, Request, Response};
 /// Stream of Requests produced by the pump.
 pub type HostIoPumpRequestRx = mpsc::UnboundedReceiver<Request>;
 
+/// Handle to an ordered bulk read queued on the pump.
+pub struct BulkReadHandle {
+    rx: oneshot::Receiver<TransportResult<Vec<u8>>>,
+}
+
+impl BulkReadHandle {
+    pub async fn recv(self) -> TransportResult<Vec<u8>> {
+        self.rx.await.unwrap_or_else(|_| Err(disconnected_err()))
+    }
+}
+
 /// Handle used by workers to issue bulk + interrupt OUT operations through the pump.
 #[derive(Clone)]
 pub struct HostIoPumpHandle {
@@ -55,12 +66,24 @@ where
 impl HostIoPumpHandle {
     /// Send a Response over interrupt OUT.
     pub async fn send_response(&self, response: Response) -> TransportResult<()> {
+        self.send_response_with_bulk(response, None).await
+    }
+
+    /// Send a Response and its optional bulk payload in-order.
+    pub async fn send_response_with_bulk(
+        &self,
+        response: Response,
+        bulk_out: Option<Vec<u8>>,
+    ) -> TransportResult<()> {
         let (reply_tx, reply_rx) = oneshot::channel();
         tracing::trace!(
             export_id = response.export_id,
             request_id = response.request_id,
             "pump: queue send_response"
         );
+        if let Some(buf) = bulk_out {
+            self.write_bulk(buf).await?;
+        }
         self.send_cmd(PumpCmd::SendResponse {
             response,
             reply: reply_tx,
@@ -71,8 +94,8 @@ impl HostIoPumpHandle {
         reply_rx.await.unwrap_or_else(|_| Err(disconnected_err()))
     }
 
-    /// Read a bulk payload of `len` bytes from the gadget.
-    pub async fn read_bulk(&self, len: usize) -> TransportResult<Vec<u8>> {
+    /// Queue an ordered bulk read and return a handle to await the payload.
+    pub async fn queue_read_bulk(&self, len: usize) -> TransportResult<BulkReadHandle> {
         let (reply_tx, reply_rx) = oneshot::channel();
         tracing::trace!(bytes = len, "pump: queue read_bulk");
         self.send_cmd(PumpCmd::ReadBulk {
@@ -82,7 +105,12 @@ impl HostIoPumpHandle {
             start: std::time::Instant::now(),
         })
         .await?;
-        reply_rx.await.unwrap_or_else(|_| Err(disconnected_err()))
+        Ok(BulkReadHandle { rx: reply_rx })
+    }
+
+    /// Read a bulk payload of `len` bytes from the gadget.
+    pub async fn read_bulk(&self, len: usize) -> TransportResult<Vec<u8>> {
+        self.queue_read_bulk(len).await?.recv().await
     }
 
     /// Write a bulk payload to the gadget.

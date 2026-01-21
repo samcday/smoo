@@ -1,6 +1,6 @@
 use crate::{
-    BlockSource, BlockSourceError, BlockSourceErrorKind, ControlTransport, ExportIdentity,
-    HostIoPumpHandle, HostIoPumpRequestRx, TransportError, TransportErrorKind,
+    BlockSource, BlockSourceError, BlockSourceErrorKind, BulkReadHandle, ControlTransport,
+    ExportIdentity, HostIoPumpHandle, HostIoPumpRequestRx, TransportError, TransportErrorKind,
     control::{ConfigExportsV0, fetch_ident, send_config_exports_v0},
 };
 use alloc::{
@@ -92,7 +92,17 @@ pub struct SmooHost<S> {
     in_flight: FuturesUnordered<InFlightFuture>,
 }
 
-type InFlightFuture = Pin<Box<dyn Future<Output = HostResult<Response>> + Send>>;
+type InFlightFuture = Pin<Box<dyn Future<Output = HostResult<ResponseWithBulk>> + Send>>;
+
+struct RequestWork {
+    request: Request,
+    bulk_in: Option<BulkReadHandle>,
+}
+
+struct ResponseWithBulk {
+    response: Response,
+    bulk_out: Option<Vec<u8>>,
+}
 
 impl<S> SmooHost<S>
 where
@@ -149,7 +159,7 @@ where
     pub async fn run_once(&mut self) -> HostResult<()> {
         while let Some(resp) = self.in_flight.next().now_or_never().flatten() {
             let response = resp?;
-            self.send_response(response).await?;
+            self.send_response_with_bulk(response).await?;
         }
 
         let request = match self.requests.next().now_or_never() {
@@ -168,19 +178,45 @@ where
         let source = match self.sources.get(&request.export_id).cloned() {
             Some(src) => src,
             None => {
-                self.send_response(invalid_request_response(request, ERRNO_EINVAL))
-                    .await?;
+                self.send_response_with_bulk(ResponseWithBulk {
+                    response: invalid_request_response(request, ERRNO_EINVAL),
+                    bulk_out: None,
+                })
+                .await?;
                 return Ok(());
             }
         };
+        let bulk_in = if request.op == OpCode::Write {
+            let byte_len = match blocks_to_bytes(request.num_blocks, source.block_size()) {
+                Ok(len) => len,
+                Err(_) => {
+                    self.send_response_with_bulk(ResponseWithBulk {
+                        response: invalid_request_response(request, ERRNO_EINVAL),
+                        bulk_out: None,
+                    })
+                    .await?;
+                    return Ok(());
+                }
+            };
+            if byte_len > 0 {
+                Some(self.pump.queue_read_bulk(byte_len).await?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let pump = self.pump.clone();
+        let work = RequestWork { request, bulk_in };
         self.in_flight
-            .push(Box::pin(handle_request(pump, source, request)));
+            .push(Box::pin(handle_request(pump, source, work)));
         Ok(())
     }
 
-    async fn send_response(&self, response: Response) -> HostResult<()> {
-        self.pump.send_response(response).await?;
+    async fn send_response_with_bulk(&self, response: ResponseWithBulk) -> HostResult<()> {
+        self.pump
+            .send_response_with_bulk(response.response, response.bulk_out)
+            .await?;
         Ok(())
     }
 }
@@ -192,49 +228,70 @@ const ERRNO_EOPNOTSUPP: u32 = 95;
 async fn handle_request<S>(
     pump: HostIoPumpHandle,
     source: S,
-    request: Request,
-) -> HostResult<Response>
+    work: RequestWork,
+) -> HostResult<ResponseWithBulk>
 where
     S: BlockSource + ExportIdentity + Clone + Send + 'static,
 {
-    match request.op {
-        OpCode::Read => handle_read(pump, source, request).await,
-        OpCode::Write => handle_write(pump, source, request).await,
+    match work.request.op {
+        OpCode::Read => handle_read(pump, source, work.request).await,
+        OpCode::Write => handle_write(pump, source, work.request, work.bulk_in).await,
         OpCode::Flush => match source.flush().await {
-            Ok(()) => Ok(Response::new(
-                request.export_id,
-                request.request_id,
-                OpCode::Flush,
-                0,
-                request.lba,
-                request.num_blocks,
-                0,
-            )),
-            Err(err) => Ok(response_from_block_error(request, err)),
+            Ok(()) => Ok(ResponseWithBulk {
+                response: Response::new(
+                    work.request.export_id,
+                    work.request.request_id,
+                    OpCode::Flush,
+                    0,
+                    work.request.lba,
+                    work.request.num_blocks,
+                    0,
+                ),
+                bulk_out: None,
+            }),
+            Err(err) => Ok(ResponseWithBulk {
+                response: response_from_block_error(work.request, err),
+                bulk_out: None,
+            }),
         },
-        OpCode::Discard => match source.discard(request.lba, request.num_blocks).await {
-            Ok(()) => Ok(Response::new(
-                request.export_id,
-                request.request_id,
-                OpCode::Discard,
-                0,
-                request.lba,
-                request.num_blocks,
-                0,
-            )),
-            Err(err) => Ok(response_from_block_error(request, err)),
+        OpCode::Discard => match source.discard(work.request.lba, work.request.num_blocks).await {
+            Ok(()) => Ok(ResponseWithBulk {
+                response: Response::new(
+                    work.request.export_id,
+                    work.request.request_id,
+                    OpCode::Discard,
+                    0,
+                    work.request.lba,
+                    work.request.num_blocks,
+                    0,
+                ),
+                bulk_out: None,
+            }),
+            Err(err) => Ok(ResponseWithBulk {
+                response: response_from_block_error(work.request, err),
+                bulk_out: None,
+            }),
         },
     }
 }
 
-async fn handle_read<S>(pump: HostIoPumpHandle, source: S, request: Request) -> HostResult<Response>
+async fn handle_read<S>(
+    _pump: HostIoPumpHandle,
+    source: S,
+    request: Request,
+) -> HostResult<ResponseWithBulk>
 where
     S: BlockSource + ExportIdentity + Clone + Send + 'static,
 {
     let block_size = source.block_size();
     let byte_len = match blocks_to_bytes(request.num_blocks, block_size) {
         Ok(len) => len,
-        Err(_) => return Ok(invalid_request_response(request, ERRNO_EINVAL)),
+        Err(_) => {
+            return Ok(ResponseWithBulk {
+                response: invalid_request_response(request, ERRNO_EINVAL),
+                bulk_out: None,
+            })
+        }
     };
     trace!(
         request_id = request.request_id,
@@ -244,7 +301,7 @@ where
         bytes = byte_len,
         "host: handling read"
     );
-    if byte_len > 0 {
+    let bulk_out = if byte_len > 0 {
         let mut buf: Vec<u8> = vec![0u8; byte_len];
         trace!(
             request_id = request.request_id,
@@ -256,10 +313,18 @@ where
         );
         let read = match source.read_blocks(request.lba, &mut buf).await {
             Ok(len) => len,
-            Err(err) => return Ok(response_from_block_error(request, err)),
+            Err(err) => {
+                return Ok(ResponseWithBulk {
+                    response: response_from_block_error(request, err),
+                    bulk_out: None,
+                })
+            }
         };
         if read != byte_len {
-            return Ok(short_io_response(request));
+            return Ok(ResponseWithBulk {
+                response: short_io_response(request),
+                bulk_out: None,
+            });
         }
         trace!(
             request_id = request.request_id,
@@ -269,23 +334,10 @@ where
             bytes = read,
             "host: blocksource read_blocks done"
         );
-        trace!(
-            request_id = request.request_id,
-            export_id = request.export_id,
-            lba = request.lba,
-            num_blocks = request.num_blocks,
-            bytes = buf.len(),
-            "host: pump write_bulk start"
-        );
-        pump.write_bulk(buf).await?;
-        trace!(
-            request_id = request.request_id,
-            export_id = request.export_id,
-            lba = request.lba,
-            num_blocks = request.num_blocks,
-            "host: pump write_bulk done"
-        );
-    }
+        Some(buf)
+    } else {
+        None
+    };
     trace!(
         request_id = request.request_id,
         export_id = request.export_id,
@@ -293,29 +345,38 @@ where
         num_blocks = request.num_blocks,
         "host: read complete"
     );
-    Ok(Response::new(
-        request.export_id,
-        request.request_id,
-        OpCode::Read,
-        0,
-        request.lba,
-        request.num_blocks,
-        0,
-    ))
+    Ok(ResponseWithBulk {
+        response: Response::new(
+            request.export_id,
+            request.request_id,
+            OpCode::Read,
+            0,
+            request.lba,
+            request.num_blocks,
+            0,
+        ),
+        bulk_out,
+    })
 }
 
 async fn handle_write<S>(
-    pump: HostIoPumpHandle,
+    _pump: HostIoPumpHandle,
     source: S,
     request: Request,
-) -> HostResult<Response>
+    bulk_in: Option<BulkReadHandle>,
+) -> HostResult<ResponseWithBulk>
 where
     S: BlockSource + ExportIdentity + Clone + Send + 'static,
 {
     let block_size = source.block_size();
     let byte_len = match blocks_to_bytes(request.num_blocks, block_size) {
         Ok(len) => len,
-        Err(_) => return Ok(invalid_request_response(request, ERRNO_EINVAL)),
+        Err(_) => {
+            return Ok(ResponseWithBulk {
+                response: invalid_request_response(request, ERRNO_EINVAL),
+                bulk_out: None,
+            })
+        }
     };
     trace!(
         request_id = request.request_id,
@@ -326,6 +387,9 @@ where
         "host: handling write"
     );
     if byte_len > 0 {
+        let bulk_in = bulk_in.ok_or_else(|| {
+            HostError::with_message(HostErrorKind::InvalidRequest, "missing bulk payload")
+        })?;
         trace!(
             request_id = request.request_id,
             export_id = request.export_id,
@@ -334,7 +398,7 @@ where
             bytes = byte_len,
             "host: pump read_bulk start"
         );
-        let buf = pump.read_bulk(byte_len).await?;
+        let buf = bulk_in.recv().await?;
         trace!(
             request_id = request.request_id,
             export_id = request.export_id,
@@ -353,10 +417,18 @@ where
         );
         let written = match source.write_blocks(request.lba, &buf).await {
             Ok(len) => len,
-            Err(err) => return Ok(response_from_block_error(request, err)),
+            Err(err) => {
+                return Ok(ResponseWithBulk {
+                    response: response_from_block_error(request, err),
+                    bulk_out: None,
+                })
+            }
         };
         if written != byte_len {
-            return Ok(short_io_response(request));
+            return Ok(ResponseWithBulk {
+                response: short_io_response(request),
+                bulk_out: None,
+            });
         }
         trace!(
             request_id = request.request_id,
@@ -375,15 +447,18 @@ where
         result = %request.num_blocks,
         "host: write complete"
     );
-    Ok(Response::new(
-        request.export_id,
-        request.request_id,
-        OpCode::Write,
-        0,
-        request.lba,
-        request.num_blocks,
-        0,
-    ))
+    Ok(ResponseWithBulk {
+        response: Response::new(
+            request.export_id,
+            request.request_id,
+            OpCode::Write,
+            0,
+            request.lba,
+            request.num_blocks,
+            0,
+        ),
+        bulk_out: None,
+    })
 }
 
 fn blocks_to_bytes(num_blocks: u32, block_size: u32) -> HostResult<usize> {
