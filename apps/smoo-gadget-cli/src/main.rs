@@ -654,7 +654,11 @@ async fn ensure_data_plane(
         if let Some(gadget) = runtime.gadget.clone() {
             let inflight_map = inflight.clone();
             let interrupt_out = gadget.response_reader();
-            *response_task = Some(tokio::spawn(response_loop(interrupt_out, inflight_map)));
+            *response_task = Some(tokio::spawn(response_loop(
+                gadget,
+                interrupt_out,
+                inflight_map,
+            )));
         }
     }
 }
@@ -1447,6 +1451,7 @@ fn response_status(resp: &Response, expected_len: usize, block_size: usize) -> R
 }
 
 async fn response_loop(
+    gadget: Arc<SmooGadget>,
     interrupt_out: Arc<Mutex<tokio::fs::File>>,
     inflight: Arc<Mutex<HashMap<u32, HashMap<u32, InflightRequest>>>>,
 ) {
@@ -1512,6 +1517,36 @@ async fn response_loop(
                 reported = status,
                 "response byte count mismatch"
             );
+        }
+        if response.op == OpCode::Read && status > 0 {
+            let read_len = usize::try_from(status).unwrap_or(entry.req_len);
+            let read_len = read_len.min(entry.req_len);
+            if let Ok(mut buffer) = entry
+                .queues
+                .checkout_buffer(entry.request.queue_id, entry.request.tag)
+            {
+                if let Err(err) = gadget
+                    .read_bulk_buffer(&mut buffer.as_mut_slice()[..read_len])
+                    .await
+                {
+                    warn!(
+                        request_id = response.request_id,
+                        export_id = response.export_id,
+                        error = ?err,
+                        "bulk OUT read failed"
+                    );
+                    let _ = entry.queues.complete_io(entry.request, -libc::EIO);
+                    continue;
+                }
+            } else {
+                warn!(
+                    request_id = response.request_id,
+                    export_id = response.export_id,
+                    "failed to checkout ublk buffer for bulk OUT"
+                );
+                let _ = entry.queues.complete_io(entry.request, -libc::EIO);
+                continue;
+            }
         }
         if let Err(err) = entry.queues.complete_io(entry.request, status) {
             warn!(

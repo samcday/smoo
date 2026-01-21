@@ -128,16 +128,6 @@ async fn process_bulk(gadget: &SmooGadget, work: IoWork) -> Result<()> {
     }
 
     match work.op {
-        OpCode::Read => {
-            let mut buffer = work
-                .queues
-                .checkout_buffer(work.queue_id, work.tag)
-                .map_err(|err| anyhow!("checkout buffer for read: {err:#}"))?;
-            gadget
-                .read_bulk_buffer(&mut buffer.as_mut_slice()[..work.req_len])
-                .await
-                .map_err(|err| anyhow!("bulk read payload: {err:#}"))?;
-        }
         OpCode::Write => {
             let mut buffer = work
                 .queues
