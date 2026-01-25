@@ -81,11 +81,9 @@ impl HostIoPumpHandle {
             request_id = response.request_id,
             "pump: queue send_response"
         );
-        if let Some(buf) = bulk_out {
-            self.write_bulk(buf).await?;
-        }
-        self.send_cmd(PumpCmd::SendResponse {
+        self.send_cmd(PumpCmd::SendResponseWithBulk {
             response,
+            bulk_out,
             reply: reply_tx,
             #[cfg(feature = "metrics")]
             start: std::time::Instant::now(),
@@ -142,6 +140,13 @@ impl HostIoPumpHandle {
 }
 
 enum PumpCmd {
+    SendResponseWithBulk {
+        response: Response,
+        bulk_out: Option<Vec<u8>>,
+        reply: oneshot::Sender<TransportResult<()>>,
+        #[cfg(feature = "metrics")]
+        start: std::time::Instant,
+    },
     SendResponse {
         response: Response,
         reply: oneshot::Sender<TransportResult<()>>,
@@ -179,7 +184,7 @@ struct BulkInOp {
 
 struct BulkOutOp {
     buf: Vec<u8>,
-    reply: oneshot::Sender<TransportResult<()>>,
+    reply: Option<oneshot::Sender<TransportResult<()>>>,
     #[cfg(feature = "metrics")]
     start: std::time::Instant,
 }
@@ -191,7 +196,7 @@ type BulkInResult = (
     oneshot::Sender<TransportResult<Vec<u8>>>,
     TransportResult<Vec<u8>>,
 );
-type BulkOutResult = (oneshot::Sender<TransportResult<()>>, TransportResult<()>);
+type BulkOutResult = (Option<oneshot::Sender<TransportResult<()>>>, TransportResult<()>);
 
 struct InFlightBulkIn {
     fut: Fuse<BoxFuture<'static, BulkInResult>>,
@@ -319,6 +324,36 @@ where
 
     if let Poll::Ready(cmd) = cmd_rx.poll_next_unpin(cx) {
         match cmd {
+            Some(PumpCmd::SendResponseWithBulk {
+                response,
+                bulk_out,
+                reply,
+                #[cfg(feature = "metrics")]
+                start,
+                ..
+            }) => {
+                tracing::trace!(
+                    export_id = response.export_id,
+                    request_id = response.request_id,
+                    "pump: enqueue response"
+                );
+                interrupt_out_queue.push_back(InterruptOutOp {
+                    response,
+                    reply,
+                    #[cfg(feature = "metrics")]
+                    start,
+                });
+                if let Some(buf) = bulk_out {
+                    #[cfg(feature = "metrics")]
+                    crate::metrics::record_bulk_out_queue(bulk_out_queue.len() + 1);
+                    bulk_out_queue.push_back(BulkOutOp {
+                        buf,
+                        reply: None,
+                        #[cfg(feature = "metrics")]
+                        start: std::time::Instant::now(),
+                    });
+                }
+            }
             Some(PumpCmd::SendResponse {
                 response,
                 reply,
@@ -367,7 +402,7 @@ where
                 crate::metrics::record_bulk_out_queue(bulk_out_queue.len() + 1);
                 bulk_out_queue.push_back(BulkOutOp {
                     buf,
-                    reply,
+                    reply: Some(reply),
                     #[cfg(feature = "metrics")]
                     start,
                 });
@@ -431,7 +466,9 @@ where
                 } else {
                     tracing::trace!("pump: bulk-out done");
                 }
-                let _ = reply.send(result);
+                if let Some(reply) = reply {
+                    let _ = reply.send(result);
+                }
             }
             bulk_out_inflight.pop_front();
             made_progress = true;

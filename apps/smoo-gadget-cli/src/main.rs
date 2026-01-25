@@ -1450,11 +1450,48 @@ fn response_status(resp: &Response, expected_len: usize, block_size: usize) -> R
         .map_err(|_| anyhow!("response length exceeds i32"))
 }
 
+struct BulkOutWork {
+    entry: InflightRequest,
+    read_len: usize,
+    status: i32,
+    completion: oneshot::Sender<BulkOutResult>,
+}
+
+struct BulkOutResult {
+    entry: InflightRequest,
+    status: i32,
+    result: Result<()>,
+}
+
 async fn response_loop(
     gadget: Arc<SmooGadget>,
     interrupt_out: Arc<Mutex<tokio::fs::File>>,
     inflight: Arc<Mutex<HashMap<u32, HashMap<u32, InflightRequest>>>>,
 ) {
+    let (bulk_tx, mut bulk_rx) = mpsc::channel::<BulkOutWork>(64);
+    let bulk_gadget = gadget.clone();
+    let bulk_task = tokio::spawn(async move {
+        while let Some(work) = bulk_rx.recv().await {
+            let result = async {
+                let mut buffer = work
+                    .entry
+                    .queues
+                    .checkout_buffer(work.entry.request.queue_id, work.entry.request.tag)
+                    .map_err(|err| anyhow!("checkout buffer for bulk out: {err:#}"))?;
+                bulk_gadget
+                    .read_bulk_buffer(&mut buffer.as_mut_slice()[..work.read_len])
+                    .await
+                    .map_err(|err| anyhow!("bulk OUT read failed: {err:#}"))?;
+                Ok(())
+            }
+            .await;
+            let _ = work.completion.send(BulkOutResult {
+                entry: work.entry,
+                status: work.status,
+                result,
+            });
+        }
+    });
     loop {
         let response = {
             let mut buf = [0u8; smoo_proto::RESPONSE_LEN];
@@ -1521,32 +1558,53 @@ async fn response_loop(
         if response.op == OpCode::Read && status > 0 {
             let read_len = usize::try_from(status).unwrap_or(entry.req_len);
             let read_len = read_len.min(entry.req_len);
-            if let Ok(mut buffer) = entry
-                .queues
-                .checkout_buffer(entry.request.queue_id, entry.request.tag)
+            let (completion_tx, completion_rx) = oneshot::channel();
+            if bulk_tx
+                .send(BulkOutWork {
+                    entry,
+                    read_len,
+                    status,
+                    completion: completion_tx,
+                })
+                .await
+                .is_err()
             {
-                if let Err(err) = gadget
-                    .read_bulk_buffer(&mut buffer.as_mut_slice()[..read_len])
-                    .await
-                {
-                    warn!(
-                        request_id = response.request_id,
-                        export_id = response.export_id,
-                        error = ?err,
-                        "bulk OUT read failed"
-                    );
-                    let _ = entry.queues.complete_io(entry.request, -libc::EIO);
-                    continue;
-                }
-            } else {
                 warn!(
                     request_id = response.request_id,
                     export_id = response.export_id,
-                    "failed to checkout ublk buffer for bulk OUT"
+                    "bulk OUT worker stopped"
                 );
-                let _ = entry.queues.complete_io(entry.request, -libc::EIO);
                 continue;
             }
+            tokio::spawn(async move {
+                match completion_rx.await {
+                    Ok(result) => match result.result {
+                        Ok(()) => {
+                            if let Err(err) =
+                                result.entry.queues.complete_io(result.entry.request, result.status)
+                            {
+                                warn!(
+                                    request_id = result.entry.request_id,
+                                    export_id = result.entry.export_id,
+                                    error = ?err,
+                                    "failed to complete ublk request after bulk OUT"
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            warn!(error = ?err, "bulk OUT worker error");
+                            let _ = result
+                                .entry
+                                .queues
+                                .complete_io(result.entry.request, -libc::EIO);
+                        }
+                    },
+                    Err(_) => {
+                        warn!("bulk OUT completion channel dropped");
+                    }
+                }
+            });
+            continue;
         }
         if let Err(err) = entry.queues.complete_io(entry.request, status) {
             warn!(
@@ -1557,6 +1615,8 @@ async fn response_loop(
             );
         }
     }
+    drop(bulk_tx);
+    let _ = bulk_task.await;
     drain_inflight(&inflight).await;
 }
 
