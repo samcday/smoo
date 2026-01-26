@@ -140,7 +140,7 @@ pub type UblkBuffer<'a> = BufferGuard<'a>;
 
 impl SmooUblk {
     pub fn max_io_bytes_hint(block_size: usize, queue_depth: u16) -> anyhow::Result<usize> {
-        compute_max_io_bytes(block_size, queue_depth)
+        compute_max_io_bytes(block_size, queue_depth, None)
     }
 
     /// Request that Drop skips issuing STOP/DEL so user-recovery can proceed.
@@ -349,6 +349,7 @@ impl SmooUblk {
         block_count: usize,
         queue_count: u16,
         queue_depth: u16,
+        max_io_bytes: Option<usize>,
     ) -> anyhow::Result<SmooUblkDevice> {
         debug!(
             block_size = block_size,
@@ -376,7 +377,7 @@ impl SmooUblk {
             "device capacity must be divisible by 512"
         );
         let dev_sectors = (total_bytes / 512) as u64;
-        let max_io_bytes = compute_max_io_bytes(block_size, queue_depth)?;
+        let max_io_bytes = compute_max_io_bytes(block_size, queue_depth, max_io_bytes)?;
         let max_io_buf_bytes = max_io_bytes as u32;
         let buffers = QueueBuffers::new(queue_count, queue_depth, max_io_bytes)
             .context("allocate ublk buffers")?;
@@ -439,6 +440,7 @@ impl SmooUblk {
         submit_ctrl_command(&self.sender, UBLK_CMD_SET_PARAMS, cmd, "set params", None).await?;
 
         let ioctl_encode = (info.flags & (sys::UBLK_F_CMD_IOCTL_ENCODE as u64)) != 0;
+        let max_io_bytes = info.max_io_buf_bytes;
         let cdev_path = format!("/dev/ublkc{}", dev_id);
         let base_cdev = File::options()
             .read(true)
@@ -578,6 +580,7 @@ impl SmooUblk {
             block_count,
             queue_count,
             queue_depth,
+            max_io_bytes,
             ioctl_encode,
         )
         .await
@@ -590,6 +593,7 @@ impl SmooUblk {
         block_count: usize,
         queue_count: u16,
         queue_depth: u16,
+        max_io_bytes: u32,
         ioctl_encode: bool,
     ) -> anyhow::Result<SmooUblkDevice> {
         ensure!(block_size != 0, "block size must be non-zero");
@@ -610,7 +614,11 @@ impl SmooUblk {
             total_bytes % 512 == 0,
             "device capacity must be divisible by 512"
         );
-        let max_io_bytes = compute_max_io_bytes(block_size, queue_depth)?;
+        let max_io_bytes = if max_io_bytes == 0 {
+            compute_max_io_bytes(block_size, queue_depth, None)?
+        } else {
+            normalize_max_io_bytes(block_size, max_io_bytes as usize)?
+        };
         let buffers = QueueBuffers::new(queue_count, queue_depth, max_io_bytes)
             .context("allocate ublk buffers")?;
         let queue_buf_ptrs = buffers.raw_ptrs();
@@ -1440,7 +1448,27 @@ fn encode_cmd_op(cmd: u32, ioctl_encode: bool) -> u32 {
     if ioctl_encode { cmd } else { cmd & 0xff }
 }
 
-fn compute_max_io_bytes(block_size: usize, queue_depth: u16) -> anyhow::Result<usize> {
+fn normalize_max_io_bytes(block_size: usize, max_io_bytes: usize) -> anyhow::Result<usize> {
+    ensure!(max_io_bytes >= block_size, "max io bytes below block size");
+    ensure!(
+        max_io_bytes % block_size == 0,
+        "max io bytes must be block aligned"
+    );
+    ensure!(
+        max_io_bytes <= u32::MAX as usize,
+        "max io bytes exceeds u32::MAX"
+    );
+    Ok(max_io_bytes)
+}
+
+fn compute_max_io_bytes(
+    block_size: usize,
+    queue_depth: u16,
+    max_io_bytes: Option<usize>,
+) -> anyhow::Result<usize> {
+    if let Some(max_io_bytes) = max_io_bytes {
+        return normalize_max_io_bytes(block_size, max_io_bytes);
+    }
     let queue_depth_bytes = block_size
         .checked_mul(queue_depth as usize)
         .context("queue buffer size overflow")?;

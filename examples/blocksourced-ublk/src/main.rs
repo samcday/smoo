@@ -84,7 +84,13 @@ async fn main() -> anyhow::Result<()> {
     let max_io_bytes = SmooUblk::max_io_bytes_hint(block_size, args.queue_depth)
         .context("compute max io bytes")?;
     let device = ublk
-        .setup_device(block_size, block_count, args.queue_count, args.queue_depth)
+        .setup_device(
+            block_size,
+            block_count,
+            args.queue_count,
+            args.queue_depth,
+            None,
+        )
         .await
         .context("setup device")?;
     ensure!(

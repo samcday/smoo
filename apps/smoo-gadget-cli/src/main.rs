@@ -77,6 +77,9 @@ struct Args {
     /// Depth of each ublk queue.
     #[arg(long, default_value_t = 16)]
     queue_depth: u16,
+    /// Maximum per-I/O size in bytes to advertise to ublk (block-aligned).
+    #[arg(long = "max-io", value_name = "BYTES")]
+    max_io_bytes: Option<usize>,
     /// Opt-in to the experimental DMA-BUF fast path when supported by the kernel.
     #[arg(long)]
     experimental_dma_buf: bool,
@@ -149,11 +152,12 @@ async fn main() -> Result<()> {
 
     let ident = Ident::new(0, 1);
     let dma_heap = args.experimental_dma_buf.then(|| args.dma_heap.into());
+    let max_io_bytes = args.max_io_bytes.unwrap_or(DEFAULT_MAX_IO_BYTES);
     let gadget_config = GadgetConfig::new(
         ident,
         args.queue_count,
         args.queue_depth,
-        DEFAULT_MAX_IO_BYTES,
+        max_io_bytes,
         dma_heap,
     );
     let gadget =
@@ -163,6 +167,7 @@ async fn main() -> Result<()> {
         ident_minor = ident.minor,
         queues = args.queue_count,
         depth = args.queue_depth,
+        max_io_bytes = max_io_bytes,
         "smoo gadget initialized"
     );
 
@@ -188,7 +193,7 @@ async fn main() -> Result<()> {
     let tunables = RuntimeTunables {
         queue_count: args.queue_count,
         queue_depth: args.queue_depth,
-        max_io_bytes: DEFAULT_MAX_IO_BYTES,
+        max_io_bytes: args.max_io_bytes,
         dma_heap,
     };
     let link = LinkController::new(Duration::from_secs(3));

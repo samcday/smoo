@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 pub struct RuntimeTunables {
     pub queue_count: u16,
     pub queue_depth: u16,
-    pub max_io_bytes: usize,
+    pub max_io_bytes: Option<usize>,
     pub dma_heap: Option<crate::DmaHeap>,
 }
 
@@ -284,6 +284,7 @@ impl ExportController {
                         block_count,
                         cx.tunables.queue_count,
                         cx.tunables.queue_depth,
+                        cx.tunables.max_io_bytes,
                     )
                     .await?;
                 let dev_id = device.dev_id();
