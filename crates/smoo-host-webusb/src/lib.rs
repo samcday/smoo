@@ -5,7 +5,7 @@
 //! the types compile but always return `TransportErrorKind::Unsupported`.
 
 /// Transport configuration for WebUSB.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct WebUsbTransportConfig {
     /// Interface number to claim before issuing transfers.
     pub interface: u8,
@@ -17,18 +17,6 @@ pub struct WebUsbTransportConfig {
     pub bulk_in: Option<u8>,
     /// Bulk endpoint number used to write payloads (host → device).
     pub bulk_out: Option<u8>,
-}
-
-impl Default for WebUsbTransportConfig {
-    fn default() -> Self {
-        Self {
-            interface: 0,
-            interrupt_in: None,
-            interrupt_out: None,
-            bulk_in: None,
-            bulk_out: None,
-        }
-    }
 }
 
 #[cfg(target_arch = "wasm32")]

@@ -254,7 +254,10 @@ where
                 bulk_out: None,
             }),
         },
-        OpCode::Discard => match source.discard(work.request.lba, work.request.num_blocks).await {
+        OpCode::Discard => match source
+            .discard(work.request.lba, work.request.num_blocks)
+            .await
+        {
             Ok(()) => Ok(ResponseWithBulk {
                 response: Response::new(
                     work.request.export_id,
@@ -290,7 +293,7 @@ where
             return Ok(ResponseWithBulk {
                 response: invalid_request_response(request, ERRNO_EINVAL),
                 bulk_out: None,
-            })
+            });
         }
     };
     trace!(
@@ -317,7 +320,7 @@ where
                 return Ok(ResponseWithBulk {
                     response: response_from_block_error(request, err),
                     bulk_out: None,
-                })
+                });
             }
         };
         if read != byte_len {
@@ -375,7 +378,7 @@ where
             return Ok(ResponseWithBulk {
                 response: invalid_request_response(request, ERRNO_EINVAL),
                 bulk_out: None,
-            })
+            });
         }
     };
     trace!(
@@ -421,7 +424,7 @@ where
                 return Ok(ResponseWithBulk {
                     response: response_from_block_error(request, err),
                     bulk_out: None,
-                })
+                });
             }
         };
         if written != byte_len {

@@ -136,12 +136,12 @@ impl TransportCounters {
 
     /// Bytes sent from host → gadget so far.
     pub fn bytes_up(&self) -> u64 {
-        self.bytes_up.load(Ordering::Relaxed) as u64
+        self.bytes_up.load(Ordering::Relaxed)
     }
 
     /// Bytes received from gadget → host so far.
     pub fn bytes_down(&self) -> u64 {
-        self.bytes_down.load(Ordering::Relaxed) as u64
+        self.bytes_down.load(Ordering::Relaxed)
     }
 
     /// Reset both counters back to zero.

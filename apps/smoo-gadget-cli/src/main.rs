@@ -1580,8 +1580,10 @@ async fn response_loop(
                 match completion_rx.await {
                     Ok(result) => match result.result {
                         Ok(()) => {
-                            if let Err(err) =
-                                result.entry.queues.complete_io(result.entry.request, result.status)
+                            if let Err(err) = result
+                                .entry
+                                .queues
+                                .complete_io(result.entry.request, result.status)
                             {
                                 warn!(
                                     request_id = result.entry.request_id,

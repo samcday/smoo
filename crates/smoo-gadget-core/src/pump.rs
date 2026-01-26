@@ -127,18 +127,15 @@ async fn process_bulk(gadget: &SmooGadget, work: IoWork) -> Result<()> {
         return Ok(());
     }
 
-    match work.op {
-        OpCode::Write => {
-            let mut buffer = work
-                .queues
-                .checkout_buffer(work.queue_id, work.tag)
-                .map_err(|err| anyhow!("checkout buffer for write: {err:#}"))?;
-            gadget
-                .write_bulk_buffer(&mut buffer.as_mut_slice()[..work.req_len])
-                .await
-                .map_err(|err| anyhow!("bulk write payload: {err:#}"))?;
-        }
-        _ => {}
+    if work.op == OpCode::Write {
+        let mut buffer = work
+            .queues
+            .checkout_buffer(work.queue_id, work.tag)
+            .map_err(|err| anyhow!("checkout buffer for write: {err:#}"))?;
+        gadget
+            .write_bulk_buffer(&mut buffer.as_mut_slice()[..work.req_len])
+            .await
+            .map_err(|err| anyhow!("bulk write payload: {err:#}"))?;
     }
 
     Ok(())

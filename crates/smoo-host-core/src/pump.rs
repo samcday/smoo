@@ -147,12 +147,6 @@ enum PumpCmd {
         #[cfg(feature = "metrics")]
         start: std::time::Instant,
     },
-    SendResponse {
-        response: Response,
-        reply: oneshot::Sender<TransportResult<()>>,
-        #[cfg(feature = "metrics")]
-        start: std::time::Instant,
-    },
     ReadBulk {
         buf: Vec<u8>,
         reply: oneshot::Sender<TransportResult<Vec<u8>>>,
@@ -196,7 +190,10 @@ type BulkInResult = (
     oneshot::Sender<TransportResult<Vec<u8>>>,
     TransportResult<Vec<u8>>,
 );
-type BulkOutResult = (Option<oneshot::Sender<TransportResult<()>>>, TransportResult<()>);
+type BulkOutResult = (
+    Option<oneshot::Sender<TransportResult<()>>>,
+    TransportResult<()>,
+);
 
 struct InFlightBulkIn {
     fut: Fuse<BoxFuture<'static, BulkInResult>>,
@@ -353,25 +350,6 @@ where
                         start: std::time::Instant::now(),
                     });
                 }
-            }
-            Some(PumpCmd::SendResponse {
-                response,
-                reply,
-                #[cfg(feature = "metrics")]
-                start,
-                ..
-            }) => {
-                tracing::trace!(
-                    export_id = response.export_id,
-                    request_id = response.request_id,
-                    "pump: enqueue response"
-                );
-                interrupt_out_queue.push_back(InterruptOutOp {
-                    response,
-                    reply,
-                    #[cfg(feature = "metrics")]
-                    start,
-                });
             }
             Some(PumpCmd::ReadBulk {
                 buf,
