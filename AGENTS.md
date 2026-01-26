@@ -41,3 +41,9 @@ The goal is to keep a clean, comprehensible codebase while safely harnessing LLM
 ## Notes
 
 This workflow is intentionally strict to maintain project integrity while allowing rapid iteration.
+
+## Output expectations
+- Prefer small, reviewable diffs; add brief rationale in the PR/commit message body when applicable.
+- Unless explicitly impossible, do not end a turn without running and passing `cargo fmt`, `cargo check --workspace`, and `cargo clippy --workspace` (or explaining why it failed/was skipped).
+- Avoid introducing new tools/dependencies without a short justification and a confirmation from the Developer.
+- If instructions in this file conflict with user directions, ask for clarification before proceeding.
