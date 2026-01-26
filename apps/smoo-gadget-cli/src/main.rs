@@ -2194,7 +2194,7 @@ async fn process_link_commands(
                     let _ = task.await;
                 }
                 runtime.gadget = None;
-                debug!("link controller requested drop; data plane closed");
+                warn!("link controller requested drop; data plane closed");
             }
             LinkCommand::Reopen => {
                 if runtime.gadget.is_some() {
@@ -2209,7 +2209,7 @@ async fn process_link_commands(
                             runtime.io_pump = Some(handle);
                             runtime.io_pump_task = Some(task);
                             runtime.gadget = Some(gadget);
-                            debug!("link controller reopened data plane");
+                            warn!("link controller reopened data plane");
                         }
                         Err(err) => {
                             warn!(error = ?err, "reopen data plane failed");
