@@ -2825,6 +2825,9 @@ fn make_ep(direction: EndpointDirection, ty: TransferType, packet_size: u16) -> 
     };
     ep.max_packet_size_hs = packet_size;
     ep.max_packet_size_ss = packet_size;
+    if matches!(ty, TransferType::Interrupt) {
+        ep.interval = 1;
+    }
     ep
 }
 
