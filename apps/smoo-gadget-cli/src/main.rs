@@ -2800,12 +2800,12 @@ fn open_data_endpoints(ffs_dir: &Path) -> Result<FunctionfsEndpoints> {
 
 fn interrupt_in_ep() -> Endpoint {
     let (_, dir) = EndpointDirection::device_to_host();
-    make_ep(dir, TransferType::Interrupt, 16)
+    make_ep(dir, TransferType::Interrupt, 1024)
 }
 
 fn interrupt_out_ep() -> Endpoint {
     let (_, dir) = EndpointDirection::host_to_device();
-    make_ep(dir, TransferType::Interrupt, 16)
+    make_ep(dir, TransferType::Interrupt, 1024)
 }
 
 fn bulk_in_ep() -> Endpoint {
