@@ -387,13 +387,18 @@ async fn open_sources(args: &Args) -> Result<(BTreeMap<u32, BlockSourceHandle>, 
     ensure!(block_size > 0, "block size must be non-zero");
 
     for path in &args.files {
-        let size_bytes = file_size_bytes(path)?;
         let canonical = canonicalize_path(path)?;
         let identity = format!("file:{}", canonical.display());
-        let source = BlockSourceHandle::new(
-            HostSource::File(FileBlockSource::open(path, block_size).await?),
-            identity.clone(),
-        );
+        let file_source = FileBlockSource::open(path, block_size).await?;
+        let total_blocks = file_source
+            .total_blocks()
+            .await
+            .map_err(|err| anyhow!(err))?;
+        let size_bytes = total_blocks
+            .checked_mul(block_size as u64)
+            .ok_or_else(|| anyhow!("file backing size overflows u64"))?;
+        ensure!(size_bytes > 0, "file backing size must be non-zero");
+        let source = BlockSourceHandle::new(HostSource::File(file_source), identity.clone());
         register_export(
             &mut sources,
             &mut entries,
@@ -406,13 +411,18 @@ async fn open_sources(args: &Args) -> Result<(BTreeMap<u32, BlockSourceHandle>, 
     }
 
     for path in &args.devices {
-        let size_bytes = file_size_bytes(path)?;
         let canonical = canonicalize_path(path)?;
         let identity = format!("device:{}", canonical.display());
-        let source = BlockSourceHandle::new(
-            HostSource::Device(DeviceBlockSource::open(path, block_size).await?),
-            identity.clone(),
-        );
+        let device_source = DeviceBlockSource::open(path, block_size).await?;
+        let total_blocks = device_source
+            .total_blocks()
+            .await
+            .map_err(|err| anyhow!(err))?;
+        let size_bytes = total_blocks
+            .checked_mul(block_size as u64)
+            .ok_or_else(|| anyhow!("device backing size overflows u64"))?;
+        ensure!(size_bytes > 0, "device backing size must be non-zero");
+        let source = BlockSourceHandle::new(HostSource::Device(device_source), identity.clone());
         register_export(
             &mut sources,
             &mut entries,
@@ -512,11 +522,6 @@ async fn open_sources(args: &Args) -> Result<(BTreeMap<u32, BlockSourceHandle>, 
     let payload = ConfigExportsV0::from_slice(&entries)
         .map_err(|err| anyhow!("build CONFIG_EXPORTS payload: {err:?}"))?;
     Ok((sources, payload))
-}
-
-fn file_size_bytes(path: &PathBuf) -> Result<u64> {
-    let meta = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
-    Ok(meta.len())
 }
 
 fn canonicalize_path(path: &PathBuf) -> Result<PathBuf> {

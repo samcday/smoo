@@ -6,7 +6,8 @@ use anyhow::{Context, Result};
 use smoo_host_core::{BlockSourceError, BlockSourceErrorKind};
 use std::{
     io,
-    os::unix::fs::FileExt,
+    os::unix::fs::{FileExt, FileTypeExt},
+    os::unix::io::AsRawFd,
     path::Path,
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -111,6 +112,59 @@ struct OpenedBlockFile {
     writable: bool,
 }
 
+#[cfg(target_os = "linux")]
+const IOC_NRBITS: u8 = 8;
+#[cfg(target_os = "linux")]
+const IOC_TYPEBITS: u8 = 8;
+#[cfg(target_os = "linux")]
+const IOC_SIZEBITS: u8 = 14;
+#[cfg(target_os = "linux")]
+const IOC_NRSHIFT: u8 = 0;
+#[cfg(target_os = "linux")]
+const IOC_TYPESHIFT: u8 = IOC_NRSHIFT + IOC_NRBITS;
+#[cfg(target_os = "linux")]
+const IOC_SIZESHIFT: u8 = IOC_TYPESHIFT + IOC_TYPEBITS;
+#[cfg(target_os = "linux")]
+const IOC_DIRSHIFT: u8 = IOC_SIZESHIFT + IOC_SIZEBITS;
+#[cfg(target_os = "linux")]
+const IOC_READ: u8 = 2;
+
+#[cfg(target_os = "linux")]
+const fn ior(ty: u8, nr: u8, size: u32) -> libc::c_ulong {
+    ((IOC_READ as libc::c_ulong) << IOC_DIRSHIFT)
+        | ((ty as libc::c_ulong) << IOC_TYPESHIFT)
+        | ((nr as libc::c_ulong) << IOC_NRSHIFT)
+        | ((size as libc::c_ulong) << IOC_SIZESHIFT)
+}
+
+#[cfg(target_os = "linux")]
+const BLKGETSIZE64: libc::c_ulong = ior(0x12, 114, core::mem::size_of::<libc::size_t>() as u32);
+
+#[cfg(target_os = "linux")]
+fn block_device_len(file: &std::fs::File) -> io::Result<u64> {
+    let mut size = 0u64;
+    let res = unsafe { libc::ioctl(file.as_raw_fd(), BLKGETSIZE64, &mut size) };
+    if res == 0 {
+        Ok(size)
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn file_len(file: &std::fs::File) -> io::Result<u64> {
+    let metadata = file.metadata()?;
+    let len = metadata.len();
+    if len > 0 || !metadata.file_type().is_block_device() {
+        return Ok(len);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return block_device_len(file);
+    }
+    #[allow(unreachable_code)]
+    Ok(len)
+}
+
 async fn open_block_file(path: &Path) -> Result<OpenedBlockFile> {
     let path_display = path.display().to_string();
     let rw_result = OpenOptions::new().read(true).write(true).open(path).await;
@@ -136,16 +190,19 @@ async fn open_block_file(path: &Path) -> Result<OpenedBlockFile> {
         }
     };
 
-    let len = file
-        .metadata()
-        .await
-        .with_context(|| format!("stat {}", path_display))?
-        .len();
+    let file = file.into_std().await;
+    let len = task::spawn_blocking({
+        let file = file
+            .try_clone()
+            .with_context(|| format!("clone {}", path_display))?;
+        let path_display = path_display.clone();
+        move || file_len(&file).with_context(|| format!("stat {}", path_display))
+    })
+    .await
+    .context("join file len task")??;
     if writable {
         debug!(path = %path_display, len = len, "opened block source read-write");
     }
-
-    let file = file.into_std().await;
 
     Ok(OpenedBlockFile {
         file,
