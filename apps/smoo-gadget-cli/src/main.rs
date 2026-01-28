@@ -47,8 +47,8 @@ use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::prelude::*;
 use usb_gadget::{
     function::custom::{
-        CtrlReceiver, CtrlReq, CtrlSender, Custom, Endpoint, EndpointDirection, Event, Interface,
-        TransferType,
+        CtrlReceiver, CtrlReq, CtrlSender, Custom, CustomBuilder, Endpoint, EndpointDirection,
+        Event, Interface, TransferType,
     },
     Class, Config, Gadget, Id, RegGadget, Strings,
 };
@@ -134,6 +134,9 @@ struct Args {
     /// Internal flag for the forked gadget child.
     #[arg(long, hide = true)]
     pid1_child: bool,
+    /// Use an existing FunctionFS directory and skip configfs management.
+    #[arg(long, value_name = "PATH")]
+    ffs_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -195,9 +198,8 @@ async fn main_impl() -> Result<()> {
         adopt_prepare(&mut ublk, &mut state_store).await?;
     }
 
-    usb_gadget::remove_all().context("remove existing USB gadgets")?;
     let (custom, endpoints, _gadget_guard, ffs_dir) =
-        setup_functionfs(&args).context("setup FunctionFS")?;
+        setup_configfs(&args).context("setup ConfigFS")?;
 
     let ident = Ident::new(0, 1);
     let dma_heap = args.experimental_dma_buf.then(|| args.dma_heap.into());
@@ -2754,15 +2756,23 @@ struct GadgetGuard {
     registration: RegGadget,
 }
 
-fn setup_functionfs(args: &Args) -> Result<(Custom, FunctionfsEndpoints, GadgetGuard, PathBuf)> {
-    let builder = Custom::builder().with_interface(
-        Interface::new(Class::vendor_specific(SMOO_SUBCLASS, SMOO_PROTOCOL), "smoo")
-            .with_endpoint(interrupt_in_ep())
-            .with_endpoint(interrupt_out_ep())
-            .with_endpoint(bulk_in_ep())
-            .with_endpoint(bulk_out_ep()),
-    );
-    let (mut custom, handle) = builder.build();
+fn setup_configfs(
+    args: &Args,
+) -> Result<(Custom, FunctionfsEndpoints, Option<GadgetGuard>, PathBuf)> {
+    if let Some(ffs_dir) = args.ffs_dir.as_ref() {
+        info!(
+            ffs_dir = %ffs_dir.display(),
+            "using existing FunctionFS directory; skipping configfs setup"
+        );
+        let custom = configfs_builder()
+            .existing(ffs_dir)
+            .context("initialize FunctionFS in existing directory")?;
+        let endpoints = open_data_endpoints(ffs_dir)?;
+        return Ok((custom, endpoints, None, ffs_dir.clone()));
+    }
+
+    usb_gadget::remove_all().context("remove existing USB gadgets")?;
+    let (mut custom, handle) = configfs_builder().build();
 
     let klass = Class::new(SMOO_CLASS, SMOO_SUBCLASS, SMOO_PROTOCOL);
     let id = Id::new(args.vendor_id, args.product_id);
@@ -2780,9 +2790,19 @@ fn setup_functionfs(args: &Args) -> Result<(Custom, FunctionfsEndpoints, GadgetG
     Ok((
         custom,
         endpoints,
-        GadgetGuard { registration: reg },
+        Some(GadgetGuard { registration: reg }),
         ffs_dir,
     ))
+}
+
+fn configfs_builder() -> CustomBuilder {
+    Custom::builder().with_interface(
+        Interface::new(Class::vendor_specific(SMOO_SUBCLASS, SMOO_PROTOCOL), "smoo")
+            .with_endpoint(interrupt_in_ep())
+            .with_endpoint(interrupt_out_ep())
+            .with_endpoint(bulk_in_ep())
+            .with_endpoint(bulk_out_ep()),
+    )
 }
 
 fn open_data_endpoints(ffs_dir: &Path) -> Result<FunctionfsEndpoints> {
