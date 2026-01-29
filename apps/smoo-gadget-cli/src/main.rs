@@ -11,7 +11,7 @@ use smoo_gadget_core::{
     SmooUblk, SmooUblkDevice, StateStore, UblkIoRequest, UblkOp, UblkQueueRuntime,
 };
 use smoo_proto::{Ident, OpCode, Request, Response, SMOO_STATUS_REQUEST, SMOO_STATUS_REQ_TYPE};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     convert::Infallible,
@@ -21,11 +21,11 @@ use std::{
     net::SocketAddr,
     os::fd::AsRawFd,
     os::fd::{FromRawFd, IntoRawFd, OwnedFd},
-    os::unix::fs::FileTypeExt,
+    os::unix::fs::{symlink, FileTypeExt},
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -306,94 +306,6 @@ fn init_logging(pid1: bool) {
     }
 }
 
-struct KmsgPump {
-    stop: Arc<AtomicBool>,
-    handle: std::thread::JoinHandle<()>,
-}
-
-impl KmsgPump {
-    fn stop(self) {
-        self.stop.store(true, Ordering::Relaxed);
-        let _ = self.handle.join();
-    }
-}
-
-fn spawn_kmsg_pump_if_enabled() -> Option<KmsgPump> {
-    if !cmdline_bool("smoo.acm") {
-        return None;
-    }
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop_task = stop.clone();
-    let handle = std::thread::spawn(move || {
-        if let Err(err) = kmsg_pump_loop(stop_task) {
-            warn!(error = ?err, "kmsg pump stopped");
-        }
-    });
-    Some(KmsgPump { stop, handle })
-}
-
-fn kmsg_pump_loop(stop: Arc<AtomicBool>) -> Result<()> {
-    let mut kmsg = File::options()
-        .read(true)
-        .open("/dev/kmsg")
-        .context("open /dev/kmsg")?;
-    set_nonblocking(&kmsg).context("set /dev/kmsg nonblocking")?;
-    let mut tty: Option<File> = None;
-    let mut buf = [0u8; 4096];
-    while !stop.load(Ordering::Relaxed) {
-        if tty.is_none() {
-            match File::options().write(true).open("/dev/ttyGS0") {
-                Ok(file) => tty = Some(file),
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                    std::thread::sleep(Duration::from_millis(200));
-                    continue;
-                }
-                Err(err) => {
-                    warn!(error = ?err, "kmsg pump: tty open failed; retrying");
-                    std::thread::sleep(Duration::from_millis(200));
-                    continue;
-                }
-            }
-        }
-        match kmsg.read(&mut buf) {
-            Ok(0) => {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Ok(len) => {
-                let mut reset_tty = false;
-                if let Some(ref mut tty) = tty {
-                    if let Err(err) = tty.write_all(&buf[..len]) {
-                        warn!(error = ?err, "kmsg pump write failed; reopening tty");
-                        reset_tty = true;
-                    }
-                }
-                if reset_tty {
-                    tty = None;
-                }
-            }
-            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(err) => return Err(err).context("read /dev/kmsg"),
-        }
-    }
-    Ok(())
-}
-
-fn set_nonblocking(file: &File) -> Result<()> {
-    let fd = file.as_raw_fd();
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 {
-        return Err(io::Error::last_os_error()).context("fcntl(F_GETFL)");
-    }
-    let res = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-    if res < 0 {
-        return Err(io::Error::last_os_error()).context("fcntl(F_SETFL)");
-    }
-    Ok(())
-}
-
 fn run_pid1(args: &Args) -> Result<()> {
     ensure!(unsafe { libc::getpid() } == 1, "pid1 mode requires PID 1");
 
@@ -479,7 +391,6 @@ fn run_pid1(args: &Args) -> Result<()> {
         .bind(Some(&udc))
         .context("bind gadget to UDC")?;
     info!("pid1: gadget bound to UDC");
-    let kmsg_pump = spawn_kmsg_pump_if_enabled();
     let ublk_dev = "/dev/ublkb0";
     let wait_secs = 30;
     debug!("pid1: waiting for block device {ublk_dev} (timeout {wait_secs}s)");
@@ -578,6 +489,7 @@ fn run_pid1(args: &Args) -> Result<()> {
     } else {
         warn!("pid1: /run/systemd/system missing before exec");
     }
+    ensure_serial_getty().ok();
 
     let systemd_path = if Path::new("/lib/systemd/systemd").exists() {
         "/lib/systemd/systemd"
@@ -585,9 +497,6 @@ fn run_pid1(args: &Args) -> Result<()> {
         "/sbin/init"
     };
     info!("pid1: exec {}", systemd_path);
-    if let Some(pump) = kmsg_pump {
-        pump.stop();
-    }
     let err = std::process::Command::new(systemd_path).exec();
     Err(anyhow!("exec {} failed: {err}", systemd_path))
 }
@@ -600,6 +509,33 @@ fn cmdline_value(key: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn ensure_serial_getty() -> Result<()> {
+    if !cmdline_bool("smoo.acm") {
+        return Ok(());
+    }
+    let unit_path = if Path::new("/lib/systemd/system/serial-getty@.service").exists() {
+        "/lib/systemd/system/serial-getty@.service"
+    } else if Path::new("/usr/lib/systemd/system/serial-getty@.service").exists() {
+        "/usr/lib/systemd/system/serial-getty@.service"
+    } else {
+        warn!("pid1: serial-getty@.service not found; skipping ttyGS0 getty");
+        return Ok(());
+    };
+    let wants_dir = Path::new("/run/systemd/system/getty.target.wants");
+    std::fs::create_dir_all(wants_dir).ok();
+    let link_path = wants_dir.join("serial-getty@ttyGS0.service");
+    if link_path.exists() {
+        info!("pid1: serial-getty@ttyGS0 already requested");
+        return Ok(());
+    }
+    if let Err(err) = symlink(unit_path, &link_path) {
+        warn!(error = ?err, "pid1: failed to enable serial-getty@ttyGS0");
+    } else {
+        info!("pid1: enabled serial-getty@ttyGS0");
+    }
+    Ok(())
 }
 
 fn cmdline_flag(key: &str) -> bool {
@@ -2968,9 +2904,11 @@ fn setup_pid1_configfs(args: &Args) -> Result<GadgetGuard> {
     let mut config = Config::new("config").with_function(handle);
 
     if cmdline_bool("smoo.acm") {
-        let (_serial, serial_handle) = Serial::new(SerialClass::Acm);
+        let mut serial_builder = Serial::builder(SerialClass::Acm);
+        serial_builder.console = Some(true);
+        let (_serial, serial_handle) = serial_builder.build();
         config = config.with_function(serial_handle);
-        info!("pid1: enabled USB ACM function");
+        info!("pid1: enabled USB ACM function with console");
     }
 
     let gadget = Gadget::new(klass, id, strings).with_config(config);
