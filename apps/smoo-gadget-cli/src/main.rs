@@ -851,7 +851,7 @@ fn wait_for_udc(timeout: Duration) -> Result<bool> {
             warned_missing = true;
         }
         ticks = ticks.wrapping_add(1);
-        if ticks % 5 == 0 {
+        if ticks.is_multiple_of(5) {
             debug!("pid1: UDC not ready yet");
         }
         if start.elapsed() >= timeout {
@@ -880,7 +880,7 @@ fn wait_for_block_device(
             return Err(anyhow!("gadget child exited: {status}"));
         }
         ticks = ticks.wrapping_add(1);
-        if ticks % 5 == 0 {
+        if ticks.is_multiple_of(5) {
             debug!("pid1: waiting for {path}");
         }
         if start.elapsed() >= timeout {

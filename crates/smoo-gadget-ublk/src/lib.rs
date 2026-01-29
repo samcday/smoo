@@ -136,6 +136,15 @@ struct QueueCompletion {
     result: i32,
 }
 
+struct RecoverDeviceParams {
+    block_size: usize,
+    block_count: usize,
+    queue_count: u16,
+    queue_depth: u16,
+    max_io_bytes: u32,
+    ioctl_encode: bool,
+}
+
 pub type UblkBuffer<'a> = BufferGuard<'a>;
 
 impl SmooUblk {
@@ -575,28 +584,30 @@ impl SmooUblk {
         );
         let block_count =
             usize::try_from(total_bytes / block_size as u64).context("block_count overflow")?;
-        self.recover_device_with_params(
-            dev_id,
+        let params = RecoverDeviceParams {
             block_size,
             block_count,
             queue_count,
             queue_depth,
-            info.max_io_buf_bytes,
+            max_io_bytes: info.max_io_buf_bytes,
             ioctl_encode,
-        )
-        .await
+        };
+        self.recover_device_with_params(dev_id, params).await
     }
 
     async fn recover_device_with_params(
         &mut self,
         dev_id: u32,
-        block_size: usize,
-        block_count: usize,
-        queue_count: u16,
-        queue_depth: u16,
-        max_io_bytes: u32,
-        ioctl_encode: bool,
+        params: RecoverDeviceParams,
     ) -> anyhow::Result<SmooUblkDevice> {
+        let RecoverDeviceParams {
+            block_size,
+            block_count,
+            queue_count,
+            queue_depth,
+            max_io_bytes,
+            ioctl_encode,
+        } = params;
         ensure!(block_size != 0, "block size must be non-zero");
         ensure!(
             block_size.is_power_of_two(),
@@ -1452,7 +1463,7 @@ fn encode_cmd_op(cmd: u32, ioctl_encode: bool) -> u32 {
 fn normalize_max_io_bytes(block_size: usize, max_io_bytes: usize) -> anyhow::Result<usize> {
     ensure!(max_io_bytes >= block_size, "max io bytes below block size");
     ensure!(
-        max_io_bytes % block_size == 0,
+        max_io_bytes.is_multiple_of(block_size),
         "max io bytes must be block aligned"
     );
     ensure!(
