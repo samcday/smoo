@@ -11,7 +11,7 @@ use smoo_gadget_core::{
     SmooUblk, SmooUblkDevice, StateStore, UblkIoRequest, UblkOp, UblkQueueRuntime,
 };
 use smoo_proto::{Ident, OpCode, Request, Response, SMOO_STATUS_REQUEST, SMOO_STATUS_REQ_TYPE};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     convert::Infallible,
@@ -25,7 +25,7 @@ use std::{
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -46,9 +46,12 @@ use tracing::{debug, error, info, trace, warn};
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::prelude::*;
 use usb_gadget::{
-    function::custom::{
-        CtrlReceiver, CtrlReq, CtrlSender, Custom, CustomBuilder, Endpoint, EndpointDirection,
-        Event, Interface, TransferType,
+    function::{
+        custom::{
+            CtrlReceiver, CtrlReq, CtrlSender, Custom, CustomBuilder, Endpoint, EndpointDirection,
+            Event, Interface, TransferType,
+        },
+        serial::{Serial, SerialClass},
     },
     Class, Config, Gadget, Id, RegGadget, Strings,
 };
@@ -172,7 +175,7 @@ async fn main_impl() -> Result<()> {
     if (args.pid1 || auto_pid1) && !args.pid1_child {
         args.pid1 = true;
         init_logging(true);
-        run_pid1().context("pid1 initramfs flow")?;
+        run_pid1(&args).context("pid1 initramfs flow")?;
         return Ok(());
     }
     init_logging(args.pid1_child);
@@ -303,10 +306,101 @@ fn init_logging(pid1: bool) {
     }
 }
 
-fn run_pid1() -> Result<()> {
+struct KmsgPump {
+    stop: Arc<AtomicBool>,
+    handle: std::thread::JoinHandle<()>,
+}
+
+impl KmsgPump {
+    fn stop(self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = self.handle.join();
+    }
+}
+
+fn spawn_kmsg_pump_if_enabled() -> Option<KmsgPump> {
+    if !cmdline_bool("smoo.acm") {
+        return None;
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_task = stop.clone();
+    let handle = std::thread::spawn(move || {
+        if let Err(err) = kmsg_pump_loop(stop_task) {
+            warn!(error = ?err, "kmsg pump stopped");
+        }
+    });
+    Some(KmsgPump { stop, handle })
+}
+
+fn kmsg_pump_loop(stop: Arc<AtomicBool>) -> Result<()> {
+    let mut kmsg = File::options()
+        .read(true)
+        .open("/dev/kmsg")
+        .context("open /dev/kmsg")?;
+    set_nonblocking(&kmsg).context("set /dev/kmsg nonblocking")?;
+    let mut tty: Option<File> = None;
+    let mut buf = [0u8; 4096];
+    while !stop.load(Ordering::Relaxed) {
+        if tty.is_none() {
+            match File::options().write(true).open("/dev/ttyGS0") {
+                Ok(file) => tty = Some(file),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    std::thread::sleep(Duration::from_millis(200));
+                    continue;
+                }
+                Err(err) => {
+                    warn!(error = ?err, "kmsg pump: tty open failed; retrying");
+                    std::thread::sleep(Duration::from_millis(200));
+                    continue;
+                }
+            }
+        }
+        match kmsg.read(&mut buf) {
+            Ok(0) => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Ok(len) => {
+                let mut reset_tty = false;
+                if let Some(ref mut tty) = tty {
+                    if let Err(err) = tty.write_all(&buf[..len]) {
+                        warn!(error = ?err, "kmsg pump write failed; reopening tty");
+                        reset_tty = true;
+                    }
+                }
+                if reset_tty {
+                    tty = None;
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(err) => return Err(err).context("read /dev/kmsg"),
+        }
+    }
+    Ok(())
+}
+
+fn set_nonblocking(file: &File) -> Result<()> {
+    let fd = file.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error()).context("fcntl(F_GETFL)");
+    }
+    let res = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    if res < 0 {
+        return Err(io::Error::last_os_error()).context("fcntl(F_SETFL)");
+    }
+    Ok(())
+}
+
+fn run_pid1(args: &Args) -> Result<()> {
     ensure!(unsafe { libc::getpid() } == 1, "pid1 mode requires PID 1");
 
     info!("pid1: starting smoo initramfs flow");
+    if args.ffs_dir.is_some() {
+        warn!("pid1: ignoring --ffs-dir; pid1 manages gadget configfs");
+    }
     std::fs::create_dir_all("/proc").ok();
     std::fs::create_dir_all("/sys").ok();
     std::fs::create_dir_all("/dev").ok();
@@ -360,9 +454,32 @@ fn run_pid1() -> Result<()> {
         return Err(anyhow!("UDC not ready after {udc_wait_secs}s"));
     }
 
+    let gadget_guard = setup_pid1_configfs(args).context("setup pid1 configfs")?;
+    let ffs_dir = gadget_guard.ffs_dir.clone();
+    info!(
+        ffs_dir = %ffs_dir.display(),
+        "pid1: configfs gadget configured"
+    );
+
     info!("pid1: spawning gadget child");
-    let mut child = spawn_gadget_child().context("spawn gadget child")?;
+    let mut child = spawn_gadget_child(Some(&ffs_dir)).context("spawn gadget child")?;
     info!("pid1: gadget child pid {}", child.id());
+    let ffs_wait_secs = 15;
+    info!("pid1: waiting for FunctionFS endpoints (timeout {ffs_wait_secs}s)");
+    if !wait_for_ffs_endpoints(&ffs_dir, Duration::from_secs(ffs_wait_secs), &mut child)? {
+        error!("pid1: fatal FunctionFS endpoints not ready after {ffs_wait_secs}s");
+        return Err(anyhow!(
+            "FunctionFS endpoints not ready after {ffs_wait_secs}s"
+        ));
+    }
+
+    let udc = usb_gadget::default_udc().context("locate UDC")?;
+    gadget_guard
+        .registration
+        .bind(Some(&udc))
+        .context("bind gadget to UDC")?;
+    info!("pid1: gadget bound to UDC");
+    let kmsg_pump = spawn_kmsg_pump_if_enabled();
     let ublk_dev = "/dev/ublkb0";
     let wait_secs = 30;
     debug!("pid1: waiting for block device {ublk_dev} (timeout {wait_secs}s)");
@@ -468,6 +585,9 @@ fn run_pid1() -> Result<()> {
         "/sbin/init"
     };
     info!("pid1: exec {}", systemd_path);
+    if let Some(pump) = kmsg_pump {
+        pump.stop();
+    }
     let err = std::process::Command::new(systemd_path).exec();
     Err(anyhow!("exec {} failed: {err}", systemd_path))
 }
@@ -480,6 +600,27 @@ fn cmdline_value(key: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn cmdline_flag(key: &str) -> bool {
+    let Ok(data) = std::fs::read_to_string("/proc/cmdline") else {
+        return false;
+    };
+    data.split_whitespace().any(|token| token == key)
+}
+
+fn cmdline_bool(key: &str) -> bool {
+    if let Some(raw) = cmdline_value(key) {
+        return match raw.as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => {
+                warn!("pid1: invalid {key} value '{raw}'");
+                false
+            }
+        };
+    }
+    cmdline_flag(key)
 }
 
 fn log_mountinfo(context: &str) {
@@ -890,16 +1031,71 @@ fn wait_for_block_device(
     }
 }
 
-fn spawn_gadget_child() -> Result<std::process::Child> {
+fn wait_for_ffs_endpoints(
+    ffs_dir: &Path,
+    timeout: Duration,
+    child: &mut std::process::Child,
+) -> Result<bool> {
+    let start = Instant::now();
+    let mut ticks: u32 = 0;
+    let ep1 = ffs_dir.join("ep1");
+    loop {
+        if ep1.exists() {
+            return Ok(true);
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            error!("pid1: gadget child exited while waiting for FunctionFS endpoints: {status}");
+            return Err(anyhow!("gadget child exited: {status}"));
+        }
+        ticks = ticks.wrapping_add(1);
+        if ticks.is_multiple_of(5) {
+            debug!(
+                ffs_dir = %ffs_dir.display(),
+                "pid1: waiting for FunctionFS endpoints"
+            );
+        }
+        if start.elapsed() >= timeout {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn spawn_gadget_child(ffs_dir: Option<&Path>) -> Result<std::process::Child> {
     let exe = std::env::current_exe().context("locate self")?;
-    let mut child_args: Vec<_> = std::env::args_os().collect();
-    child_args.retain(|arg| {
-        arg != OsStr::new("--pid1")
-            && arg != OsStr::new("--pid1-child")
-            && !arg.to_string_lossy().starts_with("--queue-depth")
-            && !arg.to_string_lossy().starts_with("--queue-count")
-            && !arg.to_string_lossy().starts_with("--max-io")
-    });
+    let mut child_args = Vec::new();
+    let mut args = std::env::args_os();
+    let Some(argv0) = args.next() else {
+        return Err(anyhow!("missing argv0"));
+    };
+    child_args.push(argv0);
+
+    let mut skip_next = false;
+    for arg in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if arg == OsStr::new("--pid1") || arg == OsStr::new("--pid1-child") {
+            continue;
+        }
+        let arg_str = arg.to_string_lossy();
+        if matches!(
+            arg_str.as_ref(),
+            "--queue-depth" | "--queue-count" | "--max-io" | "--ffs-dir"
+        ) {
+            skip_next = true;
+            continue;
+        }
+        if arg_str.starts_with("--queue-depth=")
+            || arg_str.starts_with("--queue-count=")
+            || arg_str.starts_with("--max-io=")
+            || arg_str.starts_with("--ffs-dir=")
+        {
+            continue;
+        }
+        child_args.push(arg);
+    }
     if let Some(queue_depth) =
         cmdline_u16("smoo.queue_depth").or_else(|| cmdline_u16("smoo.queue_size"))
     {
@@ -918,6 +1114,10 @@ fn spawn_gadget_child() -> Result<std::process::Child> {
         child_args.push(OsStr::new("--max-io").to_os_string());
         child_args.push(OsStr::new(&max_io_bytes.to_string()).to_os_string());
         info!("pid1: using max io bytes {max_io_bytes} from cmdline");
+    }
+    if let Some(ffs_dir) = ffs_dir {
+        child_args.push(OsStr::new("--ffs-dir").to_os_string());
+        child_args.push(ffs_dir.as_os_str().to_os_string());
     }
     child_args.push(OsStr::new("--pid1-child").to_os_string());
     let mut cmd = std::process::Command::new(exe);
@@ -2752,8 +2952,35 @@ async fn apply_config(
 }
 
 struct GadgetGuard {
-    #[allow(dead_code)]
     registration: RegGadget,
+    ffs_dir: PathBuf,
+}
+
+fn setup_pid1_configfs(args: &Args) -> Result<GadgetGuard> {
+    usb_gadget::remove_all().context("remove existing USB gadgets")?;
+    let mut builder = configfs_builder();
+    builder.ffs_no_init = true;
+    let (mut custom, handle) = builder.build();
+
+    let klass = Class::new(SMOO_CLASS, SMOO_SUBCLASS, SMOO_PROTOCOL);
+    let id = Id::new(args.vendor_id, args.product_id);
+    let strings = Strings::new("smoo", "smoo gadget", "0001");
+    let mut config = Config::new("config").with_function(handle);
+
+    if cmdline_bool("smoo.acm") {
+        let (_serial, serial_handle) = Serial::new(SerialClass::Acm);
+        config = config.with_function(serial_handle);
+        info!("pid1: enabled USB ACM function");
+    }
+
+    let gadget = Gadget::new(klass, id, strings).with_config(config);
+    let reg = gadget.register().context("register gadget")?;
+    let ffs_dir = custom.ffs_dir().context("resolve FunctionFS dir")?;
+
+    Ok(GadgetGuard {
+        registration: reg,
+        ffs_dir,
+    })
 }
 
 fn setup_configfs(
@@ -2790,7 +3017,10 @@ fn setup_configfs(
     Ok((
         custom,
         endpoints,
-        Some(GadgetGuard { registration: reg }),
+        Some(GadgetGuard {
+            registration: reg,
+            ffs_dir: ffs_dir.clone(),
+        }),
         ffs_dir,
     ))
 }
