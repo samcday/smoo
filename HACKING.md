@@ -43,10 +43,12 @@ Bulk transfers:
 5. host → gadget: send `Response` on interrupt OUT
 6. gadget completes ublk request
 
-**Invariant:** each ublk request maps to **exactly one Request + one Response**.
-Hosts/gadgets SHOULD keep queues full: multiple outstanding requests per export
-and across exports are expected (bounded by queue depth), using `(export_id,
-request_id)` as the uniqueness key.
+**Invariant:** each ublk request maps to one logical Request/Response pair.
+Gadgets MAY replay a Request after a link/session reset; the wire may see
+duplicates, but ublk completes exactly once. Hosts/gadgets SHOULD keep queues
+full: multiple outstanding requests per export and across exports are expected
+(bounded by queue depth), using `(export_id, request_id)` as the uniqueness key
+while in flight.
 
 ---
 
@@ -61,7 +63,9 @@ request_id)` as the uniqueness key.
 
 Error handling:
 
-* transport failures → ublk ops fail with `errno`
+* transport failures or link loss → keep ublk I/O outstanding; park in-flight
+  requests and replay when the link/session returns (no timeouts)
+* export removal or shutdown → complete outstanding I/O with `errno`
 * fatal errors → gadget tears down ublk cleanly
 
 ---
@@ -206,9 +210,21 @@ On restart:
 
 Host restart = new session:
 
-* Host re‑issues IDENT + CONFIG_EXPORTS.
-* Gadget MUST discard all existing exports/ublk devices and rebuild from payload.
-* State file rewritten.
+* Host re-issues IDENT + CONFIG_EXPORTS.
+* Gadget treats this as a session boundary for the data plane: forget on-wire
+  in-flight requests/responses and replay any outstanding ublk I/O when the
+  link returns.
+* Gadget only rebuilds ublk devices when the export list/geometry changes;
+  otherwise keep existing devices and update the state file to match the new
+  CONFIG_EXPORTS payload.
+
+### Transport Loss & Replay
+
+* Requests are never timed out by the gadget.
+* Link loss or data-plane I/O errors cause the gadget to drop transport state,
+  park in-flight ublk requests, and wait for the link to recover.
+* Once the host re-establishes the session (IDENT/CONFIG_EXPORTS) and the link
+  is Online, parked requests are replayed with the same `(export_id, request_id)`.
 
 ### FunctionFS Events
 

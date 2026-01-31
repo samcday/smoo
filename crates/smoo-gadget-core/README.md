@@ -5,8 +5,8 @@ Much of the "guts" of smoo's gadget daemon live here:
  * `IoPump` owns and drives the protocol interactions on the (USB) wire.
  * `ExportController` runs a reconciler that drives configured exports (from the host) into corresponding online ublk 
    targets.
- * `LinkController` is also a kinda-reconciler that handles the USB link (or the host side driving it) going away and/or  
-   coming online.
+ * `LinkController` is also a kinda-reconciler that handles the USB link (or the host side driving it) going away and/or
+   coming online, and ensures in-flight I/O is parked and replayed (no timeouts).
  * `StateStore` handles (un)marshaling the runtime state we need to survive across daemon restarts/crashes.
 
 Currently, we assume that we're dispatching i/o requests from ublk to USB via FunctionFS. In the future, if we were to

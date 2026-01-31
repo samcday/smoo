@@ -107,3 +107,13 @@ Read1, Read2] on interrupt OUT imply bulk OUT order [Read1, Read2].
   violate version/flags/length checks.
 - CONFIG_EXPORTS is an authoritative replace; partial/batch updates are not
   supported.
+
+## Recovery & replay
+
+- Requests are not timed out by the gadget.
+- If the link resets or a new host session is observed (IDENT/CONFIG_EXPORTS),
+  the gadget may drop transport state and replay outstanding ublk I/O. Duplicate
+  Requests with the same `(export_id, request_id)` can appear on the wire.
+- Responses from a prior session may be ignored by the gadget.
+- Hosts should treat duplicate Requests for the same key as retries and return
+  at most one Response per `(export_id, request_id)`.
