@@ -11,7 +11,7 @@ use smoo_gadget_core::{
     SmooUblk, SmooUblkDevice, StateStore, UblkIoRequest, UblkOp, UblkQueueRuntime,
 };
 use smoo_proto::{Ident, OpCode, Request, Response, SMOO_STATUS_REQUEST, SMOO_STATUS_REQ_TYPE};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     convert::Infallible,
@@ -137,6 +137,9 @@ struct Args {
     /// Internal flag for the forked gadget child.
     #[arg(long, hide = true)]
     pid1_child: bool,
+    /// Internal flag for the forked kmsg forwarding daemon.
+    #[arg(long, hide = true)]
+    pid1_kmsg_child: bool,
     /// Use an existing FunctionFS directory and skip configfs management.
     #[arg(long, value_name = "PATH")]
     ffs_dir: Option<PathBuf>,
@@ -181,6 +184,12 @@ async fn main_impl() -> Result<()> {
         raw_args
     };
     let mut args = Args::parse_from(cleaned_args.clone());
+    if args.pid1_kmsg_child {
+        init_logging(true);
+        warn!("pid1: kmsg forwarder starting");
+        run_kmsg_daemon().context("kmsg daemon")?;
+        return Ok(());
+    }
     if (args.pid1 || auto_pid1) && !args.pid1_child {
         args.pid1 = true;
         init_logging(true);
@@ -402,6 +411,11 @@ fn run_pid1(args: &Args, cleaned_args: &[std::ffi::OsString]) -> Result<()> {
         .bind(Some(&udc))
         .context("bind gadget to UDC")?;
     info!("pid1: gadget bound to UDC");
+    if cmdline_bool("smoo.acm") {
+        if let Err(err) = spawn_kmsg_daemon() {
+            warn!(error = ?err, "pid1: failed to spawn kmsg forwarder");
+        }
+    }
     let ublk_dev = "/dev/ublkb0";
     let wait_secs = 30;
     debug!("pid1: waiting for block device {ublk_dev} (timeout {wait_secs}s)");
@@ -1083,6 +1097,138 @@ fn spawn_gadget_child(
     cmd.args(child_args.iter().skip(1));
     cmd.stdin(std::process::Stdio::null());
     cmd.spawn().context("spawn gadget process")
+}
+
+fn spawn_kmsg_daemon() -> Result<std::process::Child> {
+    let exe = std::env::current_exe().context("locate self")?;
+    let mut cmd = std::process::Command::new(exe);
+    if let Some(log_level) = cmdline_value("smoo.log") {
+        cmd.env("RUST_LOG", log_level);
+        info!("pid1: set RUST_LOG from smoo.log for kmsg forwarder");
+    }
+    cmd.arg("--pid1-kmsg-child");
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
+    cmd.spawn().context("spawn kmsg forwarder")
+}
+
+fn run_kmsg_daemon() -> Result<()> {
+    const KMSG_PATH: &str = "/dev/kmsg";
+    const TTY_PATH: &str = "/dev/ttyGS0";
+    let mut buffer = vec![0u8; 8192];
+    let mut pending = Vec::new();
+    let mut last_tty_error = Instant::now() - Duration::from_secs(60);
+    loop {
+        let mut kmsg = match File::open(KMSG_PATH) {
+            Ok(file) => file,
+            Err(err) => {
+                warn!(error = ?err, "kmsg: open failed; retrying");
+                std::thread::sleep(Duration::from_secs(1));
+                continue;
+            }
+        };
+        let mut tty = match std::fs::OpenOptions::new().write(true).open(TTY_PATH) {
+            Ok(file) => file,
+            Err(err) => {
+                warn!(error = ?err, "kmsg: ttyGS0 unavailable; retrying");
+                std::thread::sleep(Duration::from_secs(1));
+                continue;
+            }
+        };
+
+        loop {
+            match kmsg.read(&mut buffer) {
+                Ok(0) => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Ok(n) => {
+                    pending.extend_from_slice(&buffer[..n]);
+                    while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
+                        let mut line = pending.drain(..=pos).collect::<Vec<u8>>();
+                        if line.ends_with(b"\n") {
+                            line.pop();
+                        }
+                        if line.ends_with(b"\r") {
+                            line.pop();
+                        }
+                        if line.is_empty() {
+                            continue;
+                        }
+                        let Some(sep) = line.iter().position(|&b| b == b';') else {
+                            continue;
+                        };
+                        let meta = &line[..sep];
+                        let msg = &line[sep + 1..];
+                        if msg.is_empty() {
+                            continue;
+                        }
+                        if let Some(prefix) = kmsg_prefix(meta) {
+                            if let Err(err) = tty.write_all(prefix.as_bytes()) {
+                                if handle_tty_write_error(&err, &mut last_tty_error) {
+                                    return Ok(());
+                                }
+                                pending.clear();
+                                break;
+                            }
+                        }
+                        if let Err(err) = tty.write_all(msg) {
+                            if handle_tty_write_error(&err, &mut last_tty_error) {
+                                return Ok(());
+                            }
+                            pending.clear();
+                            break;
+                        }
+                        if let Err(err) = tty.write_all(b"\r\n") {
+                            if handle_tty_write_error(&err, &mut last_tty_error) {
+                                return Ok(());
+                            }
+                            pending.clear();
+                            break;
+                        }
+                    }
+                    if pending.len() > 1024 * 1024 {
+                        pending.clear();
+                    }
+                }
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {
+                    continue;
+                }
+                Err(err) => {
+                    warn!(error = ?err, "kmsg: read failed; reopening");
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn kmsg_prefix(meta: &[u8]) -> Option<String> {
+    let meta_str = std::str::from_utf8(meta).ok()?;
+    let mut parts = meta_str.splitn(4, ',');
+    let _pri = parts.next()?;
+    let _seq = parts.next()?;
+    let ts = parts.next()?;
+    let ts = ts.parse::<u64>().ok()?;
+    let secs = ts / 1_000_000;
+    let usec = ts % 1_000_000;
+    Some(format!("[{:>5}.{:06}] ", secs, usec))
+}
+
+fn handle_tty_write_error(err: &io::Error, last_log: &mut Instant) -> bool {
+    if err.raw_os_error() == Some(libc::EIO) {
+        info!("kmsg: ttyGS0 closed (EIO); exiting");
+        return true;
+    }
+    let now = Instant::now();
+    if now.duration_since(*last_log) >= Duration::from_secs(2) {
+        warn!(error = ?err, "kmsg: write to ttyGS0 failed; reopening");
+        *last_log = now;
+    } else {
+        debug!(error = ?err, "kmsg: write to ttyGS0 failed; reopening");
+    }
+    false
 }
 
 fn filesystem_available(name: &str) -> Result<bool> {
@@ -3088,11 +3234,10 @@ fn setup_pid1_configfs(args: &Args) -> Result<GadgetGuard> {
     let mut config = Config::new("config").with_function(handle);
 
     if cmdline_bool("smoo.acm") {
-        let mut serial_builder = Serial::builder(SerialClass::Acm);
-        serial_builder.console = Some(true);
+        let serial_builder = Serial::builder(SerialClass::Acm);
         let (_serial, serial_handle) = serial_builder.build();
         config = config.with_function(serial_handle);
-        info!("pid1: enabled USB ACM function with console");
+        info!("pid1: enabled USB ACM function");
     }
 
     let gadget = Gadget::new(klass, id, strings).with_config(config);
