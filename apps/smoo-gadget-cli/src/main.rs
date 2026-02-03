@@ -169,13 +169,22 @@ async fn main() -> Result<()> {
 }
 
 async fn main_impl() -> Result<()> {
-    let mut args = Args::parse();
-    let argv0 = std::env::args().next().unwrap_or_default();
+    let raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let argv0 = raw_args
+        .first()
+        .cloned()
+        .unwrap_or_else(std::ffi::OsString::new);
     let auto_pid1 = argv0 == "/init";
+    let cleaned_args = if auto_pid1 {
+        vec![argv0.clone()]
+    } else {
+        raw_args
+    };
+    let mut args = Args::parse_from(cleaned_args.clone());
     if (args.pid1 || auto_pid1) && !args.pid1_child {
         args.pid1 = true;
         init_logging(true);
-        run_pid1(&args).context("pid1 initramfs flow")?;
+        run_pid1(&args, &cleaned_args).context("pid1 initramfs flow")?;
         return Ok(());
     }
     init_logging(args.pid1_child);
@@ -307,7 +316,7 @@ fn init_logging(pid1: bool) {
     }
 }
 
-fn run_pid1(args: &Args) -> Result<()> {
+fn run_pid1(args: &Args, cleaned_args: &[std::ffi::OsString]) -> Result<()> {
     ensure!(unsafe { libc::getpid() } == 1, "pid1 mode requires PID 1");
 
     info!("pid1: starting smoo initramfs flow");
@@ -375,7 +384,8 @@ fn run_pid1(args: &Args) -> Result<()> {
     );
 
     info!("pid1: spawning gadget child");
-    let mut child = spawn_gadget_child(Some(&ffs_dir)).context("spawn gadget child")?;
+    let mut child =
+        spawn_gadget_child(Some(&ffs_dir), cleaned_args).context("spawn gadget child")?;
     info!("pid1: gadget child pid {}", child.id());
     let ffs_wait_secs = 15;
     info!("pid1: waiting for FunctionFS endpoints (timeout {ffs_wait_secs}s)");
@@ -998,14 +1008,17 @@ fn wait_for_ffs_endpoints(
     }
 }
 
-fn spawn_gadget_child(ffs_dir: Option<&Path>) -> Result<std::process::Child> {
+fn spawn_gadget_child(
+    ffs_dir: Option<&Path>,
+    cleaned_args: &[std::ffi::OsString],
+) -> Result<std::process::Child> {
     let exe = std::env::current_exe().context("locate self")?;
     let mut child_args = Vec::new();
-    let mut args = std::env::args_os();
+    let mut args = cleaned_args.iter();
     let Some(argv0) = args.next() else {
         return Err(anyhow!("missing argv0"));
     };
-    child_args.push(argv0);
+    child_args.push(argv0.clone());
 
     let mut skip_next = false;
     for arg in args {
@@ -1031,7 +1044,7 @@ fn spawn_gadget_child(ffs_dir: Option<&Path>) -> Result<std::process::Child> {
         {
             continue;
         }
-        child_args.push(arg);
+        child_args.push(arg.clone());
     }
     if let Some(queue_depth) =
         cmdline_u16("smoo.queue_depth").or_else(|| cmdline_u16("smoo.queue_size"))
