@@ -1859,7 +1859,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
-name = "smoo-gadget-cli"
+name = "smoo-gadget-app"
 version = "0.0.1"
 dependencies = [
  "anyhow",
@@ -1876,6 +1876,15 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "usb-gadget",
+]
+
+[[package]]
+name = "smoo-gadget-cli"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "smoo-gadget-app",
+ "tokio",
 ]
 
 [[package]]
@@ -1915,6 +1924,28 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "smoo-host-app"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "clap",
+ "hyper 0.14.32",
+ "metrics-exporter-prometheus",
+ "smoo-host-blocksource-cached",
+ "smoo-host-blocksource-http",
+ "smoo-host-blocksources",
+ "smoo-host-core",
+ "smoo-host-transport-rusb",
+ "smoo-proto",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
@@ -1975,21 +2006,8 @@ name = "smoo-host-cli"
 version = "0.0.1"
 dependencies = [
  "anyhow",
- "async-trait",
- "clap",
- "hyper 0.14.32",
- "metrics-exporter-prometheus",
- "smoo-host-blocksource-cached",
- "smoo-host-blocksource-http",
- "smoo-host-blocksources",
- "smoo-host-core",
- "smoo-host-transport-rusb",
- "smoo-proto",
+ "smoo-host-app",
  "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "url",
 ]
 
 [[package]]
