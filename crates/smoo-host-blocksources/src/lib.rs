@@ -181,12 +181,12 @@ async fn open_block_file(path: &Path) -> Result<OpenedBlockFile> {
                 .read(true)
                 .open(path)
                 .await
-                .with_context(|| format!("open {} read-only", path_display))?;
+                .with_context(|| format!("open {path_display} read-only"))?;
             debug!(path = %path_display, "opened block source read-only");
             (file, false)
         }
         Err(err) => {
-            return Err(err).context(format!("open {}", path_display));
+            return Err(err).context(format!("open {path_display}"));
         }
     };
 
@@ -194,9 +194,9 @@ async fn open_block_file(path: &Path) -> Result<OpenedBlockFile> {
     let len = task::spawn_blocking({
         let file = file
             .try_clone()
-            .with_context(|| format!("clone {}", path_display))?;
+            .with_context(|| format!("clone {path_display}"))?;
         let path_display = path_display.clone();
-        move || file_len(&file).with_context(|| format!("stat {}", path_display))
+        move || file_len(&file).with_context(|| format!("stat {path_display}"))
     })
     .await
     .context("join file len task")??;

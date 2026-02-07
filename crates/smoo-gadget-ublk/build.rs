@@ -84,6 +84,6 @@ const int Fix753_UBLK_IO_RES_ABORT = UBLK_IO_RES_ABORT;
         .unwrap();
 
     if let Err(error) = add_serialize(&outdir) {
-        eprintln!("Error: {}", error)
+        eprintln!("Error: {error}")
     }
 }

@@ -451,12 +451,12 @@ impl SmooUblk {
         let ioctl_encode = (info.flags & (sys::UBLK_F_CMD_IOCTL_ENCODE as u64)) != 0;
         let max_io_bytes =
             usize::try_from(info.max_io_buf_bytes).context("max_io_buf_bytes overflow")?;
-        let cdev_path = format!("/dev/ublkc{}", dev_id);
+        let cdev_path = format!("/dev/ublkc{dev_id}");
         let base_cdev = File::options()
             .read(true)
             .write(true)
             .open(&cdev_path)
-            .with_context(|| format!("open {}", cdev_path))?;
+            .with_context(|| format!("open {cdev_path}"))?;
         let mut request_rxs = Vec::with_capacity(queue_count as usize);
         let mut completion_txs = Vec::with_capacity(queue_count as usize);
         let mut workers = Vec::with_capacity(queue_count as usize);
@@ -470,7 +470,7 @@ impl SmooUblk {
             let (ready_tx, ready_rx) = mpsc::channel();
             let cdev = base_cdev
                 .try_clone()
-                .with_context(|| format!("clone {}", cdev_path))?;
+                .with_context(|| format!("clone {cdev_path}"))?;
             let start = queue_id as usize * queue_depth as usize;
             let end = start + queue_depth as usize;
             let buf_ptrs = queue_buf_ptrs[start..end].to_vec();
@@ -535,7 +535,7 @@ impl SmooUblk {
         let ctrl_sender = self.sender.clone();
         let start_cmd = cmd;
         let start_thread = std::thread::Builder::new()
-            .name(format!("smoo-gadget-ublk-start-{}", dev_id))
+            .name(format!("smoo-gadget-ublk-start-{dev_id}"))
             .spawn(move || {
                 info!(dev_id = dev_id, "start_dev thread begin");
                 let res = submit_ctrl_command_blocking(
@@ -635,12 +635,12 @@ impl SmooUblk {
             .context("allocate ublk buffers")?;
         let queue_buf_ptrs = buffers.raw_ptrs();
         self.start_user_recovery(dev_id).await?;
-        let cdev_path = format!("/dev/ublkc{}", dev_id);
+        let cdev_path = format!("/dev/ublkc{dev_id}");
         let base_cdev = File::options()
             .read(true)
             .write(true)
             .open(&cdev_path)
-            .with_context(|| format!("open {}", cdev_path))?;
+            .with_context(|| format!("open {cdev_path}"))?;
         let mut request_rxs = Vec::with_capacity(queue_count as usize);
         let mut completion_txs = Vec::with_capacity(queue_count as usize);
         let mut workers = Vec::with_capacity(queue_count as usize);
@@ -654,7 +654,7 @@ impl SmooUblk {
             let (ready_tx, ready_rx) = mpsc::channel();
             let cdev = base_cdev
                 .try_clone()
-                .with_context(|| format!("clone {}", cdev_path))?;
+                .with_context(|| format!("clone {cdev_path}"))?;
             let start = queue_id as usize * queue_depth as usize;
             let end = start + queue_depth as usize;
             let buf_ptrs = queue_buf_ptrs[start..end].to_vec();
@@ -1006,7 +1006,7 @@ impl UblkCtrlHandle {
                     .join();
                 let result = match join_result {
                     Ok(res) => res,
-                    Err(err) => Err(anyhow!("start_dev thread panicked: {:?}", err)),
+                    Err(err) => Err(anyhow!("start_dev thread panicked: {err:?}")),
                 };
                 self.start_result = Some(result);
                 self.start_deadline = None;
@@ -1025,8 +1025,7 @@ impl UblkCtrlHandle {
     pub fn mark_start_timed_out(&mut self) {
         if self.start_result.is_none() {
             self.start_result = Some(Err(anyhow!(
-                "UBLK_CMD_START_DEV timed out after {:?}",
-                START_DEV_TIMEOUT
+                "UBLK_CMD_START_DEV timed out after {START_DEV_TIMEOUT:?}"
             )));
         }
         self.start_deadline = None;

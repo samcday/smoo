@@ -453,7 +453,7 @@ async fn open_sources(args: &Args) -> Result<(BTreeMap<u32, BlockSourceHandle>, 
             size_bytes % block_size as u64 == 0,
             "HTTP backing size must align to block size"
         );
-        let source_id = format!("http:{}", url);
+        let source_id = format!("http:{url}");
         let shared = BlockSourceHandle::new(HostSource::Http(source), source_id);
         register_export(
             &mut sources,
@@ -488,7 +488,7 @@ async fn open_sources(args: &Args) -> Result<(BTreeMap<u32, BlockSourceHandle>, 
         let cached = CachedBlockSource::new(source, cache)
             .await
             .context("init cached HTTP block source")?;
-        let source_id = format!("cached-http:{}", url);
+        let source_id = format!("cached-http:{url}");
         let shared = BlockSourceHandle::new(HostSource::CachedHttp(cached), source_id);
         register_export(
             &mut sources,
