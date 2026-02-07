@@ -2,7 +2,7 @@
 name = "smoo-gadget-ublk"
 version = { workspace = true }
 edition = "2024"
-rust-version = "1.87"
+rust-version = { workspace = true }
 license = "GPL-3.0-only"
 
 [features]

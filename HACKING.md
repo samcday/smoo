@@ -240,7 +240,7 @@ Failure to service ep0 promptly leads to EP0 STALL + possible gadget reset.
 
 ## 8. Development & Testing
 
-* Toolchain: Rust stable (MSRV 1.87)
+* Toolchain: Rust stable (MSRV 1.88)
 * Logging: `tracing`
 * Tests: `cargo test --all`
 

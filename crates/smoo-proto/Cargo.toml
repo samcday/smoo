@@ -2,7 +2,7 @@
 name = "smoo-proto"
 version = { workspace = true }
 edition = "2024"
-rust-version = "1.87"
+rust-version = { workspace = true }
 license = "MIT"
 
 [dependencies]
