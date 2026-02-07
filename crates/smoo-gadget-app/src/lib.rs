@@ -38,7 +38,6 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
-use tracing_subscriber::prelude::*;
 use usb_gadget::{
     function::custom::{
         CtrlReceiver, CtrlReq, CtrlSender, Custom, CustomBuilder, Endpoint, EndpointDirection,
@@ -149,7 +148,6 @@ pub async fn run_with_args(args: Args) -> Result<()> {
 }
 
 async fn run_impl(args: Args) -> Result<()> {
-    init_logging();
     let metrics_shutdown = CancellationToken::new();
     let metrics_task = spawn_metrics_listener(args.metrics_port, metrics_shutdown.clone())?;
     let mut ublk = SmooUblk::new().context("init ublk")?;
@@ -255,15 +253,6 @@ async fn run_impl(args: Args) -> Result<()> {
     control_task.abort();
     let _ = control_task.await;
     result
-}
-
-fn init_logging() {
-    let filter =
-        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(tracing_subscriber::fmt::layer())
-        .init();
 }
 
 fn spawn_metrics_listener(
