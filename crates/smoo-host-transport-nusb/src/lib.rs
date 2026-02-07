@@ -89,10 +89,10 @@ impl NusbTransport {
             .endpoint::<Bulk, Out>(config.bulk_out)
             .map_err(|err| map_nusb_error("open bulk_out endpoint", err))?;
 
-        let interrupt_in_mps = interrupt_in_ep.max_packet_size() as usize;
-        let _interrupt_out_mps = interrupt_out_ep.max_packet_size() as usize;
-        let bulk_in_mps = bulk_in_ep.max_packet_size() as usize;
-        let _bulk_out_mps = bulk_out_ep.max_packet_size() as usize;
+        let interrupt_in_mps = interrupt_in_ep.max_packet_size();
+        let _interrupt_out_mps = interrupt_out_ep.max_packet_size();
+        let bulk_in_mps = bulk_in_ep.max_packet_size();
+        let _bulk_out_mps = bulk_out_ep.max_packet_size();
         let interrupt_transfer_size = interrupt_in_mps.max(1024);
         let bulk_transfer_size = bulk_in_mps.max(64 * 1024);
 
