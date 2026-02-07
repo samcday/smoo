@@ -143,7 +143,7 @@ const BLKGETSIZE64: libc::c_ulong = ior(0x12, 114, core::mem::size_of::<libc::si
 #[cfg(target_os = "linux")]
 fn block_device_len(file: &std::fs::File) -> io::Result<u64> {
     let mut size = 0u64;
-    let res = unsafe { libc::ioctl(file.as_raw_fd(), BLKGETSIZE64, &mut size) };
+    let res = unsafe { libc::ioctl(file.as_raw_fd(), BLKGETSIZE64 as libc::Ioctl, &mut size) };
     if res == 0 {
         Ok(size)
     } else {
