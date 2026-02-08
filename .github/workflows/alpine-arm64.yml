@@ -2,8 +2,10 @@ name: Alpine (arm64)
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
+  release:
+    types: [published]
   workflow_dispatch:
 
 concurrency:
@@ -11,7 +13,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   alpine-arm64:
@@ -40,6 +42,13 @@ jobs:
           sed -i -e "s/^_gitrev=main$/_gitrev=$GITHUB_SHA/" APKBUILD
         shell: alpine.sh --root {0}
 
+      - name: release prep
+        if: github.event_name == 'release'
+        run: |
+          sed -i -e 's/^\(pkgver=.*\)_git$/\1/' APKBUILD
+          sed -i -e '/^_gitrev=/d' -e 's/_gitrev/pkgver/g' APKBUILD
+        shell: alpine.sh --root {0}
+
       - name: build packages
         run: |
           export PACKAGER_PRIVKEY=$HOME/.abuild/key.rsa
@@ -61,3 +70,19 @@ jobs:
         with:
           name: packages-aarch64
           path: ${{ steps.alpine.outputs.root-path }}/packages/smoo/aarch64/*.apk
+
+      - name: upload .apk artifacts to release
+        uses: softprops/action-gh-release@v2
+        if: github.event_name == 'release'
+        with:
+          name: ${{ github.event.release.name }}
+          files: |
+            ${{ steps.alpine.outputs.root-path }}/packages/smoo/aarch64/*.apk
+
+      - name: upload APKBUILD to release
+        uses: softprops/action-gh-release@v2
+        if: github.event_name == 'release'
+        with:
+          name: ${{ github.event.release.name }}
+          files: |
+            ${{ steps.alpine.outputs.root-path }}/packages/APKBUILD

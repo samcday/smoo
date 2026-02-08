@@ -1,9 +1,22 @@
-name: Build smoo gadget binaries
+name: build
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -15,22 +28,23 @@ jobs:
         include:
           - name: x86_64
             runner: ubuntu-24.04
-          - name: arm64
+            target: x86_64-unknown-linux-musl
+          - name: aarch64
             runner: ubuntu-24.04-arm
-
-    env:
-      CARGO_TERM_COLOR: always
+            target: aarch64-unknown-linux-musl
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.target }}
 
       - name: Install deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y libssl-dev
+          sudo apt-get install -y libssl-dev musl-tools
 
       - name: Check
         run: cargo check --workspace --locked
@@ -38,20 +52,36 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --locked
 
-      - name: Build
+      - name: Build (static musl)
         run: |
           cargo build \
             --bins \
-            --release
+            --release \
+            --target ${{ matrix.target }}
 
-      - name: Upload artifact
+      - name: Upload smoo-gadget artifact
         uses: actions/upload-artifact@v4
         with:
-          name: smoo-gadget-cli-${{ matrix.name }}
-          path: target/release/smoo-gadget-cli
+          name: smoo-gadget-${{ matrix.name }}
+          path: target/${{ matrix.target }}/release/smoo-gadget-cli
 
-      - name: Upload artifact
+      - name: Upload smoo-host artifact
         uses: actions/upload-artifact@v4
         with:
-          name: smoo-host-cli-${{ matrix.name }}
-          path: target/release/smoo-host-cli
+          name: smoo-host-${{ matrix.name }}
+          path: target/${{ matrix.target }}/release/smoo-host-cli
+
+      - name: Prepare release binaries
+        if: github.event_name == 'release'
+        run: |
+          cp target/${{ matrix.target }}/release/smoo-gadget-cli smoo-gadget-${{ matrix.name }}
+          cp target/${{ matrix.target }}/release/smoo-host-cli smoo-host-${{ matrix.name }}
+
+      - name: Upload binaries to release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.event.release.name }}
+          files: |
+            smoo-gadget-${{ matrix.name }}
+            smoo-host-${{ matrix.name }}
