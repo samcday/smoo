@@ -16,6 +16,8 @@ Source:         %{url}/archive/%{version}/%{name}-%{version}.tar.gz
 BuildRequires:  cargo-rpm-macros >= 24
 BuildRequires:  clang-devel
 BuildRequires:  pkgconfig(openssl)
+BuildRequires:  checkpolicy
+BuildRequires:  selinux-policy-devel
 
 %description
 smoo provides both sides of an inverted USB mass-storage protocol: a gadget
@@ -25,6 +27,8 @@ implementation that drives it over USB.
 %package gadget
 Summary:        smoo gadget CLI
 Requires:       %{name}%{?_isa}
+Requires(post): policycoreutils
+Requires(postun): policycoreutils
 
 %description gadget
 Device-side CLI that exposes a smoo gadget backed by FunctionFS + ublk.
@@ -49,6 +53,9 @@ Host-side CLI that speaks the smoo USB protocol over rusb.
 
 %build
 %cargo_build
+cp -a packaging/selinux/smoo_gadget.te .
+cp -a packaging/selinux/smoo_gadget.fc .
+make -f %{_datadir}/selinux/devel/Makefile smoo_gadget.pp
 %cargo_vendor_manifest
 %{cargo_license_summary}
 %{cargo_license} > LICENSE.dependencies
@@ -58,6 +65,8 @@ install -Dpm0755 target/rpm/smoo-gadget-cli \
     %{buildroot}%{_bindir}/smoo-gadget
 install -Dpm0755 target/rpm/smoo-host-cli \
     %{buildroot}%{_bindir}/smoo-host
+install -Dpm0644 smoo_gadget.pp \
+    %{buildroot}%{_datadir}/selinux/packages/smoo_gadget.pp
 
 %if %{with check}
 %check
@@ -73,6 +82,17 @@ install -Dpm0755 target/rpm/smoo-host-cli \
 
 %files gadget
 %{_bindir}/smoo-gadget
+%{_datadir}/selinux/packages/smoo_gadget.pp
+
+%post gadget
+if /usr/sbin/selinuxenabled; then
+    /usr/sbin/semodule -n -i %{_datadir}/selinux/packages/smoo_gadget.pp || :
+fi
+
+%postun gadget
+if [ $1 -eq 0 ] && /usr/sbin/selinuxenabled; then
+    /usr/sbin/semodule -n -r smoo_gadget || :
+fi
 
 %files host
 %{_bindir}/smoo-host

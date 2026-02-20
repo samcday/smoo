@@ -1,0 +1,34 @@
+policy_module(smoo_gadget, 1.0)
+
+require {
+    type configfs_t;
+    type functionfs_t;
+    type ublk_control_t;
+    type ublk_device_t;
+
+    class capability { dac_override net_bind_service setgid setuid sys_admin sys_resource };
+    class chr_file { getattr ioctl lock map open read write };
+    class dir { add_name create getattr open read remove_name search write };
+    class file { create getattr map open read rename setattr unlink write };
+    class filesystem getattr;
+    class sock_file write;
+}
+
+type smoo_gadget_t;
+type smoo_gadget_exec_t;
+
+init_daemon_domain(smoo_gadget_t, smoo_gadget_exec_t)
+
+allow smoo_gadget_t self:capability { dac_override net_bind_service setgid setuid sys_admin sys_resource };
+allow smoo_gadget_t self:filesystem getattr;
+allow smoo_gadget_t self:sock_file write;
+
+allow smoo_gadget_t configfs_t:dir { add_name create getattr open read remove_name search write };
+allow smoo_gadget_t configfs_t:file { create getattr map open read rename setattr unlink write };
+
+allow smoo_gadget_t functionfs_t:dir { add_name create getattr open read remove_name search write };
+allow smoo_gadget_t functionfs_t:file { create getattr map open read rename setattr unlink write };
+allow smoo_gadget_t functionfs_t:chr_file { getattr ioctl lock map open read write };
+
+allow smoo_gadget_t ublk_control_t:chr_file { getattr ioctl lock map open read write };
+allow smoo_gadget_t ublk_device_t:chr_file { getattr ioctl lock map open read write };
