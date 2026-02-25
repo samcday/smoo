@@ -13,10 +13,17 @@ pub enum LinkState {
 /// Commands emitted by the link controller for the runtime to act upon.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LinkCommand {
-    /// Attempt to (re)open FunctionFS endpoints and re-establish the data plane.
-    Reopen,
-    /// Drop any open endpoints and consider the link unavailable.
-    DropLink,
+    /// Link state became invalid and the runtime should terminate.
+    Fatal,
+}
+
+/// Most recent reason the link transitioned Offline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkOfflineReason {
+    Ep0Disable,
+    Ep0Unbind,
+    IoError,
+    LivenessTimeout,
 }
 
 /// Drives link state transitions based on ep0 lifecycle events, heartbeat pings,
@@ -28,9 +35,12 @@ pub enum LinkCommand {
 pub struct LinkController {
     state: LinkState,
     last_status: Option<Instant>,
+    last_offline_reason: Option<LinkOfflineReason>,
     liveness_timeout: Duration,
+    reopen_backoff: Duration,
+    reopen_backoff_max: Duration,
+    reopen_not_before: Option<Instant>,
     pending_drop: bool,
-    pending_reopen: bool,
 }
 
 impl LinkController {
@@ -39,9 +49,12 @@ impl LinkController {
         Self {
             state: LinkState::Offline,
             last_status: None,
+            last_offline_reason: None,
             liveness_timeout,
+            reopen_backoff: Duration::from_secs(1),
+            reopen_backoff_max: Duration::from_secs(30),
+            reopen_not_before: None,
             pending_drop: false,
-            pending_reopen: false,
         }
     }
 
@@ -50,21 +63,29 @@ impl LinkController {
         self.state
     }
 
+    /// Most recent reason the link moved Offline.
+    pub fn last_offline_reason(&self) -> Option<LinkOfflineReason> {
+        self.last_offline_reason
+    }
+
     /// Notify the controller of an ep0 lifecycle event.
     pub fn on_ep0_event(&mut self, event: Event) {
         match event {
             Event::Bind | Event::Enable | Event::Resume => {
+                self.reset_reopen_backoff();
                 self.enter_ready();
             }
-            Event::Disable | Event::Unbind => {
-                self.enter_offline();
+            Event::Disable => {
+                self.enter_offline(LinkOfflineReason::Ep0Disable);
+            }
+            Event::Unbind => {
+                self.enter_offline(LinkOfflineReason::Ep0Unbind);
             }
             Event::Suspend => {
                 // The bus may briefly suspend while the host reconfigures; keep the data plane
                 // around and let liveness/status pings drive us back to Online.
                 self.state = LinkState::Ready;
                 self.pending_drop = false;
-                self.pending_reopen = false;
             }
             Event::SetupDeviceToHost(_) | Event::SetupHostToDevice(_) => { /* ignored */ }
             Event::Unknown(_) => {}
@@ -74,26 +95,41 @@ impl LinkController {
 
     /// Notify the controller that a SMOO_STATUS (or equivalent heartbeat) was seen.
     pub fn on_status_ping(&mut self) {
-        self.last_status = Some(Instant::now());
+        let now = Instant::now();
+        self.last_status = Some(now);
         if matches!(self.state, LinkState::Offline) {
+            if let Some(not_before) = self.reopen_not_before {
+                if now < not_before {
+                    return;
+                }
+            }
             // Host is talking to ep0; ensure data plane is reopened.
             self.enter_ready();
         }
         if matches!(self.state, LinkState::Ready | LinkState::Online) {
             self.state = LinkState::Online;
+            self.reset_reopen_backoff();
         }
     }
 
     /// Notify the controller that an endpoint I/O error occurred.
     pub fn on_io_error(&mut self, _err: &io::Error) {
-        self.enter_offline();
+        if matches!(self.state, LinkState::Offline) {
+            return;
+        }
+        self.reopen_not_before = Some(Instant::now() + self.reopen_backoff);
+        self.reopen_backoff = self
+            .reopen_backoff
+            .saturating_mul(2)
+            .min(self.reopen_backoff_max);
+        self.enter_offline(LinkOfflineReason::IoError);
     }
 
     /// Advance the controller based on the current time to detect liveness timeouts.
     pub fn tick(&mut self, now: Instant) {
         if let Some(last) = self.last_status {
             if now.saturating_duration_since(last) > self.liveness_timeout {
-                self.enter_offline();
+                self.enter_offline(LinkOfflineReason::LivenessTimeout);
             }
         }
     }
@@ -102,26 +138,28 @@ impl LinkController {
     pub fn take_command(&mut self) -> Option<LinkCommand> {
         if self.pending_drop {
             self.pending_drop = false;
-            return Some(LinkCommand::DropLink);
-        }
-        if self.pending_reopen {
-            self.pending_reopen = false;
-            return Some(LinkCommand::Reopen);
+            return Some(LinkCommand::Fatal);
         }
         None
     }
 
     fn enter_ready(&mut self) {
         self.state = LinkState::Ready;
-        self.pending_reopen = true;
+        self.reopen_not_before = None;
+        self.last_offline_reason = None;
         self.pending_drop = false;
     }
 
-    fn enter_offline(&mut self) {
+    fn enter_offline(&mut self, reason: LinkOfflineReason) {
         self.state = LinkState::Offline;
         self.last_status = None;
+        self.last_offline_reason = Some(reason);
         self.pending_drop = true;
-        self.pending_reopen = false;
+    }
+
+    fn reset_reopen_backoff(&mut self) {
+        self.reopen_backoff = Duration::from_secs(1);
+        self.reopen_not_before = None;
     }
 }
 
@@ -136,7 +174,7 @@ mod tests {
 
         ctrl.on_ep0_event(Event::Enable);
         assert_eq!(ctrl.state(), LinkState::Ready);
-        assert_eq!(ctrl.take_command(), Some(LinkCommand::Reopen));
+        assert_eq!(ctrl.take_command(), None);
 
         ctrl.on_status_ping();
         assert_eq!(ctrl.state(), LinkState::Online);
@@ -144,7 +182,8 @@ mod tests {
         let err = io::Error::from_raw_os_error(libc::EPIPE);
         ctrl.on_io_error(&err);
         assert_eq!(ctrl.state(), LinkState::Offline);
-        assert_eq!(ctrl.take_command(), Some(LinkCommand::DropLink));
+        assert_eq!(ctrl.last_offline_reason(), Some(LinkOfflineReason::IoError));
+        assert_eq!(ctrl.take_command(), Some(LinkCommand::Fatal));
     }
 
     #[test]
@@ -156,6 +195,10 @@ mod tests {
         let now = Instant::now() + Duration::from_millis(250);
         ctrl.tick(now);
         assert_eq!(ctrl.state(), LinkState::Offline);
-        assert_eq!(ctrl.take_command(), Some(LinkCommand::DropLink));
+        assert_eq!(
+            ctrl.last_offline_reason(),
+            Some(LinkOfflineReason::LivenessTimeout)
+        );
+        assert_eq!(ctrl.take_command(), Some(LinkCommand::Fatal));
     }
 }

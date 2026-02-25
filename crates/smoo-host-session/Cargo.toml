@@ -1,5 +1,5 @@
 [package]
-name = "smoo-host-blocksource-cached"
+name = "smoo-host-session"
 version = { workspace = true }
 edition = "2024"
 rust-version = { workspace = true }
@@ -7,9 +7,8 @@ license = "GPL-3.0-only"
 
 [features]
 default = []
-std = []
 
 [dependencies]
-async-trait = "0.1.89"
-futures-channel = { version = "0.3.31", default-features = false, features = ["alloc"] }
+futures-util = { workspace = true, features = ["alloc", "async-await", "async-await-macro"] }
 smoo-host-core = { path = "../smoo-host-core", default-features = false }
+smoo-proto = { path = "../smoo-proto" }

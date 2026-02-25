@@ -92,6 +92,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-lock"
+version = "3.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "290f7f2596bd5b78a9fec8088ccd89180d7f9f55b94b0576823bbbdc72ee8311"
+dependencies = [
+ "event-listener",
+ "event-listener-strategy",
+ "pin-project-lite",
+]
+
+[[package]]
 name = "async-trait"
 version = "0.1.89"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -599,10 +610,50 @@ dependencies = [
 ]
 
 [[package]]
+name = "gibblox-blockreader-messageport"
+version = "0.0.1-rc.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "84f3f9c046f6ab1157be99f2273a4466158c6ebf8541f78ca242a62e42cb205b"
+dependencies = [
+ "async-trait",
+ "futures-channel",
+ "gibblox-core",
+ "js-sys",
+ "tracing",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
+name = "gibblox-core"
+version = "0.0.1-rc.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1a021aba2d7614df4b995d8e9d8a11246ad651ffea8c61da672d654c1a60246"
+dependencies = [
+ "async-lock",
+ "async-trait",
+ "futures-channel",
+ "tracing",
+]
+
+[[package]]
 name = "glob"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
+
+[[package]]
+name = "gloo-timers"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbb143cf96099802033e0d4f4963b19fd2e0b728bcf076cd9cf7f6634f092994"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "js-sys",
+ "wasm-bindgen",
+]
 
 [[package]]
 name = "h2"
@@ -1926,33 +1977,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "smoo-host-app"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "async-trait",
- "clap",
- "hyper 0.14.32",
- "metrics-exporter-prometheus",
- "smoo-host-blocksource-cached",
- "smoo-host-blocksource-http",
- "smoo-host-blocksources",
- "smoo-host-core",
- "smoo-host-transport-rusb",
- "smoo-proto",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "url",
-]
-
-[[package]]
-name = "smoo-host-blocksource-cached"
+name = "smoo-host-blocksource-gibblox"
 version = "0.0.1"
 dependencies = [
  "async-trait",
- "futures-channel",
+ "gibblox-core",
  "smoo-host-core",
 ]
 
@@ -1988,25 +2017,25 @@ dependencies = [
 ]
 
 [[package]]
-name = "smoo-host-cache-store-idb"
-version = "0.0.1"
-dependencies = [
- "async-trait",
- "js-sys",
- "smoo-host-blocksource-cached",
- "smoo-host-core",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
-]
-
-[[package]]
 name = "smoo-host-cli"
 version = "0.0.1"
 dependencies = [
  "anyhow",
- "smoo-host-app",
+ "async-trait",
+ "clap",
+ "hyper 0.14.32",
+ "metrics-exporter-prometheus",
+ "smoo-host-blocksource-http",
+ "smoo-host-blocksources",
+ "smoo-host-core",
+ "smoo-host-session",
+ "smoo-host-transport-rusb",
+ "smoo-proto",
  "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
@@ -2016,9 +2045,17 @@ dependencies = [
  "async-trait",
  "futures-channel",
  "futures-util",
- "metrics",
  "smoo-proto",
  "tracing",
+]
+
+[[package]]
+name = "smoo-host-session"
+version = "0.0.1"
+dependencies = [
+ "futures-util",
+ "smoo-host-core",
+ "smoo-proto",
 ]
 
 [[package]]
@@ -2041,6 +2078,26 @@ dependencies = [
  "smoo-host-core",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "smoo-host-web-worker"
+version = "0.0.1"
+dependencies = [
+ "futures-channel",
+ "futures-util",
+ "gibblox-blockreader-messageport",
+ "gibblox-core",
+ "gloo-timers",
+ "js-sys",
+ "smoo-host-blocksource-gibblox",
+ "smoo-host-core",
+ "smoo-host-session",
+ "smoo-host-webusb",
+ "tracing",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

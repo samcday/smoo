@@ -6,13 +6,13 @@ rust-version = { workspace = true }
 license = "GPL-3.0-only"
 
 [dependencies]
-anyhow = "1.0.100"
-clap = { version = "4.5.20", features = ["derive"] }
-libc = "0.2.177"
+anyhow = { workspace = true }
+clap = { workspace = true }
+libc = { workspace = true }
 smoo-host-core = { path = "../../crates/smoo-host-core" }
 smoo-host-blocksources = { path = "../../crates/smoo-host-blocksources" }
 smoo-gadget-ublk = { path = "../../crates/smoo-gadget-ublk" }
-tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "sync"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 ctrlc = "3.4.5"

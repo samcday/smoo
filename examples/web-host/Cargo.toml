@@ -10,11 +10,10 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 smoo-host-core = { path = "../../crates/smoo-host-core" }
-smoo-host-webusb = { path = "../../crates/smoo-host-webusb" }
 smoo-host-blocksource-http = { path = "../../crates/smoo-host-blocksource-http", default-features = false, features = ["wasm-client"] }
-wasm-bindgen = "0.2.95"
-wasm-bindgen-futures = "0.4.45"
-web-sys = { version = "0.3.72", features = [
+wasm-bindgen = { workspace = true }
+wasm-bindgen-futures = { workspace = true }
+web-sys = { workspace = true, features = [
     "Window",
     "Navigator",
     "Performance",
@@ -33,9 +32,9 @@ web-sys = { version = "0.3.72", features = [
     "UsbTransferStatus",
     "console",
 ] }
-js-sys = "0.3.72"
+js-sys = { workspace = true }
 console_error_panic_hook = "0.1.7"
-url = "2.5.4"
+url = { workspace = true }
 tracing = { version = "0.1.41", features = ["release_max_level_debug"] }
 tracing-wasm = "0.2.1"
 tracing-subscriber = { version = "0.3.18", default-features = false, features = [
@@ -44,7 +43,10 @@ tracing-subscriber = { version = "0.3.18", default-features = false, features = 
     "registry",
     "std",
 ] }
-futures-util = "0.3.31"
+futures-util = { workspace = true, features = ["std"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+smoo-host-webusb = { path = "../../crates/smoo-host-webusb" }
 
 [package.metadata.wasm-pack.profile.dev]
 wasm-opt = false
