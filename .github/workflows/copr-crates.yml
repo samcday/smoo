@@ -217,7 +217,7 @@ jobs:
           EOF
 
       - name: Verify auth
-        run: copr-cli whoami
+        run: copr whoami
 
       - name: Build in COPR and wait for completion
         env:
@@ -242,7 +242,7 @@ jobs:
               spec_name = entry["spec_name"]
               print(f"::group::COPR build {package}")
               cmd = [
-                  "copr-cli",
+                  "copr",
                   "buildscm",
                   copr_repo,
                   "--clone-url",
