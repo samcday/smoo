@@ -3,7 +3,7 @@ resolver = "2"
 members = ["apps/*", "crates/*", "examples/*"]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.0.1-rc.1"
 rust-version = "1.88"
 
 [workspace.dependencies]
