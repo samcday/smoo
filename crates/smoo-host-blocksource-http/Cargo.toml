@@ -4,6 +4,8 @@ version = { workspace = true }
 edition = "2024"
 rust-version = { workspace = true }
 license = "GPL-3.0-only"
+repository = "https://github.com/samcday/smoo"
+description = "Components for the smoo USB block device stack"
 
 [features]
 default = ["native-client"]
@@ -14,7 +16,7 @@ wasm-client = ["wasm-bindgen-futures", "web-sys", "js-sys", "wasm-bindgen", "fut
 async-trait = { workspace = true }
 thiserror = "1.0.69"
 http = "1.1.0"
-smoo-host-core = { path = "../smoo-host-core" }
+smoo-host-core = { path = "../smoo-host-core", version = "0.0.1-rc.1" }
 tracing = "0.1.41"
 url = { workspace = true }
 

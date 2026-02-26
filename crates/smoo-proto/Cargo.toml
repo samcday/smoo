@@ -4,6 +4,8 @@ version = { workspace = true }
 edition = "2024"
 rust-version = { workspace = true }
 license = "MIT"
+repository = "https://github.com/samcday/smoo"
+description = "Components for the smoo USB block device stack"
 
 [dependencies]
 heapless = { version = "0.8.0", default-features = false, features = ["serde"] }

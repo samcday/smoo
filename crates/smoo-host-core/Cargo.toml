@@ -4,6 +4,8 @@ version = { workspace = true }
 edition = "2024"
 rust-version = { workspace = true }
 license = "GPL-3.0-only"
+repository = "https://github.com/samcday/smoo"
+description = "Components for the smoo USB block device stack"
 
 [features]
 default = []
@@ -11,7 +13,7 @@ metrics = []
 
 [dependencies]
 async-trait = { workspace = true }
-smoo-proto = { path = "../smoo-proto" }
+smoo-proto = { path = "../smoo-proto", version = "0.0.1-rc.1" }
 futures-util = { workspace = true, features = ["alloc", "async-await", "async-await-macro"] }
 futures-channel = { version = "0.3.31", default-features = false, features = ["alloc"] }
 tracing = { version = "0.1.40", default-features = false, features = ["attributes"] }
