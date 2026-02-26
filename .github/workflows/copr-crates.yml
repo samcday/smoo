@@ -198,7 +198,7 @@ jobs:
       - name: Install copr-cli
         run: |
           set -euo pipefail
-          python3 -m pip install --user --upgrade copr
+          python3 -m pip install --user --upgrade copr-cli
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Configure copr-cli auth
@@ -217,7 +217,7 @@ jobs:
           EOF
 
       - name: Verify auth
-        run: copr whoami
+        run: copr-cli whoami
 
       - name: Build in COPR and wait for completion
         env:
@@ -242,7 +242,7 @@ jobs:
               spec_name = entry["spec_name"]
               print(f"::group::COPR build {package}")
               cmd = [
-                  "copr",
+                  "copr-cli",
                   "buildscm",
                   copr_repo,
                   "--clone-url",
