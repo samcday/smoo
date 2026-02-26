@@ -93,19 +93,19 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: smoo-gadget-${{ matrix.name }}
-          path: target/${{ matrix.target }}/release/smoo-gadget-cli
+          path: target/${{ matrix.target }}/release/smoo-gadget
 
       - name: Upload smoo-host artifact
         uses: actions/upload-artifact@v4
         with:
           name: smoo-host-${{ matrix.name }}
-          path: target/${{ matrix.target }}/release/smoo-host-cli
+          path: target/${{ matrix.target }}/release/smoo-host
 
       - name: Prepare release binaries
         if: github.event_name == 'release'
         run: |
-          cp target/${{ matrix.target }}/release/smoo-gadget-cli smoo-gadget-${{ matrix.name }}
-          cp target/${{ matrix.target }}/release/smoo-host-cli smoo-host-${{ matrix.name }}
+          cp target/${{ matrix.target }}/release/smoo-gadget smoo-gadget-${{ matrix.name }}
+          cp target/${{ matrix.target }}/release/smoo-host smoo-host-${{ matrix.name }}
 
       - name: Upload binaries to release
         if: github.event_name == 'release'

@@ -4,7 +4,24 @@ version = { workspace = true }
 edition = "2021"
 rust-version = { workspace = true }
 license = "GPL-3.0-only"
-publish = false
+repository = { workspace = true }
+description = "Host CLI for serving smoo block exports over USB."
+autobins = false
+
+[[bin]]
+name = "smoo-host"
+path = "src/main.rs"
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.tar.gz"
+pkg-fmt = "tgz"
+bin-dir = "{ bin }{ binary-ext }"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-x86_64-unknown-linux-musl.tar.gz"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-aarch64-unknown-linux-musl.tar.gz"
 
 [dependencies]
 anyhow = { workspace = true }
@@ -12,12 +29,12 @@ async-trait = { workspace = true }
 clap = { workspace = true }
 hyper = { workspace = true, features = ["server", "http1", "tcp"] }
 metrics-exporter-prometheus = { workspace = true, features = ["http-listener"] }
-smoo-host-blocksource-http = { path = "../../crates/smoo-host-blocksource-http" }
-smoo-host-blocksources = { path = "../../crates/smoo-host-blocksources" }
-smoo-host-core = { path = "../../crates/smoo-host-core", features = ["metrics"] }
-smoo-host-session = { path = "../../crates/smoo-host-session" }
-smoo-host-transport-rusb = { path = "../../crates/smoo-host-transport-rusb" }
-smoo-proto = { path = "../../crates/smoo-proto" }
+smoo-host-blocksource-http = { path = "../../crates/smoo-host-blocksource-http", version = "0.0.1-rc.1" }
+smoo-host-blocksources = { path = "../../crates/smoo-host-blocksources", version = "0.0.1-rc.1" }
+smoo-host-core = { path = "../../crates/smoo-host-core", version = "0.0.1-rc.1", features = ["metrics"] }
+smoo-host-session = { path = "../../crates/smoo-host-session", version = "0.0.1-rc.1" }
+smoo-host-transport-rusb = { path = "../../crates/smoo-host-transport-rusb", version = "0.0.1-rc.1" }
+smoo-proto = { path = "../../crates/smoo-proto", version = "0.0.1-rc.1" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time"] }
 tokio-util = { workspace = true }
 tracing = "0.1.41"

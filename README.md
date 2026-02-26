@@ -22,11 +22,11 @@ cargo build
 
 # On the device side:
 sudo modprobe ublk-drv
-sudo ./target/debug/smoo-gadget-cli --no-dma-buf
+sudo ./target/debug/smoo-gadget --no-dma-buf
 
 # on the host side
 dd if=/dev/urandom of=random.img bs=4096 count=512
-sudo ./target/debug/smoo-host-cli --file random.img
+sudo ./target/debug/smoo-host --file random.img
 
 # the device will now see a /dev/ublkb0 device
 # it will return data matching the contents of random.img on the host.

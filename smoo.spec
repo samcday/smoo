@@ -6,7 +6,7 @@
 %endif
 
 Name:           smoo
-Version:        0.0.1_rc1
+Version:        0.0.1_rc2
 Release:        %autorelease
 Summary:        Inverted USB mass-storage host/gadget utilities
 License:        GPL-3.0-only
@@ -54,9 +54,9 @@ Host-side CLI that speaks the smoo USB protocol over rusb.
 %{cargo_license} > LICENSE.dependencies
 
 %install
-install -Dpm0755 target/rpm/smoo-gadget-cli \
+install -Dpm0755 target/rpm/smoo-gadget \
     %{buildroot}%{_bindir}/smoo-gadget
-install -Dpm0755 target/rpm/smoo-host-cli \
+install -Dpm0755 target/rpm/smoo-host \
     %{buildroot}%{_bindir}/smoo-host
 
 %if %{with check}

@@ -1,6 +1,6 @@
 # Maintainer: Sam Day <me@samcday.com>
 pkgname=smoo
-pkgver=0.0.1_rc1_git
+pkgver=0.0.1_rc2_git
 pkgrel=0
 pkgdesc="Inverted USB mass-storage utilities (host + gadget)"
 url=https://github.com/samcday/smoo
@@ -50,8 +50,8 @@ check() {
 package() {
 	local target_dir="$_cargo_target_dir/release"
 
-	install -Dm755 "$target_dir"/smoo-gadget-cli "$pkgdir"/usr/bin/smoo-gadget
-	install -Dm755 "$target_dir"/smoo-host-cli "$pkgdir"/usr/bin/smoo-host
+	install -Dm755 "$target_dir"/smoo-gadget "$pkgdir"/usr/bin/smoo-gadget
+	install -Dm755 "$target_dir"/smoo-host "$pkgdir"/usr/bin/smoo-host
 }
 
 gadget() {

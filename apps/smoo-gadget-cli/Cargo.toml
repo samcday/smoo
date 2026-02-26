@@ -4,7 +4,24 @@ version = { workspace = true }
 edition = "2021"
 rust-version = { workspace = true }
 license = "GPL-3.0-only"
-publish = false
+repository = { workspace = true }
+description = "Gadget CLI for exporting smoo devices over USB FunctionFS."
+autobins = false
+
+[[bin]]
+name = "smoo-gadget"
+path = "src/main.rs"
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.tar.gz"
+pkg-fmt = "tgz"
+bin-dir = "{ bin }{ binary-ext }"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-x86_64-unknown-linux-musl.tar.gz"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-aarch64-unknown-linux-musl.tar.gz"
 
 [features]
 default = []
@@ -13,5 +30,5 @@ apkbuild = ["smoo-gadget-app/apkbuild"]
 [dependencies]
 anyhow = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time"] }
-smoo-gadget-app = { path = "../../crates/smoo-gadget-app" }
+smoo-gadget-app = { path = "../../crates/smoo-gadget-app", version = "0.0.1-rc.1" }
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
