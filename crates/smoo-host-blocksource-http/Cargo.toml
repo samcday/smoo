@@ -4,8 +4,8 @@ version = { workspace = true }
 edition = "2024"
 rust-version = { workspace = true }
 license = "GPL-3.0-only"
-repository = "https://github.com/samcday/smoo"
-description = "Components for the smoo USB block device stack"
+repository = { workspace = true }
+description = { workspace = true }
 
 [features]
 default = ["native-client"]
