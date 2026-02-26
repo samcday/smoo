@@ -1,6 +1,7 @@
 name: Alpine (arm64)
 
 on:
+  workflow_call:
   push:
     branches: [main]
   pull_request:
