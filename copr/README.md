@@ -1,5 +1,6 @@
 Build order:
 
+ * rust-is_terminal_polyfill
  * rust-dma-heap
 
 Notes:
