@@ -62,7 +62,7 @@ const RECONCILE_TIMEOUT_MS: u64 = 200;
 const GRACEFUL_SHUTDOWN_TIMEOUT_MS: u64 = 5_000;
 
 #[derive(Debug, Parser)]
-#[command(name = "smoo-gadget-cli", version)]
+#[command(name = "smoo-gadget", version)]
 #[command(about = "Expose a smoo gadget backed by FunctionFS + ublk", long_about = None)]
 pub struct Args {
     /// USB vendor ID for the gadget (hex).
@@ -143,7 +143,7 @@ pub async fn run_from_env() -> Result<()> {
     let args = Args::parse();
     let result = run_impl(args).await;
     if let Err(err) = &result {
-        error!(error = ?err, "smoo-gadget-cli exiting with error");
+        error!(error = ?err, "smoo-gadget exiting with error");
     }
     result
 }

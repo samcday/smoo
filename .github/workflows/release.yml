@@ -190,10 +190,16 @@ jobs:
           set -euo pipefail
           mkdir -p release-assets
 
-          cp release-artifacts/smoo-gadget-x86_64/smoo-gadget-cli release-assets/smoo-gadget-x86_64
-          cp release-artifacts/smoo-host-x86_64/smoo-host-cli release-assets/smoo-host-x86_64
-          cp release-artifacts/smoo-gadget-aarch64/smoo-gadget-cli release-assets/smoo-gadget-aarch64
-          cp release-artifacts/smoo-host-aarch64/smoo-host-cli release-assets/smoo-host-aarch64
+          cp release-artifacts/smoo-gadget-x86_64/smoo-gadget release-assets/smoo-gadget-x86_64
+          cp release-artifacts/smoo-host-x86_64/smoo-host release-assets/smoo-host-x86_64
+          cp release-artifacts/smoo-gadget-aarch64/smoo-gadget release-assets/smoo-gadget-aarch64
+          cp release-artifacts/smoo-host-aarch64/smoo-host release-assets/smoo-host-aarch64
+
+          tar -C release-artifacts/smoo-gadget-x86_64 -czf release-assets/smoo-gadget-cli-x86_64-unknown-linux-musl.tar.gz smoo-gadget
+          tar -C release-artifacts/smoo-host-x86_64 -czf release-assets/smoo-host-cli-x86_64-unknown-linux-musl.tar.gz smoo-host
+          tar -C release-artifacts/smoo-gadget-aarch64 -czf release-assets/smoo-gadget-cli-aarch64-unknown-linux-musl.tar.gz smoo-gadget
+          tar -C release-artifacts/smoo-host-aarch64 -czf release-assets/smoo-host-cli-aarch64-unknown-linux-musl.tar.gz smoo-host
+
           cp release-artifacts/APKBUILD/APKBUILD release-assets/APKBUILD
           cp release-artifacts/packages-aarch64/*.apk release-assets/
 
@@ -205,6 +211,10 @@ jobs:
           test -f release-assets/smoo-host-x86_64
           test -f release-assets/smoo-gadget-aarch64
           test -f release-assets/smoo-host-aarch64
+          test -f release-assets/smoo-gadget-cli-x86_64-unknown-linux-musl.tar.gz
+          test -f release-assets/smoo-host-cli-x86_64-unknown-linux-musl.tar.gz
+          test -f release-assets/smoo-gadget-cli-aarch64-unknown-linux-musl.tar.gz
+          test -f release-assets/smoo-host-cli-aarch64-unknown-linux-musl.tar.gz
           test -f release-assets/APKBUILD
           compgen -G 'release-assets/*.apk' >/dev/null
 
@@ -219,6 +229,10 @@ jobs:
             release-assets/smoo-host-x86_64
             release-assets/smoo-gadget-aarch64
             release-assets/smoo-host-aarch64
+            release-assets/smoo-gadget-cli-x86_64-unknown-linux-musl.tar.gz
+            release-assets/smoo-host-cli-x86_64-unknown-linux-musl.tar.gz
+            release-assets/smoo-gadget-cli-aarch64-unknown-linux-musl.tar.gz
+            release-assets/smoo-host-cli-aarch64-unknown-linux-musl.tar.gz
             release-assets/APKBUILD
             release-assets/*.apk
 

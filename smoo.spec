@@ -54,9 +54,9 @@ Host-side CLI that speaks the smoo USB protocol over rusb.
 %{cargo_license} > LICENSE.dependencies
 
 %install
-install -Dpm0755 target/rpm/smoo-gadget-cli \
+install -Dpm0755 target/rpm/smoo-gadget \
     %{buildroot}%{_bindir}/smoo-gadget
-install -Dpm0755 target/rpm/smoo-host-cli \
+install -Dpm0755 target/rpm/smoo-host \
     %{buildroot}%{_bindir}/smoo-host
 
 %if %{with check}

@@ -11,8 +11,8 @@ use smoo_host_core::{
     register_export, BlockSource, BlockSourceHandle, BlockSourceResult, ExportIdentity,
 };
 use smoo_host_session::{
-    HostSession, HostSessionConfig, HostSessionDriveConfig, HostSessionDriveEvent,
-    HostSessionDriveOutcome, drive_host_session,
+    drive_host_session, HostSession, HostSessionConfig, HostSessionDriveConfig,
+    HostSessionDriveEvent, HostSessionDriveOutcome,
 };
 use smoo_host_transport_rusb::RusbTransport;
 use std::{
@@ -33,7 +33,7 @@ const STATUS_RETRY_ATTEMPTS: usize = 5;
 const RECONNECT_PAUSE: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Parser)]
-#[command(name = "smoo-host-cli", version)]
+#[command(name = "smoo-host", version)]
 #[command(
     about = "Host shim for smoo gadgets",
     long_about = "Host shim for smoo gadgets. By default all visible USB devices are scanned and the first interface matching the vendor triple 0xFF/0x53/0x4D is selected."
@@ -269,8 +269,7 @@ async fn run_session(
             } => {
                 warn!(
                     missed_heartbeats,
-                    budget,
-                    "heartbeat miss budget exhausted; treating transport as lost"
+                    budget, "heartbeat miss budget exhausted; treating transport as lost"
                 );
             }
         },
