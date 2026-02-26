@@ -1,0 +1,261 @@
+name: COPR Crates
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "copr/**"
+  pull_request:
+    paths:
+      - "copr/**"
+  workflow_dispatch:
+
+concurrency:
+  group: copr-crates-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  detect-packages:
+    runs-on: ubuntu-24.04
+    outputs:
+      count: ${{ steps.detect.outputs.count }}
+      plan: ${{ steps.detect.outputs.plan }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve diff base
+        id: base
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            base_sha="$PR_BASE_SHA"
+          elif [[ "$EVENT_NAME" == "push" ]]; then
+            base_sha="$PUSH_BEFORE_SHA"
+          else
+            base_sha="$(git rev-list --max-parents=0 HEAD)"
+          fi
+
+          if [[ -z "$base_sha" || "$base_sha" == "0000000000000000000000000000000000000000" ]]; then
+            base_sha="$(git rev-list --max-parents=0 HEAD)"
+          fi
+
+          echo "sha=$base_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Detect changed COPR packages
+        id: detect
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+          HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import json
+          import os
+          import pathlib
+          import re
+          import subprocess
+          import sys
+
+          base_sha = os.environ["BASE_SHA"]
+          head_sha = os.environ["HEAD_SHA"]
+
+          diff_files = subprocess.check_output(
+              ["git", "diff", "--name-only", base_sha, head_sha, "--", "copr"],
+              text=True,
+          ).splitlines()
+
+          changed_packages = {
+              path.split("/")[1]
+              for path in diff_files
+              if path.startswith("copr/") and len(path.split("/")) >= 3
+          }
+
+          graph = {}
+          readme_order = []
+          readme_path = pathlib.Path("copr/README.md")
+          if readme_path.exists():
+              bullet = re.compile(r"^(?P<indent>\s*)\*\s+(?P<name>[A-Za-z0-9._+-]+)\s*$")
+              stack = []
+              for line in readme_path.read_text(encoding="utf-8").splitlines():
+                  match = bullet.match(line)
+                  if match:
+                      name = match.group("name")
+                      indent = len(match.group("indent").replace("\t", "  "))
+
+                      graph.setdefault(name, set())
+                      readme_order.append(name)
+
+                      while stack and stack[-1][0] >= indent:
+                          stack.pop()
+
+                      if stack:
+                          parent = stack[-1][1]
+                          graph.setdefault(parent, set()).add(name)
+
+                      stack.append((indent, name))
+
+          spec_names = {}
+          for pkg in sorted(changed_packages):
+              spec_files = sorted(pathlib.Path("copr", pkg).glob("*.spec"))
+              if not spec_files:
+                  continue
+
+              if len(spec_files) != 1:
+                  print(
+                      f"::error file=copr/{pkg}::Expected exactly one .spec file, found {len(spec_files)}"
+                  )
+                  sys.exit(1)
+
+              spec_names[pkg] = spec_files[0].name
+
+          build_set = set(spec_names)
+          ordered_packages = []
+          visited = set()
+          visiting = set()
+
+          def visit(pkg):
+              if pkg in visited:
+                  return
+              if pkg in visiting:
+                  print(f"::error file=copr/README.md::Dependency cycle detected involving {pkg}")
+                  sys.exit(1)
+
+              visiting.add(pkg)
+              for dep in graph.get(pkg, set()):
+                  if dep in build_set:
+                      visit(dep)
+              visiting.remove(pkg)
+              visited.add(pkg)
+              ordered_packages.append(pkg)
+
+          seeds = []
+          for pkg in readme_order:
+              if pkg in build_set and pkg not in seeds:
+                  seeds.append(pkg)
+          for pkg in sorted(build_set):
+              if pkg not in seeds:
+                  seeds.append(pkg)
+
+          for pkg in seeds:
+              visit(pkg)
+
+          plan = [
+              {
+                  "package": pkg,
+                  "spec_name": spec_names[pkg],
+              }
+              for pkg in ordered_packages
+          ]
+
+          plan_json = json.dumps(plan, separators=(",", ":"))
+
+          summary_lines = [f"Detected {len(plan)} COPR package(s) to build."]
+          summary_lines.extend(f"- {entry['package']} ({entry['spec_name']})" for entry in plan)
+          pathlib.Path(os.environ["GITHUB_STEP_SUMMARY"]).write_text(
+              "\n".join(summary_lines) + "\n",
+              encoding="utf-8",
+          )
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"count={len(plan)}\n")
+              output.write("plan<<EOF\n")
+              output.write(plan_json + "\n")
+              output.write("EOF\n")
+          PY
+
+  build-changed-packages:
+    needs: detect-packages
+    if: >
+      needs.detect-packages.outputs.count != '0' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Require COPR secrets
+        env:
+          COPR_LOGIN: ${{ secrets.COPR_LOGIN }}
+          COPR_TOKEN: ${{ secrets.COPR_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$COPR_LOGIN" || -z "$COPR_TOKEN" ]]; then
+            echo "COPR_LOGIN and COPR_TOKEN secrets are required."
+            exit 1
+          fi
+
+      - name: Install copr-cli
+        run: |
+          set -euo pipefail
+          python3 -m pip install --user --upgrade copr
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Configure copr-cli auth
+        env:
+          COPR_LOGIN: ${{ secrets.COPR_LOGIN }}
+          COPR_TOKEN: ${{ secrets.COPR_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.config"
+          cat > "$HOME/.config/copr" <<EOF
+          [copr-cli]
+          login = $COPR_LOGIN
+          username = samcday
+          token = $COPR_TOKEN
+          copr_url = https://copr.fedorainfracloud.org
+          EOF
+
+      - name: Verify auth
+        run: copr-cli whoami
+
+      - name: Build in COPR and wait for completion
+        env:
+          COPR_REPO: samcday/smoo-nightly
+          BUILD_COMMIT: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          BUILD_PLAN: ${{ needs.detect-packages.outputs.plan }}
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import json
+          import os
+          import subprocess
+
+          plan = json.loads(os.environ["BUILD_PLAN"])
+          copr_repo = os.environ["COPR_REPO"]
+          build_commit = os.environ["BUILD_COMMIT"]
+          clone_url = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}.git"
+
+          for entry in plan:
+              package = entry["package"]
+              spec_name = entry["spec_name"]
+              print(f"::group::COPR build {package}")
+              cmd = [
+                  "copr-cli",
+                  "buildscm",
+                  copr_repo,
+                  "--clone-url",
+                  clone_url,
+                  "--commit",
+                  build_commit,
+                  "--subdir",
+                  f"copr/{package}",
+                  "--spec",
+                  spec_name,
+                  "--enable-net",
+                  "on",
+              ]
+              subprocess.run(cmd, check=True)
+              print("::endgroup::")
+          PY

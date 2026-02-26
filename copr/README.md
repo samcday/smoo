@@ -1,4 +1,4 @@
-Build order:
+Dependency graph (nested bullets mean parent depends on children):
 
  * rust-is_terminal_polyfill
  * rust-dma-heap
