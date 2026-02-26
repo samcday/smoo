@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: alpine-arm64-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:

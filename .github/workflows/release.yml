@@ -103,14 +103,17 @@ jobs:
 
   dry-run:
     needs: [gate, release, ci-build, ci-alpine-arm64]
-    if: needs.gate.outputs.mode == 'pr'
+    if: needs.gate.outputs.enabled == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - if: needs.gate.outputs.mode == 'pr'
+        uses: actions/checkout@v4
 
-      - uses: taiki-e/install-action@just
+      - if: needs.gate.outputs.mode == 'pr'
+        uses: taiki-e/install-action@just
 
-      - name: Validate bump is idempotent
+      - if: needs.gate.outputs.mode == 'pr'
+        name: Validate bump is idempotent
         env:
           VERSION: ${{ needs.gate.outputs.version }}
         run: |
@@ -123,9 +126,33 @@ jobs:
             exit 1
           fi
 
+      - if: needs.gate.outputs.mode == 'tag'
+        name: Skip dry-run in tag mode
+        run: |
+          echo "tag mode: dry-run bump validation is not required"
+
+  publish-crates:
+    needs: [gate, release, ci-build, ci-alpine-arm64]
+    if: needs.gate.outputs.enabled == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: taiki-e/install-action@just
+
+      - if: needs.gate.outputs.mode == 'pr'
+        name: Validate crate publish (dry-run)
+        run: just publish-dry-run
+
+      - if: needs.gate.outputs.mode == 'tag'
+        name: Publish crates to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: just publish
+
   pass:
     name: "✅ Pass"
-    needs: [gate, release, ci-build, ci-alpine-arm64, dry-run]
+    needs: [gate, release, ci-build, ci-alpine-arm64, dry-run, publish-crates]
     runs-on: ubuntu-latest
     if: always() && needs.gate.outputs.enabled == 'true'
     steps:

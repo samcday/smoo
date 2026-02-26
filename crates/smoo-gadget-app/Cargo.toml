@@ -4,6 +4,8 @@ version = { workspace = true }
 edition = "2021"
 rust-version = "1.87"
 license = "GPL-3.0-only"
+repository = { workspace = true }
+description = { workspace = true }
 
 [features]
 default = []
@@ -12,8 +14,8 @@ apkbuild = ["smoo-gadget-core/apkbuild"]
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
-smoo-gadget-core = { path = "../smoo-gadget-core", features = ["metrics"] }
-smoo-proto = { path = "../smoo-proto" }
+smoo-gadget-core = { path = "../smoo-gadget-core", version = "0.0.1-rc.1", features = ["metrics"] }
+smoo-proto = { path = "../smoo-proto", version = "0.0.1-rc.1" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time"] }
 tracing = "0.1.41"
 usb-gadget = { workspace = true, features = ["tokio"] }
