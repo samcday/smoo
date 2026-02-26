@@ -1,6 +1,6 @@
 # Maintainer: Sam Day <me@samcday.com>
 pkgname=smoo
-pkgver=0.0.1_rc2_git
+pkgver=0.0.1_rc3_git
 pkgrel=0
 pkgdesc="Inverted USB mass-storage utilities (host + gadget)"
 url=https://github.com/samcday/smoo

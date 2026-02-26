@@ -3,7 +3,7 @@ resolver = "2"
 members = ["apps/*", "crates/*", "examples/*"]
 
 [workspace.package]
-version = "0.0.1-rc.2"
+version = "0.0.1-rc.3"
 rust-version = "1.88"
 repository = "https://github.com/samcday/smoo"
 description = "Reverse USB Mass Storage"
