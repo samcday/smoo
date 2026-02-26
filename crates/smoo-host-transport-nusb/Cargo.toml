@@ -4,9 +4,11 @@ edition = "2024"
 version.workspace = true
 rust-version.workspace = true
 license = "GPL-3.0-only"
+repository = "https://github.com/samcday/smoo"
+description = "Components for the smoo USB block device stack"
 
 [dependencies]
 async-trait = { workspace = true }
 nusb = { version = "0.2.1", features = ["tokio"] }
-smoo-host-core = { path = "../smoo-host-core" }
+smoo-host-core = { path = "../smoo-host-core", version = "0.0.1-rc.1" }
 tokio = { workspace = true, features = ["sync"] }
