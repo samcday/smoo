@@ -6,7 +6,7 @@
 %endif
 
 Name:           smoo
-Version:        0.0.1_rc4
+Version:        0.0.1_rc5
 Release:        %autorelease
 Summary:        Inverted USB mass-storage host/gadget utilities
 License:        GPL-3.0-only
