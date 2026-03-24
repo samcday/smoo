@@ -122,7 +122,7 @@ impl ControlTransport for WebUsbControl {
             let params = control_params(request_type, request, self.interface);
             self.device.control_transfer_in(&params, len)
         };
-        let result = SendJsFuture::from(promise)
+        let result = SendJsFuture::from(promise.unchecked_into::<Promise>())
             .await
             .map_err(|err| js_error("control_in", err))?;
         let result: UsbInTransferResult = result
@@ -195,7 +195,7 @@ impl ControlTransport for WebUsbControl {
                 .control_transfer_out_with_u8_array(&params, &payload)
                 .map_err(|err| js_error("control_out", err))?
         };
-        let result = SendJsFuture::from(promise)
+        let result = SendJsFuture::from(promise.unchecked_into::<Promise>())
             .await
             .map_err(|err| js_error("control_out", err))?;
         let result: UsbOutTransferResult = result
@@ -334,18 +334,18 @@ fn decode_request_type(bm_request_type: u8) -> (UsbRequestType, Option<UsbRecipi
 async fn open_and_claim(device: &UsbDevice, interface: u8) -> TransportResult<()> {
     if !device.opened() {
         let promise = device.open();
-        SendJsFuture::from(promise)
+        SendJsFuture::from(promise.unchecked_into::<Promise>())
             .await
             .map_err(|err| js_error("open await", err))?;
     }
     if device.configuration().is_none() {
         let promise = device.select_configuration(1);
-        SendJsFuture::from(promise)
+        SendJsFuture::from(promise.unchecked_into::<Promise>())
             .await
             .map_err(|err| js_error("select_configuration await", err))?;
     }
     let promise = device.claim_interface(interface as u8);
-    SendJsFuture::from(promise)
+    SendJsFuture::from(promise.unchecked_into::<Promise>())
         .await
         .map_err(|err| js_error("claim_interface await", err))?;
     Ok(())
@@ -370,7 +370,7 @@ async fn transfer_in(
         )
     })?;
     let promise = device.clone_inner().transfer_in(endpoint, len);
-    let result = SendJsFuture::from(promise)
+    let result = SendJsFuture::from(promise.unchecked_into::<Promise>())
         .await
         .map_err(|err| js_error("transfer_in await", err))?;
     let result: UsbInTransferResult = result
@@ -425,7 +425,7 @@ async fn transfer_out(device: SendUsbDevice, endpoint: u8, buf: &[u8]) -> Transp
         drop(payload);
         promise
     };
-    let result = SendJsFuture::from(promise)
+    let result = SendJsFuture::from(promise.unchecked_into::<Promise>())
         .await
         .map_err(|err| js_error("transfer_out await", err))?;
     let result: UsbOutTransferResult = result
