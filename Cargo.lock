@@ -629,9 +629,9 @@ dependencies = [
 
 [[package]]
 name = "gibblox-blockreader-messageport"
-version = "0.0.1-rc.16"
+version = "0.0.1-rc.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92d535aeff6d3734ef894e52e348817d0f66fd0b9e63cf1b7412724cd70be18b"
+checksum = "71503ad11999ea80093bac64a66a6d90e114c3179e396d8889a1215be5a22eda"
 dependencies = [
  "async-trait",
  "futures-channel",
@@ -645,9 +645,9 @@ dependencies = [
 
 [[package]]
 name = "gibblox-core"
-version = "0.0.1-rc.16"
+version = "0.0.1-rc.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5986c6b828e188c691fe6b63c6b2fef3d8e339abbf7c472d0bcdb7d775efc3d2"
+checksum = "13d4aa6dfb47edc855600d1685a772c8c8894e4ba50023ef5c44726dfcfed371"
 dependencies = [
  "async-lock",
  "async-trait",
