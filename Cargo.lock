@@ -194,7 +194,7 @@ dependencies = [
 
 [[package]]
 name = "blocksourced-ublk"
-version = "0.0.1-rc.5"
+version = "0.0.1-rc.6"
 dependencies = [
  "anyhow",
  "clap",
@@ -1969,7 +1969,7 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
 name = "smoo-gadget-app"
-version = "0.0.1-rc.5"
+version = "0.0.1-rc.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1988,7 +1988,7 @@ dependencies = [
 
 [[package]]
 name = "smoo-gadget-cli"
-version = "0.0.1-rc.5"
+version = "0.0.1-rc.6"
 dependencies = [
  "anyhow",
  "smoo-gadget-app",
@@ -1998,7 +1998,7 @@ dependencies = [
 
 [[package]]
 name = "smoo-gadget-core"
-version = "0.0.1-rc.5"
+version = "0.0.1-rc.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2021,7 +2021,7 @@ dependencies = [
 
 [[package]]
 name = "smoo-gadget-ublk"
-version = "0.0.1-rc.5"
+version = "0.0.1-rc.6"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -2037,7 +2037,7 @@ dependencies = [
 
 [[package]]
 name = "smoo-host-blocksource-gibblox"
-version = "0.0.1-rc.5"
+version = "0.0.1-rc.6"
 dependencies = [
  "async-trait",
  "gibblox-core",
@@ -2046,7 +2046,7 @@ dependencies = [
 
 [[package]]
 name = "smoo-host-blocksource-http"
-version = "0.0.1-rc.5"
+version = "0.0.1-rc.6"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -2065,7 +2065,7 @@ dependencies = [
 
 [[package]]
 name = "smoo-host-blocksources"
-version = "0.0.1-rc.5"
+version = "0.0.1-rc.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2077,7 +2077,7 @@ dependencies = [
 
 [[package]]
 name = "smoo-host-cli"
-version = "0.0.1-rc.5"
+version = "0.0.1-rc.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2099,7 +2099,7 @@ dependencies = [
 
 [[package]]
 name = "smoo-host-core"
-version = "0.0.1-rc.5"
+version = "0.0.1-rc.6"
 dependencies = [
  "async-trait",
  "futures-channel",
@@ -2110,7 +2110,7 @@ dependencies = [
 
 [[package]]
 name = "smoo-host-session"
-version = "0.0.1-rc.5"
+version = "0.0.1-rc.6"
 dependencies = [
  "futures-util",
  "smoo-host-core",
@@ -2119,7 +2119,7 @@ dependencies = [
 
 [[package]]
 name = "smoo-host-transport-nusb"
-version = "0.0.1-rc.5"
+version = "0.0.1-rc.6"
 dependencies = [
  "async-trait",
  "nusb",
@@ -2129,7 +2129,7 @@ dependencies = [
 
 [[package]]
 name = "smoo-host-transport-rusb"
-version = "0.0.1-rc.5"
+version = "0.0.1-rc.6"
 dependencies = [
  "async-trait",
  "crossbeam-channel",
@@ -2141,7 +2141,7 @@ dependencies = [
 
 [[package]]
 name = "smoo-host-web-worker"
-version = "0.0.1-rc.5"
+version = "0.0.1-rc.6"
 dependencies = [
  "futures-channel",
  "futures-util",
@@ -2161,7 +2161,7 @@ dependencies = [
 
 [[package]]
 name = "smoo-host-webusb"
-version = "0.0.1-rc.5"
+version = "0.0.1-rc.6"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -2175,7 +2175,7 @@ dependencies = [
 
 [[package]]
 name = "smoo-proto"
-version = "0.0.1-rc.5"
+version = "0.0.1-rc.6"
 dependencies = [
  "heapless",
 ]
@@ -2770,7 +2770,7 @@ dependencies = [
 
 [[package]]
 name = "web-host"
-version = "0.0.1-rc.5"
+version = "0.0.1-rc.6"
 dependencies = [
  "console_error_panic_hook",
  "futures-util",
