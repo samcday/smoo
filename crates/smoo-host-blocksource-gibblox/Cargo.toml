@@ -9,5 +9,5 @@ description = { workspace = true }
 
 [dependencies]
 async-trait = { workspace = true }
-gibblox-core = { version = ">=0.0.1, <0.1.0-0" }
+gibblox-core = { version = ">=0.0.2-rc, <0.1.0-0" }
 smoo-host-core = { workspace = true }
