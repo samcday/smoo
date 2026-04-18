@@ -14,8 +14,8 @@ apkbuild = ["smoo-gadget-core/apkbuild"]
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
-smoo-gadget-core = { path = "../smoo-gadget-core", version = "0.0.1-rc.1", features = ["metrics"] }
-smoo-proto = { path = "../smoo-proto", version = "0.0.1-rc.1" }
+smoo-gadget-core = { workspace = true, features = ["metrics"] }
+smoo-proto = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time"] }
 tracing = "0.1.41"
 usb-gadget = { workspace = true, features = ["tokio"] }

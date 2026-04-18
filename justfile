@@ -24,8 +24,9 @@ bump version:
 
     echo "Bumping smoo to $version"
 
-    # Cargo.toml workspace version
+    # Cargo.toml workspace version + internal workspace.dependencies pins
     sed -i "s/^version = \".*\"/version = \"${cargo_version}\"/" Cargo.toml
+    sed -i -E "s|^(smoo-[a-zA-Z0-9_-]+ = \\{ path = \"[^\"]+\", version = )\"[^\"]+\"|\\1\"${cargo_version}\"|" Cargo.toml
 
     # RPM spec
     sed -i "s/^Version:        .*/Version:        ${package_version}/" smoo.spec

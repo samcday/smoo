@@ -29,12 +29,12 @@ async-trait = { workspace = true }
 clap = { workspace = true }
 hyper = { workspace = true, features = ["server", "http1", "tcp"] }
 metrics-exporter-prometheus = { workspace = true, features = ["http-listener"] }
-smoo-host-blocksource-http = { path = "../../crates/smoo-host-blocksource-http", version = "0.0.1-rc.1" }
-smoo-host-blocksources = { path = "../../crates/smoo-host-blocksources", version = "0.0.1-rc.1" }
-smoo-host-core = { path = "../../crates/smoo-host-core", version = "0.0.1-rc.1", features = ["metrics"] }
-smoo-host-session = { path = "../../crates/smoo-host-session", version = "0.0.1-rc.1" }
-smoo-host-transport-rusb = { path = "../../crates/smoo-host-transport-rusb", version = "0.0.1-rc.1" }
-smoo-proto = { path = "../../crates/smoo-proto", version = "0.0.1-rc.1" }
+smoo-host-blocksource-http = { workspace = true }
+smoo-host-blocksources = { workspace = true }
+smoo-host-core = { workspace = true, features = ["metrics"] }
+smoo-host-session = { workspace = true }
+smoo-host-transport-rusb = { workspace = true }
+smoo-proto = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time"] }
 tokio-util = { workspace = true }
 tracing = "0.1.41"

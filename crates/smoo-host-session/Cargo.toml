@@ -12,5 +12,5 @@ default = []
 
 [dependencies]
 futures-util = { workspace = true, features = ["alloc", "async-await", "async-await-macro"] }
-smoo-host-core = { path = "../smoo-host-core", version = "0.0.1-rc.1", default-features = false }
-smoo-proto = { path = "../smoo-proto", version = "0.0.1-rc.1" }
+smoo-host-core = { workspace = true }
+smoo-proto = { workspace = true }

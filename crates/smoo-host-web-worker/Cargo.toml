@@ -13,10 +13,10 @@ futures-util = { workspace = true, features = ["alloc", "async-await", "async-aw
 gloo-timers = { version = "0.3.0", features = ["futures"] }
 gibblox-blockreader-messageport = { version = ">=0.0.1, <0.1.0-0" }
 gibblox-core = { version = ">=0.0.1, <0.1.0-0" }
-smoo-host-blocksource-gibblox = { path = "../smoo-host-blocksource-gibblox", version = "0.0.1-rc.1" }
-smoo-host-core = { path = "../smoo-host-core", version = "0.0.1-rc.1" }
-smoo-host-session = { path = "../smoo-host-session", version = "0.0.1-rc.1" }
-smoo-host-webusb = { path = "../smoo-host-webusb", version = "0.0.1-rc.1" }
+smoo-host-blocksource-gibblox = { workspace = true }
+smoo-host-core = { workspace = true }
+smoo-host-session = { workspace = true }
+smoo-host-webusb = { workspace = true }
 tracing = "0.1.41"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
