@@ -37,3 +37,4 @@ smoo-host-session = { path = "crates/smoo-host-session", version = "0.0.2-rc.3" 
 smoo-host-transport-rusb = { path = "crates/smoo-host-transport-rusb", version = "0.0.2-rc.3" }
 smoo-host-webusb = { path = "crates/smoo-host-webusb", version = "0.0.2-rc.3" }
 smoo-proto = { path = "crates/smoo-proto", version = "0.0.2-rc.3" }
+smoo-test-harness = { path = "crates/smoo-test-harness", version = "0.0.2-rc.3" }

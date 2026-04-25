@@ -2176,6 +2176,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "smoo-test-harness"
+version = "0.0.2-rc.3"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "futures-util",
+ "libc 0.2.185",
+ "nix 0.30.1",
+ "regex",
+ "serde",
+ "serde_json",
+ "smoo-host-blocksources",
+ "smoo-host-core",
+ "smoo-proto",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "socket2"
 version = "0.5.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
