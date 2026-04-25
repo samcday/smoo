@@ -1,0 +1,64 @@
+name: integration-spike
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/integration-spike.yml
+  workflow_dispatch:
+
+jobs:
+  modprobe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Show kernel
+        run: uname -a
+
+      - name: Install linux-modules-extra and capture tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            linux-modules-extra-$(uname -r) \
+            tshark \
+            wireshark-common \
+            fio
+
+      - name: Probe baseline modules
+        run: |
+          sudo modprobe configfs
+          sudo modprobe libcomposite
+          sudo modprobe usb_f_fs
+          sudo modprobe ublk_drv
+          sudo modprobe usbmon
+
+      - name: Probe dummy_hcd
+        run: sudo modprobe dummy_hcd num_instances=4
+
+      - name: Inspect resulting kernel state
+        run: |
+          echo "--- /sys/class/udc ---"
+          ls -la /sys/class/udc/ || true
+          echo "--- /sys/bus/usb/devices ---"
+          ls -la /sys/bus/usb/devices/ || true
+          echo "--- usbmon devices ---"
+          ls -la /sys/kernel/debug/usb/usbmon/ 2>/dev/null || ls -la /dev/usbmon* 2>/dev/null || true
+          echo "--- ublk control device ---"
+          ls -la /dev/ublk-control 2>/dev/null || true
+          echo "--- /sys/kernel/debug/usb/devices ---"
+          sudo cat /sys/kernel/debug/usb/devices 2>/dev/null | head -80 || true
+
+      - name: Verify required tools on PATH
+        run: |
+          which tshark
+          which dumpcap
+          which fio
+          tshark --version | head -1
+          fio --version
+
+      - name: Verify dummy_hcd UDC slot is present
+        run: |
+          if [ ! -e /sys/class/udc/dummy_udc.0 ]; then
+            echo "FAIL: dummy_udc.0 did not appear after modprobe dummy_hcd"
+            exit 1
+          fi
+          echo "OK: dummy_udc.0 present"
