@@ -242,10 +242,30 @@ Failure to service ep0 promptly leads to EP0 STALL + possible gadget reset.
 
 * Toolchain: Rust stable (MSRV 1.88)
 * Logging: `tracing`
-* Tests: `cargo test --all`
+* Unit tests: `cargo test --workspace --locked` — uses mock transports.
+* Integration tests: `crates/smoo-test-harness/` drives a real
+  `smoo-gadget` ↔ `smoo-host` session over `dummy_hcd` loopback with
+  per-scenario `usbmon` capture (`.pcapng` + logs landed under
+  `target/integration-artifacts/<test>/`).
 
-  * uses mock transports
-  * USB loopback via `dummy_hcd`
+  Local quick-start:
+
+      cargo xtask check-test-infra      # diagnostic
+      cargo xtask test-infra-setup      # one-time per boot (sudo)
+      cargo xtask integration           # runs all scenarios
+
+  Each scenario is a `#[tokio::test]` in `crates/smoo-test-harness/tests/`.
+  v1 ships `smoke` (handshake + 1 R/W) and `rw_modest` (fio randwrite-
+  with-md5 against the resulting `/dev/ublkbN`). On failure the artifact
+  bundle is the source of truth — open `capture.pcapng` with the
+  dissector at `tools/wireshark/smoo.lua` to triage wire-level issues.
+
+  CI runs the same flow (`.github/workflows/integration-tests.yml`) on a
+  self-hosted runner tagged `[self-hosted, linux, dummy-hcd]`.
+  GitHub-hosted `ubuntu-24.04` runners ship the Azure kernel without
+  `CONFIG_USB_DUMMY_HCD` (verified in PR #41) — that's why the workflow
+  targets self-hosted infra.
+
 * CLIs are thin wrappers; logic in libraries
 * Agents MUST uphold:
 

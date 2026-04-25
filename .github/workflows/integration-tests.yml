@@ -1,0 +1,40 @@
+name: integration-tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: integration-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  integration:
+    # GitHub-hosted ubuntu-24.04 runners boot the Azure VM kernel which
+    # ships without CONFIG_USB_DUMMY_HCD — confirmed in PR #41. The harness
+    # therefore targets a self-hosted runner with a kernel that has
+    # dummy_hcd / ublk_drv / usbmon. Tag the runner with `dummy-hcd` to
+    # mark eligibility.
+    runs-on: [self-hosted, linux, dummy-hcd]
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Pre-flight checks
+        run: cargo xtask check-test-infra
+
+      - name: Run integration tests
+        run: cargo xtask integration
+
+      - if: failure()
+        name: Upload artifact bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-artifacts-${{ github.run_id }}
+          path: target/integration-artifacts/**
+          retention-days: 14

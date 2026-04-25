@@ -4,6 +4,7 @@ rustflags = ["--cfg=web_sys_unstable_apis"]
 [alias]
 gadget-musl-aarch64 = ["build", "-p", "smoo-gadget-cli", "--release", "--target", "aarch64-unknown-linux-musl"]
 gadget-musl-x86_64 = ["build", "-p", "smoo-gadget-cli", "--release", "--target", "x86_64-unknown-linux-musl"]
+xtask = ["run", "--quiet", "--package", "xtask", "--"]
 
 [target.aarch64-unknown-linux-musl]
 linker = "rust-lld"
