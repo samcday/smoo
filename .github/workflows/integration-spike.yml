@@ -23,13 +23,21 @@ jobs:
             wireshark-common \
             fio
 
-      - name: Probe baseline modules
+      - name: Probe modules (built-in modules report 'not found' — that's fine)
         run: |
-          sudo modprobe configfs
-          sudo modprobe libcomposite
-          sudo modprobe usb_f_fs
-          sudo modprobe ublk_drv
-          sudo modprobe usbmon
+          set +e
+          for mod in configfs libcomposite usb_f_fs ublk_drv usbmon; do
+            out=$(sudo modprobe "$mod" 2>&1)
+            rc=$?
+            if [ $rc -eq 0 ]; then
+              echo "OK:    $mod loaded (or was already)"
+            elif echo "$out" | grep -q "not found"; then
+              echo "INFO:  $mod not a module (likely built-in =y, capability check below decides)"
+            else
+              echo "FAIL:  $mod modprobe failed: $out"
+              exit 1
+            fi
+          done
 
       - name: Probe dummy_hcd
         run: sudo modprobe dummy_hcd num_instances=4
@@ -39,13 +47,16 @@ jobs:
           echo "--- /sys/class/udc ---"
           ls -la /sys/class/udc/ || true
           echo "--- /sys/bus/usb/devices ---"
-          ls -la /sys/bus/usb/devices/ || true
+          ls -la /sys/bus/usb/devices/ | head -30 || true
           echo "--- usbmon devices ---"
           ls -la /sys/kernel/debug/usb/usbmon/ 2>/dev/null || ls -la /dev/usbmon* 2>/dev/null || true
           echo "--- ublk control device ---"
           ls -la /dev/ublk-control 2>/dev/null || true
-          echo "--- /sys/kernel/debug/usb/devices ---"
-          sudo cat /sys/kernel/debug/usb/devices 2>/dev/null | head -80 || true
+          echo "--- configfs mount ---"
+          mount | grep configfs || sudo mount -t configfs none /sys/kernel/config 2>&1 || true
+          ls -la /sys/kernel/config/ 2>/dev/null || true
+          echo "--- /lib/modules dummy_hcd ---"
+          find /lib/modules/$(uname -r) -name 'dummy_hcd*' 2>/dev/null || true
 
       - name: Verify required tools on PATH
         run: |
@@ -53,12 +64,56 @@ jobs:
           which dumpcap
           which fio
           tshark --version | head -1
-          fio --version
+          fio --version | head -1
 
-      - name: Verify dummy_hcd UDC slot is present
+      - name: Capability check (the actual gate)
         run: |
+          fail=0
+
+          # dummy_hcd: did a UDC appear?
           if [ ! -e /sys/class/udc/dummy_udc.0 ]; then
             echo "FAIL: dummy_udc.0 did not appear after modprobe dummy_hcd"
-            exit 1
+            fail=1
+          else
+            echo "OK:   dummy_udc.0 present"
           fi
-          echo "OK: dummy_udc.0 present"
+
+          # configfs: mountpoint exists?
+          if [ ! -d /sys/kernel/config ]; then
+            echo "FAIL: /sys/kernel/config not present (configfs unavailable)"
+            fail=1
+          else
+            echo "OK:   /sys/kernel/config present"
+          fi
+
+          # usb_gadget configfs subsys: needed for our gadget setup
+          if [ ! -d /sys/kernel/config/usb_gadget ]; then
+            echo "INFO: /sys/kernel/config/usb_gadget missing — try modprobe libcomposite"
+            sudo modprobe libcomposite 2>/dev/null || true
+            if [ ! -d /sys/kernel/config/usb_gadget ]; then
+              echo "FAIL: /sys/kernel/config/usb_gadget still missing"
+              fail=1
+            else
+              echo "OK:   /sys/kernel/config/usb_gadget present after retry"
+            fi
+          else
+            echo "OK:   /sys/kernel/config/usb_gadget present"
+          fi
+
+          # ublk control device
+          if [ ! -e /dev/ublk-control ]; then
+            echo "FAIL: /dev/ublk-control missing"
+            fail=1
+          else
+            echo "OK:   /dev/ublk-control present"
+          fi
+
+          # usbmon: should expose a debugfs interface or /dev/usbmon*
+          if [ ! -d /sys/kernel/debug/usb/usbmon ] && ! ls /dev/usbmon* >/dev/null 2>&1; then
+            echo "FAIL: usbmon interface not present"
+            fail=1
+          else
+            echo "OK:   usbmon interface present"
+          fi
+
+          exit $fail
