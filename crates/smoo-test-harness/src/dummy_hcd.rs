@@ -7,10 +7,9 @@
 
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
-use parking_lot_compat::Mutex;
 
 /// Default number of `dummy_hcd` instances expected. Matches `just
 /// test-infra-setup` (`modprobe dummy_hcd num_instances=4`).
@@ -60,7 +59,10 @@ impl std::fmt::Debug for Slot {
 
 impl Drop for Slot {
     fn drop(&mut self) {
-        self.pool.lock().release(self.udc_idx);
+        self.pool
+            .lock()
+            .expect("slot pool mutex poisoned")
+            .release(self.udc_idx);
     }
 }
 
@@ -93,16 +95,19 @@ impl SlotPool {
     }
 }
 
+fn lock_pool(pool: &Mutex<SlotPool>) -> std::sync::MutexGuard<'_, SlotPool> {
+    pool.lock().expect("slot pool mutex poisoned")
+}
+
 /// Reserve one slot from the pool. Verifies that `dummy_udc.<idx>` and the
 /// matching HCD bus are present before returning; releases on probe failure.
 pub fn allocate_slot(pool: &Arc<Mutex<SlotPool>>) -> Result<Slot> {
-    let idx = pool
-        .lock()
+    let idx = lock_pool(pool)
         .try_take()
         .ok_or_else(|| anyhow::anyhow!("no free dummy_hcd slot — increase num_instances?"))?;
 
     if !udc_present(idx) {
-        pool.lock().release(idx);
+        lock_pool(pool).release(idx);
         bail!(
             "dummy_udc.{} not present in /sys/class/udc — is dummy_hcd loaded?",
             idx
@@ -111,7 +116,7 @@ pub fn allocate_slot(pool: &Arc<Mutex<SlotPool>>) -> Result<Slot> {
     let bus_id = match bus_for_hcd(idx) {
         Ok(bus) => bus,
         Err(err) => {
-            pool.lock().release(idx);
+            lock_pool(pool).release(idx);
             return Err(err.context(format!("resolve bus for dummy_hcd.{idx}")));
         }
     };
@@ -190,39 +195,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pool_allocates_and_releases_unique_indices() {
-        let pool = Arc::new(Mutex::new(SlotPool::new(2)));
-        // We can't actually call SlotPool::allocate without dummy_hcd loaded,
-        // so test the lower-level invariants directly.
-        let mut guard = pool.lock();
-        assert!(!guard.in_use[0] && !guard.in_use[1]);
-        guard.in_use[0] = true;
-        assert!(guard.in_use[0]);
-        guard.release(0);
-        assert!(!guard.in_use[0]);
-    }
-}
-
-mod parking_lot_compat {
-    //! Trivial Mutex wrapper that panics-on-poison instead of returning a Result,
-    //! matching parking_lot semantics without the dep.
-
-    use std::sync::{Mutex as StdMutex, MutexGuard};
-
-    pub struct Mutex<T>(StdMutex<T>);
-
-    impl<T> Mutex<T> {
-        pub fn new(value: T) -> Self {
-            Self(StdMutex::new(value))
-        }
-        pub fn lock(&self) -> MutexGuard<'_, T> {
-            self.0.lock().expect("test-harness mutex poisoned")
-        }
-    }
-
-    impl<T: std::fmt::Debug> std::fmt::Debug for Mutex<T> {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            self.0.fmt(f)
-        }
+    fn pool_try_take_and_release() {
+        let mut pool = SlotPool::new(2);
+        assert_eq!(pool.try_take(), Some(0));
+        assert_eq!(pool.try_take(), Some(1));
+        assert_eq!(pool.try_take(), None);
+        pool.release(0);
+        assert_eq!(pool.try_take(), Some(0));
     }
 }
