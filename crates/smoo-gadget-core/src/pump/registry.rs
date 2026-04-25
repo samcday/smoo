@@ -64,6 +64,7 @@ impl<V> InFlightRegistry<V> {
         state.pending.drain().map(|(_, v)| v).collect()
     }
 
+    #[allow(dead_code)] // used by tests; useful for future metrics/debug
     pub(crate) fn len(&self) -> usize {
         self.state
             .lock()
