@@ -2110,6 +2110,7 @@ dependencies = [
  "futures-util",
  "smoo-host-core",
  "smoo-proto",
+ "tracing",
 ]
 
 [[package]]
