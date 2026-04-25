@@ -10,6 +10,7 @@ pub mod heartbeat;
 pub mod host;
 #[cfg(feature = "metrics")]
 pub mod metrics;
+pub mod pump;
 pub mod transport;
 
 pub use block::{
