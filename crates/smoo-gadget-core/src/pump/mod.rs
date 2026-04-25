@@ -50,6 +50,14 @@ use tokio::{
 };
 use tracing::{debug, trace, warn};
 
+#[cfg(feature = "metrics")]
+fn observe_inflight(registry: &InFlightRegistry<InFlightEntry>) {
+    crate::metrics::record_inflight_requests(registry.len());
+}
+
+#[cfg(not(feature = "metrics"))]
+fn observe_inflight(_registry: &InFlightRegistry<InFlightEntry>) {}
+
 /// Work item executed by the I/O pump.
 pub struct IoWork {
     pub ublk_request: UblkIoRequest,
@@ -261,6 +269,7 @@ async fn interrupt_in_writer(
             // Entry dropped — completion oneshot drop signals submit caller.
             continue;
         }
+        observe_inflight(&registry);
 
         trace!(
             export_id = request.export_id,
@@ -342,6 +351,7 @@ async fn handle_response(
         );
         return Ok(());
     };
+    observe_inflight(registry);
 
     if response.op != entry.work.op {
         let msg = format!(
