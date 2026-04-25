@@ -1,4 +1,13 @@
 //! Serialized gadget-side I/O pump.
+//!
+//! `registry` and `state` are foundation submodules that the upcoming
+//! pipelined rewrite will use; they're defined now so they get test coverage
+//! ahead of the larger refactor.
+
+#[allow(dead_code)] // wired up by the upcoming pipelined pump
+mod registry;
+#[allow(dead_code)]
+mod state;
 
 use crate::{SmooGadget, UblkIoRequest, UblkQueueRuntime};
 use anyhow::{Result, anyhow};
