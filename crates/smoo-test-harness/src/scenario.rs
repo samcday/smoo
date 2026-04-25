@@ -128,13 +128,21 @@ impl ScenarioBuilder {
         }
 
         // Start capture before UDC bind so IDENT/CONFIG_EXPORTS land in the pcap.
-        let capture = if self.capture_enabled {
+        // If `dumpcap` isn't on PATH (common on minimal/bootc systems), skip
+        // capture with a warning rather than failing — pcap assertions then
+        // become no-ops in `assert_clean`.
+        let capture = if self.capture_enabled && capture_available() {
             Some(
                 CaptureSession::start(slot.bus_id, artifacts.pcap_path(), artifacts.log_dir())
                     .await
                     .context("start capture")?,
             )
         } else {
+            if self.capture_enabled {
+                tracing::warn!(
+                    "dumpcap not on PATH; running without packet capture (install wireshark-cli for wire-level assertions)"
+                );
+            }
             None
         };
 
@@ -323,6 +331,21 @@ fn check_exit(name: &str, status: ExitStatus) -> Result<()> {
 async fn analyse_pcap(pcap: &Path) -> Result<PcapAssertions> {
     let lua = workspace_path("tools/wireshark/smoo.lua")?;
     PcapAssertions::from_pcap(pcap, &lua).await
+}
+
+fn capture_available() -> bool {
+    which("dumpcap").is_some()
+}
+
+fn which(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 fn default_artifact_root() -> PathBuf {

@@ -110,10 +110,12 @@ impl GadgetFixture {
 
         // Wait for the gadget to log readiness — fires from
         // crates/smoo-gadget-app/src/lib.rs:193 after FunctionFS descriptors
-        // have been written and ep1-4 opened.
+        // have been written and ep1-4 opened. The CLI's tracing-subscriber
+        // writes to stdout by default; use either stream so this works
+        // regardless of how a future caller configures it.
         let re = Regex::new(r"smoo gadget initialized").unwrap();
         child
-            .wait_for_stderr(&re, opts.readiness_timeout)
+            .wait_for_either(&re, opts.readiness_timeout)
             .await
             .context("waiting for 'smoo gadget initialized'")?;
 
@@ -126,10 +128,10 @@ impl GadgetFixture {
         })
     }
 
-    /// Wait for the gadget to log a regex-matching line on stderr. Useful for
-    /// tests that need to observe e.g. ublk dev_id assignment.
+    /// Wait for the gadget to log a regex-matching line on either stream.
+    /// Useful for tests that need to observe e.g. ublk dev_id assignment.
     pub async fn wait_for_log(&self, re: &Regex, timeout: Duration) -> Result<String> {
-        self.child.wait_for_stderr(re, timeout).await
+        self.child.wait_for_either(re, timeout).await
     }
 
     /// Wait for the `start_dev completed` log line (emitted by
@@ -137,7 +139,7 @@ impl GadgetFixture {
     /// associated `dev_id`. The corresponding block device is `/dev/ublkb<id>`.
     pub async fn wait_for_ublk_dev_id(&self, timeout: Duration) -> Result<u32> {
         let line_re = Regex::new(r"start_dev completed").unwrap();
-        let line = self.child.wait_for_stderr(&line_re, timeout).await?;
+        let line = self.child.wait_for_either(&line_re, timeout).await?;
         let id_re = Regex::new(r"dev_id=(\d+)").unwrap();
         let caps = id_re.captures(&line).ok_or_else(|| {
             anyhow::anyhow!("'start_dev completed' line had no dev_id field: {line}")
@@ -240,10 +242,10 @@ impl HostFixture {
         Ok(Self { child })
     }
 
-    /// Wait for the host to log a regex match on stderr. Tests use this to
-    /// assert "session connected" or similar.
+    /// Wait for the host to log a regex match on either stream. Tests use
+    /// this to assert "session connected" or similar.
     pub async fn wait_for_log(&self, re: &Regex, timeout: Duration) -> Result<String> {
-        self.child.wait_for_stderr(re, timeout).await
+        self.child.wait_for_either(re, timeout).await
     }
 
     pub async fn shutdown(self) -> Result<ExitStatus> {
