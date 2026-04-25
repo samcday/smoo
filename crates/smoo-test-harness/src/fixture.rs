@@ -132,6 +132,22 @@ impl GadgetFixture {
         self.child.wait_for_stderr(re, timeout).await
     }
 
+    /// Wait for the `start_dev completed` log line (emitted by
+    /// `smoo-gadget-ublk` after `UBLK_CMD_START_DEV` succeeds) and parse the
+    /// associated `dev_id`. The corresponding block device is `/dev/ublkb<id>`.
+    pub async fn wait_for_ublk_dev_id(&self, timeout: Duration) -> Result<u32> {
+        let line_re = Regex::new(r"start_dev completed").unwrap();
+        let line = self.child.wait_for_stderr(&line_re, timeout).await?;
+        let id_re = Regex::new(r"dev_id=(\d+)").unwrap();
+        let caps = id_re.captures(&line).ok_or_else(|| {
+            anyhow::anyhow!("'start_dev completed' line had no dev_id field: {line}")
+        })?;
+        let id: u32 = caps[1]
+            .parse()
+            .context("parse dev_id from gadget log")?;
+        Ok(id)
+    }
+
     /// SIGTERM the gadget, wait, then drop configfs (which umounts FFS and
     /// rmdir's the gadget tree).
     pub async fn shutdown(self) -> Result<ExitStatus> {

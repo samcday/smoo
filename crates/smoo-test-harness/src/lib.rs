@@ -19,3 +19,13 @@ pub mod fixture;
 pub mod process;
 pub mod scenario;
 pub mod verify;
+
+pub use artifacts::{ArtifactBundle, ExitInfo, Metadata, OpMixSer};
+pub use capture::CaptureSession;
+pub use dummy_hcd::Slot;
+pub use fixture::{
+    GadgetFixture, GadgetOpts, HostFixture, HostOpts, HostSourceSpec, KernelFixture,
+};
+pub use scenario::{ExportSpec, RunningScenario, ScenarioBuilder, ScenarioResult};
+pub use verify::block_pattern::BlockPatternVerifier;
+pub use verify::pcap::{OpMix, PcapAssertions};
