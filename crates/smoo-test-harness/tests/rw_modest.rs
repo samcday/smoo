@@ -46,7 +46,8 @@ async fn rw_modest() -> Result<()> {
     common::wait_for_block_device(&dev_path, Duration::from_secs(5)).await?;
 
     let mut cmd = Command::new("fio");
-    cmd.arg(format!("--filename={}", dev_path.display()))
+    cmd.current_dir(tmp.path()) // fio writes its verify-state file in CWD
+        .arg(format!("--filename={}", dev_path.display()))
         .arg("--name=integrity")
         .arg("--rw=randwrite")
         .arg("--bs=4k")

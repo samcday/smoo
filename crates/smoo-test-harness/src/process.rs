@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -17,6 +17,12 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
+
+fn strip_ansi(s: &str) -> String {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]").unwrap());
+    re.replace_all(s, "").into_owned()
+}
 
 /// Default per-stream log buffer cap. Lines beyond this drop the oldest.
 const RING_CAP: usize = 8192;
@@ -235,11 +241,12 @@ async fn pump_stream<R: AsyncRead + Unpin>(
     loop {
         match reader.next_line().await {
             Ok(Some(line)) => {
-                if let Err(err) = file.write_all(line.as_bytes()).await {
+                let stripped = strip_ansi(&line);
+                if let Err(err) = file.write_all(stripped.as_bytes()).await {
                     tracing::warn!(label = %label, error = %err, "log write failed");
                 }
                 let _ = file.write_all(b"\n").await;
-                buf.push(line).await;
+                buf.push(stripped).await;
             }
             Ok(None) => break,
             Err(err) => {
@@ -255,6 +262,12 @@ async fn pump_stream<R: AsyncRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_ansi_removes_colors() {
+        let raw = "\x1b[2m2026-04-26\x1b[0m \x1b[32m INFO\x1b[0m foo: dev_id=\x1b[0m0";
+        assert_eq!(strip_ansi(raw), "2026-04-26  INFO foo: dev_id=0");
+    }
 
     #[tokio::test]
     async fn buffer_matches_existing_line() {
