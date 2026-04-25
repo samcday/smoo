@@ -47,6 +47,7 @@ impl PumpStateHandle {
         self.transition(PumpState::Shutdown)
     }
 
+    #[allow(dead_code)] // used by tests; readers in workers go through state_rx
     pub(crate) fn current(&self) -> PumpState {
         *self.tx.borrow()
     }

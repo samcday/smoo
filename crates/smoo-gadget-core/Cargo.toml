@@ -24,7 +24,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = "1.0.132"
 smoo-proto = { workspace = true }
 smoo-gadget-ublk = { workspace = true }
-tokio = { workspace = true, features = ["fs", "io-util", "rt", "sync"] }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt", "sync"] }
 tracing = "0.1.41"
 async-trait = { workspace = true }
 usb-gadget = { workspace = true, features = ["tokio"] }
