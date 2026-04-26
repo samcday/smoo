@@ -607,7 +607,6 @@ impl GadgetDataPlane {
             .await
             .map_err(|err| anyhow!("dma-buf transfer task failed: {err}"))?
     }
-
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -62,7 +62,7 @@ async fn rw_modest() -> Result<()> {
         .arg("--time_based=0");
 
     let status = run_tool(&sc, "fio", cmd).await.context("run fio")?;
-    ensure!(status.success(), "fio exited {:?}", status);
+    ensure!(status.success(), "fio exited {status:?}");
 
     let result = sc.stop().await?;
     result.assert_clean().await?;
