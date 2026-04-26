@@ -66,11 +66,7 @@ impl<V> InFlightRegistry<V> {
 
     #[allow(dead_code)] // used by tests; useful for future metrics/debug
     pub(crate) fn len(&self) -> usize {
-        self.state
-            .lock()
-            .expect("registry poisoned")
-            .pending
-            .len()
+        self.state.lock().expect("registry poisoned").pending.len()
     }
 }
 

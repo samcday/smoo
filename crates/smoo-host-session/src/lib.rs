@@ -545,7 +545,8 @@ async fn handle_read(
     request: Request,
 ) -> Result<(), HandlerError> {
     let block_size = source.block_size();
-    let byte_len = blocks_to_bytes(request.num_blocks, block_size).map_err(HandlerError::Invalid)?;
+    let byte_len =
+        blocks_to_bytes(request.num_blocks, block_size).map_err(HandlerError::Invalid)?;
 
     if byte_len == 0 {
         let response = ok_response(&request, OpCode::Read);
@@ -598,7 +599,10 @@ async fn handle_write(
                 request.request_id
             ))
         })?;
-        handle.await_payload().await.map_err(HandlerError::Transport)?
+        handle
+            .await_payload()
+            .await
+            .map_err(HandlerError::Transport)?
     } else {
         Vec::new()
     };

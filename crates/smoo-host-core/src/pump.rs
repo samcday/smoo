@@ -122,16 +122,17 @@ where
     let (bulk_in_tx, bulk_in_rx) = mpsc::channel::<BulkInPending>(PUMP_CHANNEL_CAPACITY);
     let (bulk_out_tx, bulk_out_rx) = mpsc::channel::<BulkOutPending>(PUMP_CHANNEL_CAPACITY);
     let task = HostPumpTask {
-        inner: run_pump(transport, cmd_rx, req_tx, bulk_in_rx, bulk_out_tx, bulk_out_rx).boxed(),
+        inner: run_pump(
+            transport,
+            cmd_rx,
+            req_tx,
+            bulk_in_rx,
+            bulk_out_tx,
+            bulk_out_rx,
+        )
+        .boxed(),
     };
-    (
-        HostPumpHandle {
-            cmd_tx,
-            bulk_in_tx,
-        },
-        req_rx,
-        task,
-    )
+    (HostPumpHandle { cmd_tx, bulk_in_tx }, req_rx, task)
 }
 
 impl HostPumpHandle {
@@ -258,25 +259,19 @@ async fn run_interrupt_out_writer<T>(
             reply,
         } = cmd;
         let encoded = response.encode();
-        let interrupt_result: TransportResult<()> =
-            match transport.write_interrupt(&encoded).await {
-                Ok(written) if written == RESPONSE_LEN => Ok(()),
-                Ok(written) => Err(TransportError::with_message(
-                    TransportErrorKind::Protocol,
-                    format!(
-                        "response transfer truncated (expected {RESPONSE_LEN}, wrote {written})"
-                    ),
-                )),
-                Err(err) => Err(err),
-            };
+        let interrupt_result: TransportResult<()> = match transport.write_interrupt(&encoded).await
+        {
+            Ok(written) if written == RESPONSE_LEN => Ok(()),
+            Ok(written) => Err(TransportError::with_message(
+                TransportErrorKind::Protocol,
+                format!("response transfer truncated (expected {RESPONSE_LEN}, wrote {written})"),
+            )),
+            Err(err) => Err(err),
+        };
         let final_result = match interrupt_result {
             Ok(()) => match bulk_out {
                 Some(payload) => {
-                    if bulk_out_tx
-                        .send(BulkOutPending { payload })
-                        .await
-                        .is_err()
-                    {
+                    if bulk_out_tx.send(BulkOutPending { payload }).await.is_err() {
                         Err(disconnected_err())
                     } else {
                         Ok(())
