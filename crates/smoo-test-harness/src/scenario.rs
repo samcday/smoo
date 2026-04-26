@@ -321,6 +321,17 @@ impl ScenarioResult {
         self.pcap_path.as_deref()
     }
 
+    /// Parse the captured pcap and return the assertions handle for tests
+    /// that want to make extra wire-level claims (e.g. peak in-flight)
+    /// before calling [`Self::assert_clean`]. Returns `Ok(None)` if no pcap
+    /// was captured (typical when `dumpcap` isn't on PATH).
+    pub async fn pcap_assertions(&self) -> Result<Option<PcapAssertions>> {
+        match self.pcap_path.as_ref() {
+            Some(p) => Ok(Some(analyse_pcap(p).await?)),
+            None => Ok(None),
+        }
+    }
+
     /// Run all the standard checks: clean exits + balanced wire framing +
     /// no length-mismatch + no orphan bulks. Writes `metadata.json` either
     /// way.
