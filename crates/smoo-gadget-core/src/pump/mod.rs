@@ -164,11 +164,7 @@ struct BulkOutPending {
     read_len: usize,
 }
 
-async fn supervise(
-    gadget: Arc<SmooGadget>,
-    submit_rx: mpsc::Receiver<SubmitMsg>,
-    capacity: usize,
-) {
+async fn supervise(gadget: Arc<SmooGadget>, submit_rx: mpsc::Receiver<SubmitMsg>, capacity: usize) {
     let registry = Arc::new(InFlightRegistry::<InFlightEntry>::new());
     let (state_handle, state_rx) = PumpStateHandle::new();
     let (bulk_in_tx, bulk_in_rx) = mpsc::channel::<BulkInPending>(capacity);
@@ -459,7 +455,9 @@ async fn bulk_out_worker(
                 .await
         };
         if let Err(err) = xfer_result {
-            let _ = entry.completion.send(Err(err.context("bulk OUT read failed")));
+            let _ = entry
+                .completion
+                .send(Err(err.context("bulk OUT read failed")));
             state.fault();
             break;
         }
