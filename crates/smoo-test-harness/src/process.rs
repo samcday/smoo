@@ -48,7 +48,7 @@ impl LogBuffer {
         self.notify.notify_waiters();
     }
 
-    fn close(&self) {
+    pub(crate) fn close(&self) {
         self.closed.store(true, Ordering::Release);
         self.notify.notify_waiters();
     }
@@ -222,7 +222,7 @@ impl ChildProcess {
     }
 }
 
-async fn pump_stream<R: AsyncRead + Unpin>(
+pub(crate) async fn pump_stream<R: AsyncRead + Unpin>(
     src: R,
     path: PathBuf,
     buf: Arc<LogBuffer>,
