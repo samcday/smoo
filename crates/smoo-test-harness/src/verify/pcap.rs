@@ -10,6 +10,17 @@
 //! and `smoo.bulk.orphan` when the corresponding condition fires (see
 //! `tools/wireshark/smoo.lua:253-260`), so we use *field presence* as the
 //! signal — independent of how tshark serialises a boolean ProtoField.
+//!
+//! ## Privilege drop
+//!
+//! tshark refuses to load Lua scripts when running as uid 0 — the postdissector
+//! never registers, and `-Y "smoo"` then fails with "not a valid protocol".
+//! When the harness is invoked under sudo (typical: `cargo xtask integration`
+//! shells out to `sudo cargo test`), we honour `$SUDO_USER` and re-exec
+//! tshark via `sudo -u <user>`. The pcap file is created world-readable by
+//! [`crate::capture`], and the artifact dir lives under `target/` which is
+//! traversable by the original user, so the dropped-privilege tshark can read
+//! it without further chown gymnastics.
 
 use std::path::{Path, PathBuf};
 
@@ -44,18 +55,16 @@ pub struct PcapAssertions {
 
 impl PcapAssertions {
     pub async fn from_pcap(pcap: &Path, lua: &Path) -> Result<Self> {
-        let output = Command::new("tshark")
-            .arg("-X")
+        let mut cmd = build_tshark_command();
+        cmd.arg("-X")
             .arg(format!("lua_script:{}", lua.display()))
             .arg("-r")
             .arg(pcap)
             .arg("-T")
             .arg("json")
             .arg("-Y")
-            .arg("smoo")
-            .output()
-            .await
-            .context("spawn tshark")?;
+            .arg("smoo");
+        let output = cmd.output().await.context("spawn tshark")?;
         if !output.status.success() {
             bail!(
                 "tshark failed (exit {:?}): {}",
@@ -117,17 +126,48 @@ impl PcapAssertions {
         Ok(())
     }
 
-    pub fn assert_request_response_balanced(&self) -> Result<()> {
+    /// Allow up to `tolerated_in_flight` unanswered requests at the tail of
+    /// the capture — those represent ublk requests that were issued just
+    /// before SIGTERM and never got a response. With ublk read-ahead, even a
+    /// "single block read" scenario can have 1+ in-flight at teardown. Set
+    /// this to your effective queue depth.
+    pub fn assert_request_response_balanced(&self, tolerated_in_flight: u64) -> Result<()> {
         let s = &self.summary;
-        if s.requests != s.responses {
+        if s.responses > s.requests {
             bail!(
-                "request/response imbalance: {} requests, {} responses",
+                "more responses than requests: {} requests, {} responses",
                 s.requests,
                 s.responses
             );
         }
+        let unanswered = s.requests - s.responses;
+        if unanswered > tolerated_in_flight {
+            bail!(
+                "request/response imbalance: {} requests, {} responses ({} unanswered, tolerance {})",
+                s.requests,
+                s.responses,
+                unanswered,
+                tolerated_in_flight
+            );
+        }
         Ok(())
     }
+}
+
+/// Build a `tshark` Command, dropping privileges to `$SUDO_USER` if we're
+/// running under sudo. tshark silently disables Lua scripts when uid==0; the
+/// smoo postdissector then never registers and `-Y "smoo"` errors out.
+fn build_tshark_command() -> Command {
+    if unsafe { libc::geteuid() } == 0
+        && let Ok(user) = std::env::var("SUDO_USER")
+        && !user.is_empty()
+        && user != "root"
+    {
+        let mut cmd = Command::new("sudo");
+        cmd.arg("-u").arg(user).arg("--").arg("tshark");
+        return cmd;
+    }
+    Command::new("tshark")
 }
 
 fn summarize(raw: &Value) -> Summary {

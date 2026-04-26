@@ -146,6 +146,7 @@ impl ScenarioBuilder {
             None
         };
 
+        let queue_depth = self.gadget_opts.queue_depth;
         let gadget = GadgetFixture::spawn(slot, self.gadget_opts.clone(), artifacts.log_dir())
             .await
             .context("spawn gadget fixture")?;
@@ -164,6 +165,7 @@ impl ScenarioBuilder {
             host: Some(host),
             capture,
             exports: self.exports,
+            queue_depth,
         })
     }
 }
@@ -176,6 +178,7 @@ pub struct RunningScenario {
     pub host: Option<HostFixture>,
     pub capture: Option<CaptureSession>,
     pub exports: Vec<ExportSpec>,
+    pub queue_depth: u32,
 }
 
 impl RunningScenario {
@@ -215,6 +218,7 @@ impl RunningScenario {
             host_exit,
             pcap_path: pcap,
             exports: self.exports,
+            queue_depth: self.queue_depth,
         })
     }
 }
@@ -226,6 +230,7 @@ pub struct ScenarioResult {
     pub host_exit: Option<ExitStatus>,
     pub pcap_path: Option<PathBuf>,
     pub exports: Vec<ExportSpec>,
+    pub queue_depth: u32,
 }
 
 impl ScenarioResult {
@@ -261,7 +266,9 @@ impl ScenarioResult {
                         failure_msg = Some(err.to_string());
                     } else if let Err(err) = assertions.assert_no_orphan_bulk() {
                         failure_msg = Some(err.to_string());
-                    } else if let Err(err) = assertions.assert_request_response_balanced() {
+                    } else if let Err(err) =
+                        assertions.assert_request_response_balanced(self.queue_depth as u64)
+                    {
                         failure_msg = Some(err.to_string());
                     }
                 }
