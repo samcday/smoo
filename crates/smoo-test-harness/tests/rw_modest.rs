@@ -2,9 +2,14 @@
 //! ublk device.
 //!
 //! Backing: a 16 MB tmpfs file on the host side (`HostSourceSpec::File`).
-//! Workload: `fio --rw=randwrite --bs=4k --io_size=8M --verify=md5 --do_verify=1`.
+//! Workload: `fio --rw=randwrite --bs=4k --io_size=8M --verify=md5 --do_verify=1
+//! --numjobs=2 --iodepth=16` against a gadget configured with `queue_count=2`,
+//! `queue_depth=16` — pushes the data path into pipelined territory rather
+//! than the serialised default.
+//!
 //! Asserts: fio exits 0, both processes shut down cleanly, pcap is balanced
-//! and free of length-mismatch / orphan bulks.
+//! and free of length-mismatch / orphan bulks, and pipelining was actually
+//! exercised on the wire (`peak_inflight >= 4`).
 
 mod common;
 
@@ -12,6 +17,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
+use smoo_test_harness::fixture::GadgetOpts;
 use smoo_test_harness::scenario::run_tool;
 use smoo_test_harness::{HostSourceSpec, ScenarioBuilder};
 use tokio::process::Command;
@@ -36,6 +42,11 @@ async fn rw_modest() -> Result<()> {
     let sc = ScenarioBuilder::new("rw_modest")
         .with_host_source(HostSourceSpec::File(backing.clone()))
         .with_block_size(BLOCK_SIZE)
+        .with_gadget_opts(GadgetOpts {
+            queue_count: 2,
+            queue_depth: 16,
+            ..GadgetOpts::default()
+        })
         .start()
         .await?;
 
@@ -53,7 +64,8 @@ async fn rw_modest() -> Result<()> {
         .arg("--rw=randwrite")
         .arg("--bs=4k")
         .arg("--io_size=8M")
-        .arg("--iodepth=8")
+        .arg("--numjobs=2")
+        .arg("--iodepth=16")
         .arg("--ioengine=libaio")
         .arg("--direct=1")
         .arg("--verify=md5")
@@ -65,6 +77,14 @@ async fn rw_modest() -> Result<()> {
     ensure!(status.success(), "fio exited {status:?}");
 
     let result = sc.stop().await?;
+    if let Some(pcap) = result.pcap_assertions().await? {
+        let peak = pcap.peak_inflight();
+        ensure!(
+            peak >= 4,
+            "rw_modest expected pipelined wire activity (peak_inflight >= 4), \
+             got {peak} — pipelining may have regressed to serial"
+        );
+    }
     result.assert_clean().await?;
     Ok(())
 }
