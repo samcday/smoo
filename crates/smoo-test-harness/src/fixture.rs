@@ -141,13 +141,44 @@ impl GadgetFixture {
     /// `smoo-gadget-ublk` after `UBLK_CMD_START_DEV` succeeds) and parse the
     /// associated `dev_id`. The corresponding block device is `/dev/ublkb<id>`.
     pub async fn wait_for_ublk_dev_id(&self, timeout: Duration) -> Result<u32> {
-        let line_re = Regex::new(r"start_dev completed").unwrap();
-        let line = self.child.wait_for_either(&line_re, timeout).await?;
-        let id_re = Regex::new(r"dev_id=(\d+)").unwrap();
-        let caps = id_re.captures(&line).ok_or_else(|| {
-            anyhow::anyhow!("'start_dev completed' line had no dev_id field: {line}")
-        })?;
-        let id: u32 = caps[1].parse().context("parse dev_id from gadget log")?;
+        let ids = self.wait_for_ublk_dev_ids(1, timeout).await?;
+        Ok(ids[0])
+    }
+
+    /// Wait for `count` distinct `start_dev completed dev_id=<N>` lines from
+    /// the gadget (one per export). Returns the dev_ids in the order they
+    /// appeared. Each kernel-assigned id corresponds to `/dev/ublkb<id>`.
+    pub async fn wait_for_ublk_dev_ids(&self, count: usize, timeout: Duration) -> Result<Vec<u32>> {
+        let id_re = Regex::new(r"start_dev completed.*dev_id=(\d+)").unwrap();
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let mut ids: Vec<u32> = Vec::with_capacity(count);
+            let stdout = self.child.stdout_buf.snapshot().await;
+            let stderr = self.child.stderr_buf.snapshot().await;
+            for line in stdout.iter().chain(stderr.iter()) {
+                if let Some(caps) = id_re.captures(line)
+                    && let Ok(id) = caps[1].parse::<u32>()
+                    && !ids.contains(&id)
+                {
+                    ids.push(id);
+                    self.remember_ublk_dev_id(id);
+                    if ids.len() == count {
+                        return Ok(ids);
+                    }
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "timed out waiting for {count} ublk dev_ids ({} seen so far: {:?})",
+                    ids.len(),
+                    ids
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    fn remember_ublk_dev_id(&self, id: u32) {
         let mut observed = self
             .observed_ublk_dev_ids
             .lock()
@@ -155,7 +186,6 @@ impl GadgetFixture {
         if !observed.contains(&id) {
             observed.push(id);
         }
-        Ok(id)
     }
 
     pub fn observed_ublk_dev_ids(&self) -> Vec<u32> {
