@@ -43,11 +43,14 @@ pf.cfg_size_bytes = ProtoField.uint64("smoo.config.size_bytes", "SMOO Size Bytes
 
 pf.note = ProtoField.string("smoo.note", "SMOO Note")
 
+-- The dissector identifies endpoints by transfer type + direction (the high
+-- bit of the endpoint address) rather than fixed addresses. FunctionFS
+-- assigns endpoint numbers based on UDC capabilities, so addresses vary
+-- across hardware (real UDCs vs `dummy_hcd`). This is safe because the smoo
+-- interface descriptor only declares one IN/OUT pair per transfer type, and
+-- non-smoo traffic on shared interrupt endpoints (e.g. hub status) won't
+-- parse as a 28-byte SMOO Request/Response.
 local CONFIG = {
-    interrupt_in = 0x81,
-    interrupt_out = 0x01,
-    bulk_in = 0x82,
-    bulk_out = 0x02,
     default_block_size = 4096,
     config_exports_req_type = 0x41,
     config_exports_request = 0x02,
@@ -58,9 +61,33 @@ local f_transfer = Field.new("usb.transfer_type")
 local f_capdata = Field.new("usb.capdata")
 local f_bus = Field.new("usb.bus_id")
 local f_dev = Field.new("usb.device_address")
-local f_ctrl_req = Field.new("usb.control.bRequest")
-local f_ctrl_type = Field.new("usb.control.bmRequestType")
+local f_ctrl_req = Field.new("usb.setup.bRequest")
+local f_ctrl_type = Field.new("usb.bmRequestType")
 local f_len = Field.new("usb.data_len")
+local f_urb_type = Field.new("usb.urb_type")
+
+-- usbmon emits *two* frames per URB: 'S' (submit) and 'C' (complete). Data
+-- only travels with one of them, depending on direction:
+--   * IN endpoints: 'S' has no data; 'C' carries the bytes returned by the
+--     device.
+--   * OUT endpoints: 'S' carries the bytes being sent; 'C' is just status.
+-- The dissector must skip the empty half so it doesn't double-count or pop
+-- queued requests twice.
+local function urb_type_char()
+    local v = f_urb_type()
+    if not v then
+        return nil
+    end
+    local s = tostring(v)
+    -- Field returns the raw byte value as a hex string ("0x53" for 'S',
+    -- "0x43" for 'C') or sometimes the literal char. Cover both.
+    if s == "'S'" or s == "S" or s == "0x53" or s == "83" then
+        return "S"
+    elseif s == "'C'" or s == "C" or s == "0x43" or s == "67" then
+        return "C"
+    end
+    return s
+end
 
 local function to_number(fieldinfo)
     if not fieldinfo then
@@ -277,7 +304,20 @@ function smoo.dissector(buffer, pinfo, tree)
     local capbytes = hex_to_bytes(capdata and tostring(capdata) or nil)
     local st = state_for_device()
 
-    if transfer_type == 1 and endpoint == CONFIG.interrupt_in then
+    -- Direction: high bit of endpoint address. 1 = IN (device→host),
+    -- 0 = OUT (host→device). FunctionFS assigns endpoint *numbers*, not
+    -- roles, so we anchor on direction + transfer type instead.
+    local dir_in = endpoint and (endpoint % 256) >= 0x80 or false
+    local urb = urb_type_char()
+    -- Skip the empty half of every URB pair: IN-direction submits and
+    -- OUT-direction completions carry no payload and would double-count or
+    -- pop the queue twice.
+    local data_bearing = (dir_in and urb == "C") or ((not dir_in) and urb == "S")
+    if not data_bearing then
+        return
+    end
+
+    if transfer_type == 1 and dir_in then
         local req = parse_request(capbytes)
         if req then
             local export = st.exports[req.export_id]
@@ -295,7 +335,7 @@ function smoo.dissector(buffer, pinfo, tree)
         return
     end
 
-    if transfer_type == 1 and endpoint == CONFIG.interrupt_out then
+    if transfer_type == 1 and not dir_in then
         local resp = parse_response(capbytes)
         if resp then
             local key = tostring(resp.export_id) .. ":" .. tostring(resp.request_id)
@@ -305,9 +345,11 @@ function smoo.dissector(buffer, pinfo, tree)
         return
     end
 
-    if transfer_type == 3 and (endpoint == CONFIG.bulk_out or endpoint == CONFIG.bulk_in) then
-        local bulk_dir = endpoint == CONFIG.bulk_out and "read" or "write"
-        local queue = endpoint == CONFIG.bulk_out and st.read_q or st.write_q
+    if transfer_type == 3 then
+        -- bulk OUT carries read-response payload (host→gadget); bulk IN
+        -- carries write-data payload (gadget→host). Yes, it's inverted.
+        local bulk_dir = dir_in and "write" or "read"
+        local queue = dir_in and st.write_q or st.read_q
         local entry = queue_pop(queue)
         local actual_len = to_number(f_len()) or #capbytes
         if entry then
