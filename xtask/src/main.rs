@@ -172,14 +172,20 @@ fn integration(extra: &[String]) -> Result<()> {
     // Build the gadget + host CLIs first so the harness can spawn them.
     run("cargo", &["build", "--bins", "-p", "smoo-gadget-cli", "-p", "smoo-host-cli"])?;
 
-    // Run the test harness under sudo, preserving PATH so the resolved
-    // cargo / rustc are found.
+    // Run the test harness under sudo. Fedora's default sudoers has
+    // `env_reset` with a narrow `env_keep` allowlist (LANG, DISPLAY, …) that
+    // does not include RUST_LOG / SMOO_*, so `sudo -E` alone won't carry our
+    // testing env vars through. We forward an explicit set via the `env`
+    // shim. PATH is already needed so cargo/rustc can resolve.
     let path = std::env::var("PATH").unwrap_or_default();
     let mut cmd = Command::new("sudo");
-    cmd.arg("-E")
-        .arg("env")
-        .arg(format!("PATH={path}"))
-        .arg("cargo")
+    cmd.arg("-E").arg("env").arg(format!("PATH={path}"));
+    for var in FORWARDED_ENV_VARS {
+        if let Ok(val) = std::env::var(var) {
+            cmd.arg(format!("{var}={val}"));
+        }
+    }
+    cmd.arg("cargo")
         .arg("test")
         .arg("-p")
         .arg("smoo-test-harness")
@@ -198,6 +204,20 @@ fn integration(extra: &[String]) -> Result<()> {
     }
     Ok(())
 }
+
+/// Env vars forwarded through the sudo wrapper. RUST_LOG steers tracing in
+/// every spawned smoo binary; RUST_BACKTRACE is useful when something panics;
+/// SMOO_FULL_PCAP toggles the test-harness's full-payload capture
+/// opt-in (see `crates/smoo-test-harness/src/scenario.rs`); SMOO_GADGET_PATH /
+/// SMOO_HOST_PATH let contributors point the harness at custom-built CLI
+/// binaries (see `binary_path` in `crates/smoo-test-harness/src/fixture.rs`).
+const FORWARDED_ENV_VARS: &[&str] = &[
+    "RUST_LOG",
+    "RUST_BACKTRACE",
+    "SMOO_FULL_PCAP",
+    "SMOO_GADGET_PATH",
+    "SMOO_HOST_PATH",
+];
 
 fn run(prog: &str, args: &[&str]) -> Result<()> {
     let mut cmd = Command::new(prog);
