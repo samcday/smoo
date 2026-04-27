@@ -1239,7 +1239,7 @@ async fn handle_request(
     req: UblkIoRequest,
 ) -> Result<()> {
     let block_size = queues.block_size();
-    let req_len = match request_byte_len(&req, block_size) {
+    let req_len = match request_byte_len(&req) {
         Ok(len) => len,
         Err(err) => {
             let errno = errno_from_io(&err);
@@ -1303,8 +1303,9 @@ async fn handle_request(
 
     let num_blocks = u32::try_from(req_len / block_size)
         .context("request block count exceeds protocol limit")?;
+    let lba = sector_to_lba(req.sector, block_size);
     let request_id = make_request_id(req.queue_id, req.tag);
-    let proto_req = Request::new(export_id, request_id, opcode, req.sector, num_blocks, 0);
+    let proto_req = Request::new(export_id, request_id, opcode, lba, num_blocks, 0);
     trace!(
         export_id,
         dev_id = queues.dev_id(),
@@ -1430,12 +1431,18 @@ fn make_request_id(queue_id: u16, tag: u16) -> u32 {
     ((queue_id as u32) << 16) | tag as u32
 }
 
-fn request_byte_len(req: &UblkIoRequest, block_size: usize) -> io::Result<usize> {
-    let sectors = usize::try_from(req.num_sectors)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "sector count overflow"))?;
-    sectors
-        .checked_mul(block_size)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "request byte length overflow"))
+/// `req.num_sectors` is in 512-byte sectors (kernel block-layer convention),
+/// independent of the device's logical block size — so `byte_len()` is
+/// authoritative. Multiplying by `block_size` would 8x-amplify every I/O on a
+/// 4k device.
+fn request_byte_len(req: &UblkIoRequest) -> io::Result<usize> {
+    usize::try_from(req.byte_len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "request byte length overflow"))
+}
+
+/// Convert a 512-byte sector index to an LBA in `block_size` units.
+fn sector_to_lba(sector: u64, block_size: usize) -> u64 {
+    sector / (block_size as u64 / 512)
 }
 
 fn errno_from_io(err: &io::Error) -> i32 {
