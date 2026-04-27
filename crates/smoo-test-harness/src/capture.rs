@@ -52,7 +52,23 @@ pub struct CaptureSession {
 impl CaptureSession {
     /// Start dumpcap on `usbmon<bus_id>`, writing pcapng to `pcap_path`.
     /// Returns once dumpcap has written the pcapng file header.
-    pub async fn start(bus_id: u32, pcap_path: PathBuf, log_dir: &Path) -> Result<Self> {
+    ///
+    /// `snaplen` truncates each captured packet to N bytes. `Some(256)` is
+    /// the harness default — it preserves the usbmon URB header + the full
+    /// 28-byte smoo Request/Response while dropping bulk read/write payloads
+    /// that would otherwise dominate the file size *and* the lua dissector's
+    /// runtime. The `usb.data_len` field in the URB header is the
+    /// pre-capture length, so length-mismatch / orphan-bulk assertions still
+    /// work correctly against truncated payloads. Pass `None` (which becomes
+    /// `dumpcap -s 0` — "no truncation") to capture everything; tests doing
+    /// that should expect the pcap to be ~8x larger and the analyser ~15x
+    /// slower.
+    pub async fn start(
+        bus_id: u32,
+        pcap_path: PathBuf,
+        log_dir: &Path,
+        snaplen: Option<u32>,
+    ) -> Result<Self> {
         if let Some(parent) = pcap_path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
@@ -74,6 +90,8 @@ impl CaptureSession {
             .arg("-w")
             .arg("-")
             .arg("-q")
+            .arg("-s")
+            .arg(snaplen.unwrap_or(0).to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::from(pcap_file))
             .stderr(Stdio::piped())

@@ -48,8 +48,16 @@ pub struct ScenarioBuilder {
     gadget_opts: GadgetOpts,
     host_opts: HostOpts,
     capture_enabled: bool,
+    capture_full_payload: bool,
     artifact_root: PathBuf,
 }
+
+/// Default snaplen passed to `dumpcap -s` when `capture_full_payload` is off.
+/// Big enough to cover the usbmon URB header (~64 B) plus a 28-byte smoo
+/// Request/Response with comfortable slack; small enough to keep typical pcaps
+/// in single-digit megabytes and to keep the lua dissector running near
+/// memory-bandwidth speed instead of Lua-per-byte speed.
+const DEFAULT_SNAPLEN: u32 = 256;
 
 impl ScenarioBuilder {
     pub fn new(name: &str) -> Self {
@@ -61,6 +69,7 @@ impl ScenarioBuilder {
             gadget_opts: GadgetOpts::default(),
             host_opts: HostOpts::default(),
             capture_enabled: true,
+            capture_full_payload: false,
             artifact_root: default_artifact_root(),
         }
     }
@@ -82,6 +91,18 @@ impl ScenarioBuilder {
 
     pub fn with_capture(mut self, enabled: bool) -> Self {
         self.capture_enabled = enabled;
+        self
+    }
+
+    /// Capture full bulk payloads instead of truncating at
+    /// `DEFAULT_SNAPLEN` (256 B). Default off — full payloads bloat the pcap
+    /// ~8x and slow the lua dissector by roughly the same factor without
+    /// changing what the standard wire-level assertions can detect (the URB
+    /// header carries the pre-truncation length). Turn this on only when
+    /// you specifically want to inspect bulk bytes after a failure. The
+    /// `SMOO_FULL_PCAP=1` env var has the same effect without recompiling.
+    pub fn with_full_payload_capture(mut self, on: bool) -> Self {
+        self.capture_full_payload = on;
         self
     }
 
@@ -132,10 +153,22 @@ impl ScenarioBuilder {
         // capture with a warning rather than failing — pcap assertions then
         // become no-ops in `assert_clean`.
         let capture = if self.capture_enabled && capture_available() {
+            let snaplen = if self.capture_full_payload
+                || std::env::var_os("SMOO_FULL_PCAP").is_some()
+            {
+                None
+            } else {
+                Some(DEFAULT_SNAPLEN)
+            };
             Some(
-                CaptureSession::start(slot.bus_id, artifacts.pcap_path(), artifacts.log_dir())
-                    .await
-                    .context("start capture")?,
+                CaptureSession::start(
+                    slot.bus_id,
+                    artifacts.pcap_path(),
+                    artifacts.log_dir(),
+                    snaplen,
+                )
+                .await
+                .context("start capture")?,
             )
         } else {
             if self.capture_enabled {
