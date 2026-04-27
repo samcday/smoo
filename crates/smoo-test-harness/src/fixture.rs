@@ -102,7 +102,7 @@ impl GadgetFixture {
         for arg in &opts.extra_args {
             cmd.arg(arg);
         }
-        cmd.env("RUST_LOG", &opts.rust_log);
+        apply_rust_log(&mut cmd, &opts.rust_log);
 
         let child = ChildProcess::spawn("smoo-gadget", cmd, log_dir)
             .await
@@ -234,7 +234,7 @@ impl HostFixture {
         for arg in &opts.extra_args {
             cmd.arg(arg);
         }
-        cmd.env("RUST_LOG", &opts.rust_log);
+        apply_rust_log(&mut cmd, &opts.rust_log);
 
         let child = ChildProcess::spawn("smoo-host", cmd, log_dir)
             .await
@@ -250,6 +250,18 @@ impl HostFixture {
 
     pub async fn shutdown(self) -> Result<ExitStatus> {
         self.child.shutdown().await
+    }
+}
+
+/// Set `RUST_LOG` on a child command. The harness's caller-set value
+/// (typically the `"info"` default in [`GadgetOpts`] / [`HostOpts`]) is
+/// applied only when the parent process doesn't already have `RUST_LOG`
+/// in its environment — that way `RUST_LOG=trace cargo xtask integration`
+/// reaches the spawned smoo binaries unchanged. `tokio::process::Command`
+/// inherits the parent env by default, so we only need to *not clobber* it.
+fn apply_rust_log(cmd: &mut Command, fallback: &str) {
+    if std::env::var_os("RUST_LOG").is_none() {
+        cmd.env("RUST_LOG", fallback);
     }
 }
 
