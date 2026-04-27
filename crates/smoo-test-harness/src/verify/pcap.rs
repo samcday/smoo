@@ -3,13 +3,18 @@
 //! After a scenario stops capture, [`PcapAssertions::from_pcap`] runs:
 //!
 //! ```sh
-//! tshark -X lua_script:tools/wireshark/smoo.lua -r <pcap> -T json -Y "smoo"
+//! tshark -X lua_script:tools/wireshark/smoo.lua -r <pcap> -T fields \
+//!   -e frame.number -e smoo.request.op -e smoo.response.op \
+//!   -e smoo.bulk.dir -e smoo.bulk.len_mismatch -e smoo.bulk.orphan \
+//!   -e smoo.config.export_id -Y smoo
 //! ```
 //!
-//! and parses the result. The dissector only emits `smoo.bulk.len_mismatch`
-//! and `smoo.bulk.orphan` when the corresponding condition fires (see
-//! `tools/wireshark/smoo.lua:253-260`), so we use *field presence* as the
-//! signal — independent of how tshark serialises a boolean ProtoField.
+//! The dissector only emits `smoo.bulk.len_mismatch` and `smoo.bulk.orphan`
+//! when the corresponding condition fires (see
+//! `tools/wireshark/smoo.lua:253-260`), so we key on *field presence*
+//! (non-empty TSV cell) — independent of how tshark serialises a boolean
+//! ProtoField. tshark's default field separator is `\t` and absent fields
+//! render as empty strings, which is the signal we want.
 //!
 //! ## Privilege drop
 //!
@@ -25,7 +30,6 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use serde_json::Value;
 use tokio::process::Command;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -61,7 +65,21 @@ impl PcapAssertions {
             .arg("-r")
             .arg(pcap)
             .arg("-T")
-            .arg("json")
+            .arg("fields")
+            .arg("-e")
+            .arg("frame.number")
+            .arg("-e")
+            .arg("smoo.request.op")
+            .arg("-e")
+            .arg("smoo.response.op")
+            .arg("-e")
+            .arg("smoo.bulk.dir")
+            .arg("-e")
+            .arg("smoo.bulk.len_mismatch")
+            .arg("-e")
+            .arg("smoo.bulk.orphan")
+            .arg("-e")
+            .arg("smoo.config.export_id")
             .arg("-Y")
             .arg("smoo");
         let output = cmd.output().await.context("spawn tshark")?;
@@ -72,9 +90,8 @@ impl PcapAssertions {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
-        let raw: Value = serde_json::from_slice(&output.stdout)
-            .context("parse tshark JSON output")?;
-        let summary = summarize(&raw);
+        let tsv = std::str::from_utf8(&output.stdout).context("tshark output not utf-8")?;
+        let summary = summarize(tsv);
         Ok(Self {
             summary,
             pcap_path: pcap.to_path_buf(),
@@ -170,104 +187,78 @@ fn build_tshark_command() -> Command {
     Command::new("tshark")
 }
 
-fn summarize(raw: &Value) -> Summary {
+/// Parse tshark's tab-separated `-T fields` output. Column order must match
+/// the `-e` flags in [`PcapAssertions::from_pcap`]: frame.number,
+/// smoo.request.op, smoo.response.op, smoo.bulk.dir,
+/// smoo.bulk.len_mismatch, smoo.bulk.orphan, smoo.config.export_id.
+/// Empty cells indicate the field was absent on that frame.
+fn summarize(tsv: &str) -> Summary {
     let mut s = Summary::default();
-    let Some(arr) = raw.as_array() else {
-        return s;
-    };
-    for entry in arr {
-        let Some(layers) = entry
-            .get("_source")
-            .and_then(|v| v.get("layers"))
-            .and_then(|v| v.as_object())
-        else {
+    for line in tsv.lines() {
+        if line.is_empty() {
             continue;
-        };
-        let Some(smoo) = layers.get("smoo").and_then(|v| v.as_object()) else {
-            continue;
-        };
-        s.smoo_frame_count += 1;
-
-        let frame_no = layers
-            .get("frame")
-            .and_then(|v| v.get("frame.number"))
-            .and_then(value_to_u64)
+        }
+        let mut cols = line.split('\t');
+        let frame_no = cols
+            .next()
+            .and_then(|c| c.parse::<u64>().ok())
             .unwrap_or(0);
+        let req = cols.next().unwrap_or("");
+        let resp = cols.next().unwrap_or("");
+        let bulk_dir = cols.next().unwrap_or("");
+        let len_mismatch = cols.next().unwrap_or("");
+        let orphan = cols.next().unwrap_or("");
+        let export_id = cols.next().unwrap_or("");
 
-        if smoo.contains_key("smoo.request.op") {
+        s.smoo_frame_count += 1;
+        if !req.is_empty() {
             s.requests += 1;
         }
-        if smoo.contains_key("smoo.response.op") {
+        if !resp.is_empty() {
             s.responses += 1;
         }
-        if let Some(dir) = smoo.get("smoo.bulk.dir").and_then(|v| v.as_str()) {
-            // Dissector labels: bulk_out endpoint == "read" (host-to-gadget,
-            // i.e. read-response payload), bulk_in endpoint == "write".
-            // For test reasoning we want the wire direction, so map back.
-            match dir {
-                "read" => s.bulk_out += 1, // host → gadget
-                "write" => s.bulk_in += 1, // gadget → host
-                _ => {}
-            }
+        // Dissector labels: bulk_out endpoint == "read" (host→gadget,
+        // read-response payload); bulk_in endpoint == "write" (gadget→host,
+        // write-data payload). Map back to wire direction.
+        match bulk_dir {
+            "read" => s.bulk_out += 1,
+            "write" => s.bulk_in += 1,
+            _ => {}
         }
-        if smoo.contains_key("smoo.bulk.len_mismatch") {
+        if !len_mismatch.is_empty() {
             s.length_mismatch_frames.push(frame_no);
         }
-        if smoo.contains_key("smoo.bulk.orphan") {
+        if !orphan.is_empty() {
             s.orphan_frames.push(frame_no);
         }
-        if smoo.contains_key("smoo.config.export_id") {
+        if !export_id.is_empty() {
             s.config_exports_count += 1;
         }
     }
     s
 }
 
-fn value_to_u64(v: &Value) -> Option<u64> {
-    if let Some(n) = v.as_u64() {
-        return Some(n);
-    }
-    if let Some(s) = v.as_str() {
-        return s.parse().ok();
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+
+    // Column order: frame.number, request.op, response.op, bulk.dir,
+    // len_mismatch, orphan, config.export_id. Tab-separated, empty cells
+    // mean field-absent.
 
     #[test]
     fn summarize_empty_returns_zero() {
-        let s = summarize(&json!([]));
+        let s = summarize("");
         assert_eq!(s.smoo_frame_count, 0);
         assert!(s.length_mismatch_frames.is_empty());
     }
 
     #[test]
     fn summarize_counts_requests_and_responses() {
-        let raw = json!([
-            {
-                "_source": { "layers": {
-                    "frame": { "frame.number": "1" },
-                    "smoo": { "smoo.request.op": "0", "smoo.request.export_id": "0" }
-                }}
-            },
-            {
-                "_source": { "layers": {
-                    "frame": { "frame.number": "2" },
-                    "smoo": { "smoo.response.op": "0", "smoo.response.status": "0" }
-                }}
-            },
-            {
-                "_source": { "layers": {
-                    "frame": { "frame.number": "3" },
-                    "smoo": { "smoo.bulk.dir": "write", "smoo.bulk.actual_len": "4096" }
-                }}
-            }
-        ]);
-        let s = summarize(&raw);
+        let tsv = "1\t0\t\t\t\t\t\n\
+                   2\t\t0\t\t\t\t\n\
+                   3\t\t\twrite\t\t\t\n";
+        let s = summarize(tsv);
         assert_eq!(s.smoo_frame_count, 3);
         assert_eq!(s.requests, 1);
         assert_eq!(s.responses, 1);
@@ -278,29 +269,9 @@ mod tests {
 
     #[test]
     fn summarize_flags_mismatch_and_orphan() {
-        let raw = json!([
-            {
-                "_source": { "layers": {
-                    "frame": { "frame.number": "5" },
-                    "smoo": {
-                        "smoo.bulk.dir": "read",
-                        "smoo.bulk.actual_len": "4096",
-                        "smoo.bulk.len_mismatch": "1"
-                    }
-                }}
-            },
-            {
-                "_source": { "layers": {
-                    "frame": { "frame.number": "7" },
-                    "smoo": {
-                        "smoo.bulk.dir": "write",
-                        "smoo.bulk.actual_len": "8192",
-                        "smoo.bulk.orphan": "1"
-                    }
-                }}
-            }
-        ]);
-        let s = summarize(&raw);
+        let tsv = "5\t\t\tread\t1\t\t\n\
+                   7\t\t\twrite\t\t1\t\n";
+        let s = summarize(tsv);
         assert_eq!(s.length_mismatch_frames, vec![5]);
         assert_eq!(s.orphan_frames, vec![7]);
     }
