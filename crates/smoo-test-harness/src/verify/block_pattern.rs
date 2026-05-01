@@ -87,13 +87,16 @@ impl BlockPatternVerifier {
 }
 
 fn first_diff(a: &[u8], b: &[u8]) -> Option<usize> {
-    a.iter().zip(b.iter()).position(|(x, y)| x != y).or_else(|| {
-        if a.len() != b.len() {
-            Some(a.len().min(b.len()))
-        } else {
-            None
-        }
-    })
+    a.iter()
+        .zip(b.iter())
+        .position(|(x, y)| x != y)
+        .or_else(|| {
+            if a.len() != b.len() {
+                Some(a.len().min(b.len()))
+            } else {
+                None
+            }
+        })
 }
 
 #[cfg(test)]
@@ -127,7 +130,10 @@ mod tests {
         buf[100] ^= 0xFF;
         std::fs::write(&path, &buf)?;
 
-        let err = v.verify_device_read(&path, 0, v.total_blocks()).await.unwrap_err();
+        let err = v
+            .verify_device_read(&path, 0, v.total_blocks())
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("offset 100"), "got: {err}");
         Ok(())
     }

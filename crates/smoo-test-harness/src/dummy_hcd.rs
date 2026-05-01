@@ -108,10 +108,7 @@ pub fn allocate_slot(pool: &Arc<Mutex<SlotPool>>) -> Result<Slot> {
 
     if !udc_present(idx) {
         lock_pool(pool).release(idx);
-        bail!(
-            "dummy_udc.{} not present in /sys/class/udc — is dummy_hcd loaded?",
-            idx
-        );
+        bail!("dummy_udc.{idx} not present in /sys/class/udc — is dummy_hcd loaded?");
     }
     let bus_id = match bus_for_hcd(idx) {
         Ok(bus) => bus,
@@ -161,15 +158,10 @@ pub fn bus_for_hcd(idx: u32) -> Result<u32> {
 /// Probe of the kernel state required by the harness. `Ok(())` means the
 /// modules-or-equivalent capabilities are in place.
 pub fn probe_kernel() -> Result<()> {
-    let need_dirs: &[&str] = &[
-        "/sys/kernel/config/usb_gadget",
-        "/sys/class/udc",
-    ];
+    let need_dirs: &[&str] = &["/sys/kernel/config/usb_gadget", "/sys/class/udc"];
     for dir in need_dirs {
         if !Path::new(dir).is_dir() {
-            bail!(
-                "{dir} not present — load configfs+libcomposite (try `just test-infra-setup`)"
-            );
+            bail!("{dir} not present — load configfs+libcomposite (try `just test-infra-setup`)");
         }
     }
     if !udc_present(0) {
@@ -180,8 +172,8 @@ pub fn probe_kernel() -> Result<()> {
     if !Path::new("/dev/ublk-control").exists() {
         bail!("/dev/ublk-control missing — `modprobe ublk_drv`");
     }
-    let usbmon_ok = Path::new("/sys/kernel/debug/usb/usbmon").is_dir()
-        || Path::new("/dev/usbmon0").exists();
+    let usbmon_ok =
+        Path::new("/sys/kernel/debug/usb/usbmon").is_dir() || Path::new("/dev/usbmon0").exists();
     if !usbmon_ok {
         bail!(
             "no usbmon interface — mount debugfs (sudo mount -t debugfs none /sys/kernel/debug) and `modprobe usbmon`"

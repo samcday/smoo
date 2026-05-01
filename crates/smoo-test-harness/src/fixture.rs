@@ -74,6 +74,7 @@ pub struct GadgetFixture {
     /// FDs before [`GadgetConfigFs`] tries to umount.
     pub child: ChildProcess,
     pub configfs: GadgetConfigFs,
+    observed_ublk_dev_ids: Mutex<Vec<u32>>,
 }
 
 impl GadgetFixture {
@@ -125,6 +126,7 @@ impl GadgetFixture {
             slot,
             child,
             configfs,
+            observed_ublk_dev_ids: Mutex::new(Vec::new()),
         })
     }
 
@@ -144,10 +146,22 @@ impl GadgetFixture {
         let caps = id_re.captures(&line).ok_or_else(|| {
             anyhow::anyhow!("'start_dev completed' line had no dev_id field: {line}")
         })?;
-        let id: u32 = caps[1]
-            .parse()
-            .context("parse dev_id from gadget log")?;
+        let id: u32 = caps[1].parse().context("parse dev_id from gadget log")?;
+        let mut observed = self
+            .observed_ublk_dev_ids
+            .lock()
+            .expect("observed ublk dev-id mutex poisoned");
+        if !observed.contains(&id) {
+            observed.push(id);
+        }
         Ok(id)
+    }
+
+    pub fn observed_ublk_dev_ids(&self) -> Vec<u32> {
+        self.observed_ublk_dev_ids
+            .lock()
+            .expect("observed ublk dev-id mutex poisoned")
+            .clone()
     }
 
     /// SIGTERM the gadget, wait, then drop configfs (which umounts FFS and
@@ -157,6 +171,7 @@ impl GadgetFixture {
             slot,
             child,
             configfs,
+            observed_ublk_dev_ids: _,
         } = self;
         let status = child.shutdown().await?;
         drop(configfs);

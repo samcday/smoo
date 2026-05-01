@@ -170,7 +170,17 @@ fn sudo_modprobe(module: &str, params: &[&str]) -> Result<()> {
 
 fn integration(extra: &[String]) -> Result<()> {
     // Build the gadget + host CLIs first so the harness can spawn them.
-    run("cargo", &["build", "--bins", "-p", "smoo-gadget-cli", "-p", "smoo-host-cli"])?;
+    run(
+        "cargo",
+        &[
+            "build",
+            "--bins",
+            "-p",
+            "smoo-gadget-cli",
+            "-p",
+            "smoo-host-cli",
+        ],
+    )?;
 
     // Run the test harness under sudo. Fedora's default sudoers has
     // `env_reset` with a narrow `env_keep` allowlist (LANG, DISPLAY, …) that
@@ -196,9 +206,7 @@ fn integration(extra: &[String]) -> Result<()> {
         cmd.arg(a);
     }
 
-    let status = cmd
-        .status()
-        .with_context(|| format!("spawn {cmd:?}"))?;
+    let status = cmd.status().with_context(|| format!("spawn {cmd:?}"))?;
     if !status.success() {
         bail!("integration tests failed: {status:?}");
     }

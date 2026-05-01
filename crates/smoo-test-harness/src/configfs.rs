@@ -77,7 +77,10 @@ impl GadgetConfigFs {
         fs::create_dir_all(&strings).with_context(|| format!("mkdir {}", strings.display()))?;
         write_sys(&strings.join("manufacturer"), "smoo-test")?;
         write_sys(&strings.join("product"), "smoo gadget (test)")?;
-        write_sys(&strings.join("serialnumber"), &format!("test-{}", slot.udc_idx))?;
+        write_sys(
+            &strings.join("serialnumber"),
+            &format!("test-{}", slot.udc_idx),
+        )?;
 
         let cfg = gd.join("configs/c.1");
         fs::create_dir_all(&cfg).with_context(|| format!("mkdir {}", cfg.display()))?;
@@ -256,7 +259,8 @@ fn recursive_rmdir(dir: &Path) -> std::io::Result<()> {
             let p = entry.path();
             if p.is_dir() {
                 let _ = recursive_rmdir(&p);
-            } else if p.symlink_metadata()
+            } else if p
+                .symlink_metadata()
                 .map(|m| m.file_type().is_symlink())
                 .unwrap_or(false)
             {

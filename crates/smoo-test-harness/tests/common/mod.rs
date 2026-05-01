@@ -9,8 +9,9 @@ use std::time::Duration;
 pub fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,smoo_test_harness=debug")),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new("info,smoo_test_harness=debug")
+            }),
         )
         .with_writer(std::io::stderr)
         .with_test_writer()
@@ -26,7 +27,11 @@ pub async fn wait_for_block_device(path: &Path, timeout: Duration) -> anyhow::Re
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
-            anyhow::bail!("block device {} did not appear within {:?}", path.display(), timeout);
+            anyhow::bail!(
+                "block device {} did not appear within {:?}",
+                path.display(),
+                timeout
+            );
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
