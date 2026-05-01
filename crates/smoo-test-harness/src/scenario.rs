@@ -266,6 +266,40 @@ impl RunningScenario {
             ublk_dev_ids,
         })
     }
+
+    /// Adversarial shutdown path: kill the host first, then ask the gadget to
+    /// stop. A correct gadget must still preempt any in-flight host I/O, finish
+    /// ublk teardown, and exit without the harness SIGKILL fallback.
+    pub async fn stop_host_then_gadget(mut self) -> Result<ScenarioResult> {
+        let ublk_dev_ids = self
+            .gadget
+            .as_ref()
+            .map(GadgetFixture::observed_ublk_dev_ids)
+            .unwrap_or_default();
+        let host_exit = match self.host.take() {
+            Some(h) => Some(h.shutdown().await.context("host shutdown")?),
+            None => None,
+        };
+        let gadget_exit = match self.gadget.take() {
+            Some(g) => Some(g.shutdown().await.context("gadget shutdown")?),
+            None => None,
+        };
+        let pcap = match self.capture.take() {
+            Some(c) => Some(c.stop().await.context("stop capture")?),
+            None => None,
+        };
+
+        Ok(ScenarioResult {
+            name: self.name,
+            artifacts: self.artifacts,
+            gadget_exit,
+            host_exit,
+            pcap_path: pcap,
+            exports: self.exports,
+            queue_depth: self.queue_depth,
+            ublk_dev_ids,
+        })
+    }
 }
 
 pub struct ScenarioResult {
