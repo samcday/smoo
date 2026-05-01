@@ -6,8 +6,8 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -27,8 +27,9 @@ fn strip_ansi(s: &str) -> String {
 /// Default per-stream log buffer cap. Lines beyond this drop the oldest.
 const RING_CAP: usize = 8192;
 
-/// Default SIGTERM grace period before SIGKILL.
-const TERM_GRACE: Duration = Duration::from_secs(5);
+/// Default SIGTERM grace period before SIGKILL. Keep this above smoo-gadget's
+/// internal graceful-shutdown deadline so it can force-clean ublk devices itself.
+const TERM_GRACE: Duration = Duration::from_secs(10);
 
 #[derive(Default)]
 pub struct LogBuffer {
@@ -275,10 +276,7 @@ mod tests {
         buf.push("nothing".into()).await;
         buf.push("hello world".into()).await;
         let re = Regex::new("hello").unwrap();
-        let got = buf
-            .wait_for(&re, Duration::from_millis(10))
-            .await
-            .unwrap();
+        let got = buf.wait_for(&re, Duration::from_millis(10)).await.unwrap();
         assert_eq!(got, "hello world");
     }
 
@@ -291,10 +289,7 @@ mod tests {
             buf2.push("ready".into()).await;
         });
         let re = Regex::new("ready").unwrap();
-        let got = buf
-            .wait_for(&re, Duration::from_millis(500))
-            .await
-            .unwrap();
+        let got = buf.wait_for(&re, Duration::from_millis(500)).await.unwrap();
         assert_eq!(got, "ready");
         writer.await.unwrap();
     }
@@ -319,10 +314,7 @@ mod tests {
             buf2.close();
         });
         let re = Regex::new("never").unwrap();
-        let err = buf
-            .wait_for(&re, Duration::from_secs(1))
-            .await
-            .unwrap_err();
+        let err = buf.wait_for(&re, Duration::from_secs(1)).await.unwrap_err();
         assert!(err.to_string().contains("closed"), "got: {err}");
     }
 }

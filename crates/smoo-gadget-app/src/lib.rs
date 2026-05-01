@@ -26,7 +26,6 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    signal,
     signal::unix::{signal as unix_signal, SignalKind},
     sync::{
         mpsc,
@@ -920,6 +919,69 @@ enum ShutdownState {
     Forceful,
 }
 
+enum ShutdownAction {
+    BeginGraceful,
+    ForceNow,
+}
+
+fn advance_shutdown_state(
+    signal_name: &str,
+    shutdown_state: &mut ShutdownState,
+    exit_reason: &mut Option<String>,
+) -> ShutdownAction {
+    match shutdown_state {
+        ShutdownState::Running => {
+            info!(
+                signal = signal_name,
+                "shutdown signal received; entering graceful shutdown"
+            );
+            *shutdown_state = ShutdownState::Graceful {
+                deadline: Instant::now() + Duration::from_millis(GRACEFUL_SHUTDOWN_TIMEOUT_MS),
+            };
+            ShutdownAction::BeginGraceful
+        }
+        ShutdownState::Graceful { .. } => {
+            warn!(
+                signal = signal_name,
+                "second shutdown signal; forcing shutdown"
+            );
+            note_exit_reason(
+                exit_reason,
+                format!("second shutdown signal received ({signal_name})"),
+            );
+            *shutdown_state = ShutdownState::Forceful;
+            ShutdownAction::ForceNow
+        }
+        ShutdownState::Forceful => ShutdownAction::ForceNow,
+    }
+}
+
+fn fail_pending_io_for_shutdown(
+    queue_rx: &mut mpsc::Receiver<QueueEvent>,
+    outstanding: &mut HashMap<u32, HashMap<(u16, u16), OutstandingRequest>>,
+) {
+    while let Ok(event) = queue_rx.try_recv() {
+        match event {
+            QueueEvent::Request {
+                request, queues, ..
+            } => {
+                if let Err(err) = queues.complete_io(request, -libc::ESHUTDOWN) {
+                    warn!(error = ?err, "failed to complete queued IO during shutdown");
+                }
+            }
+            QueueEvent::QueueError { .. } => {}
+        }
+    }
+
+    for (_export_id, mut pending) in outstanding.drain() {
+        for ((_queue_id, _tag), req) in pending.drain() {
+            if let Err(err) = req.queues.complete_io(req.request, -libc::ESHUTDOWN) {
+                warn!(error = ?err, "failed to complete outstanding IO during shutdown");
+            }
+        }
+    }
+}
+
 async fn run_event_loop(
     ublk: &mut SmooUblk,
     mut runtime: RuntimeState,
@@ -928,7 +990,8 @@ async fn run_event_loop(
     ep0_signals: Ep0Signals,
     control_stop: watch::Sender<bool>,
 ) -> Result<()> {
-    let mut shutdown = Some(Box::pin(signal::ctrl_c()));
+    let mut sigint = unix_signal(SignalKind::interrupt()).context("install SIGINT handler")?;
+    let mut sigterm = unix_signal(SignalKind::terminate()).context("install SIGTERM handler")?;
     let mut hup = unix_signal(SignalKind::hangup()).context("install SIGHUP handler")?;
     let idle_sleep = tokio::time::sleep(Duration::from_millis(IDLE_INTERVAL_MS));
     tokio::pin!(idle_sleep);
@@ -997,28 +1060,24 @@ async fn run_event_loop(
         let ep0_notified = ep0_notify.notified();
         tokio::pin!(ep0_notified);
         tokio::select! { biased;
-            _ = async {
-                if let Some(fut) = shutdown.as_mut() {
-                    let _ = fut.as_mut().await;
-                }
-            }, if shutdown.is_some() => {
-                shutdown = None;
-                match shutdown_state {
-                    ShutdownState::Running => {
-                        info!("shutdown signal received; entering graceful shutdown");
-                        shutdown_state = ShutdownState::Graceful {
-                            deadline: Instant::now() + Duration::from_millis(GRACEFUL_SHUTDOWN_TIMEOUT_MS),
-                        };
+            Some(_) = sigint.recv() => {
+                match advance_shutdown_state("SIGINT", &mut shutdown_state, &mut exit_reason) {
+                    ShutdownAction::BeginGraceful => {
                         stop_accepting_new_io(&mut runtime, &mut queue_tx).await;
+                        fail_pending_io_for_shutdown(&mut queue_rx, &mut outstanding);
                         let _ = control_stop.send(true);
                     }
-                    ShutdownState::Graceful { .. } => {
-                        warn!("second shutdown signal; forcing shutdown");
-                        note_exit_reason(&mut exit_reason, "second shutdown signal received");
-                        shutdown_state = ShutdownState::Forceful;
-                        break;
+                    ShutdownAction::ForceNow => break,
+                }
+            }
+            Some(_) = sigterm.recv() => {
+                match advance_shutdown_state("SIGTERM", &mut shutdown_state, &mut exit_reason) {
+                    ShutdownAction::BeginGraceful => {
+                        stop_accepting_new_io(&mut runtime, &mut queue_tx).await;
+                        fail_pending_io_for_shutdown(&mut queue_rx, &mut outstanding);
+                        let _ = control_stop.send(true);
                     }
-                    ShutdownState::Forceful => break,
+                    ShutdownAction::ForceNow => break,
                 }
             }
             Some(_) = hup.recv() => {
@@ -1187,7 +1246,6 @@ async fn run_event_loop(
                 warn!("graceful shutdown deadline reached; forcing shutdown");
                 note_exit_reason(&mut exit_reason, "graceful shutdown deadline reached");
                 shutdown_state = ShutdownState::Forceful;
-                shutdown = None;
             }
         }
     }

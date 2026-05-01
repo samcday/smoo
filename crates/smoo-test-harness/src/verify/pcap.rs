@@ -199,10 +199,7 @@ fn summarize(tsv: &str) -> Summary {
             continue;
         }
         let mut cols = line.split('\t');
-        let frame_no = cols
-            .next()
-            .and_then(|c| c.parse::<u64>().ok())
-            .unwrap_or(0);
+        let frame_no = cols.next().and_then(|c| c.parse::<u64>().ok()).unwrap_or(0);
         let req = cols.next().unwrap_or("");
         let resp = cols.next().unwrap_or("");
         let bulk_dir = cols.next().unwrap_or("");

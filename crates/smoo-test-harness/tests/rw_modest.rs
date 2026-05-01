@@ -12,8 +12,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
-use smoo_test_harness::{HostSourceSpec, ScenarioBuilder};
 use smoo_test_harness::scenario::run_tool;
+use smoo_test_harness::{HostSourceSpec, ScenarioBuilder};
 use tokio::process::Command;
 
 const BLOCK_SIZE: u32 = 4096;

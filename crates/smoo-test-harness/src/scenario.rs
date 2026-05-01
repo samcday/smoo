@@ -16,7 +16,9 @@ use tokio::process::Command;
 use crate::artifacts::{ArtifactBundle, ExitInfo, Metadata, OpMixSer, kernel_release};
 use crate::capture::CaptureSession;
 use crate::dummy_hcd::Slot;
-use crate::fixture::{GadgetFixture, GadgetOpts, HostFixture, HostOpts, HostSourceSpec, KernelFixture};
+use crate::fixture::{
+    GadgetFixture, GadgetOpts, HostFixture, HostOpts, HostSourceSpec, KernelFixture,
+};
 use crate::verify::pcap::PcapAssertions;
 
 #[derive(Debug, Clone)]
@@ -58,6 +60,7 @@ pub struct ScenarioBuilder {
 /// in single-digit megabytes and to keep the lua dissector running near
 /// memory-bandwidth speed instead of Lua-per-byte speed.
 const DEFAULT_SNAPLEN: u32 = 256;
+const UBLK_REMOVE_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl ScenarioBuilder {
     pub fn new(name: &str) -> Self {
@@ -125,8 +128,8 @@ impl ScenarioBuilder {
     /// gadget, start capture, spawn the host, and return a handle ready for
     /// the test body to run against.
     pub async fn start(self) -> Result<RunningScenario> {
-        let artifacts = ArtifactBundle::create(&self.artifact_root, &self.name)
-            .context("artifact bundle")?;
+        let artifacts =
+            ArtifactBundle::create(&self.artifact_root, &self.name).context("artifact bundle")?;
 
         let kernel = KernelFixture::ensure().context("kernel fixture")?;
         let slot = kernel.allocate_slot().context("slot allocation")?;
@@ -153,13 +156,12 @@ impl ScenarioBuilder {
         // capture with a warning rather than failing — pcap assertions then
         // become no-ops in `assert_clean`.
         let capture = if self.capture_enabled && capture_available() {
-            let snaplen = if self.capture_full_payload
-                || std::env::var_os("SMOO_FULL_PCAP").is_some()
-            {
-                None
-            } else {
-                Some(DEFAULT_SNAPLEN)
-            };
+            let snaplen =
+                if self.capture_full_payload || std::env::var_os("SMOO_FULL_PCAP").is_some() {
+                    None
+                } else {
+                    Some(DEFAULT_SNAPLEN)
+                };
             Some(
                 CaptureSession::start(
                     slot.bus_id,
@@ -228,15 +230,24 @@ impl RunningScenario {
         &self.gadget().slot
     }
 
-    /// Shut down host, gadget, then capture. Returns a result that the test
+    /// Shut down gadget, host, then capture. Keeping the host alive while the
+    /// gadget handles SIGTERM lets any final ublk read-ahead complete before
+    /// the gadget removes its ublk devices.
+    ///
+    /// Returns a result that the test
     /// can call [`ScenarioResult::assert_clean`] on.
     pub async fn stop(mut self) -> Result<ScenarioResult> {
-        let host_exit = match self.host.take() {
-            Some(h) => Some(h.shutdown().await.context("host shutdown")?),
-            None => None,
-        };
+        let ublk_dev_ids = self
+            .gadget
+            .as_ref()
+            .map(GadgetFixture::observed_ublk_dev_ids)
+            .unwrap_or_default();
         let gadget_exit = match self.gadget.take() {
             Some(g) => Some(g.shutdown().await.context("gadget shutdown")?),
+            None => None,
+        };
+        let host_exit = match self.host.take() {
+            Some(h) => Some(h.shutdown().await.context("host shutdown")?),
             None => None,
         };
         let pcap = match self.capture.take() {
@@ -252,6 +263,7 @@ impl RunningScenario {
             pcap_path: pcap,
             exports: self.exports,
             queue_depth: self.queue_depth,
+            ublk_dev_ids,
         })
     }
 }
@@ -264,6 +276,7 @@ pub struct ScenarioResult {
     pub pcap_path: Option<PathBuf>,
     pub exports: Vec<ExportSpec>,
     pub queue_depth: u32,
+    pub ublk_dev_ids: Vec<u32>,
 }
 
 impl ScenarioResult {
@@ -283,13 +296,19 @@ impl ScenarioResult {
         let mut failure_msg: Option<String> = None;
         let mut op_mix = None;
 
+        if check_exits && let Err(err) = check_exit_codes(&self.gadget_exit, &self.host_exit) {
+            failure_msg = Some(err.to_string());
+        }
+
         if check_exits
-            && let Err(err) = check_exit_codes(&self.gadget_exit, &self.host_exit)
+            && failure_msg.is_none()
+            && let Err(err) = check_ublk_devices_removed(&self.ublk_dev_ids).await
         {
             failure_msg = Some(err.to_string());
         }
 
-        if check_pcap && failure_msg.is_none()
+        if check_pcap
+            && failure_msg.is_none()
             && let Some(pcap) = self.pcap_path.as_ref()
         {
             match analyse_pcap(pcap).await {
@@ -339,10 +358,7 @@ impl ScenarioResult {
     }
 }
 
-fn check_exit_codes(
-    gadget: &Option<ExitStatus>,
-    host: &Option<ExitStatus>,
-) -> Result<()> {
+fn check_exit_codes(gadget: &Option<ExitStatus>, host: &Option<ExitStatus>) -> Result<()> {
     if let Some(g) = gadget {
         check_exit("gadget", *g)?;
     }
@@ -366,6 +382,35 @@ fn check_exit(name: &str, status: ExitStatus) -> Result<()> {
         status.code(),
         status.signal()
     )
+}
+
+async fn check_ublk_devices_removed(dev_ids: &[u32]) -> Result<()> {
+    let mut dev_ids = dev_ids.to_vec();
+    dev_ids.sort_unstable();
+    dev_ids.dedup();
+
+    for dev_id in dev_ids {
+        wait_for_path_absent(PathBuf::from(format!("/dev/ublkb{dev_id}"))).await?;
+        wait_for_path_absent(PathBuf::from(format!("/dev/ublkc{dev_id}"))).await?;
+    }
+    Ok(())
+}
+
+async fn wait_for_path_absent(path: PathBuf) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + UBLK_REMOVE_TIMEOUT;
+    loop {
+        if !path.exists() {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "ublk node {} still present after {:?}",
+                path.display(),
+                UBLK_REMOVE_TIMEOUT
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 async fn analyse_pcap(pcap: &Path) -> Result<PcapAssertions> {
@@ -419,11 +464,7 @@ fn workspace_path(rel: &str) -> Result<PathBuf> {
 /// Convenience: run an arbitrary command (e.g. `dd`, `fio`) against the
 /// scenario's `/dev/ublkbN`. Tees output to the artifact directory and
 /// returns the exit status.
-pub async fn run_tool(
-    scenario: &RunningScenario,
-    name: &str,
-    cmd: Command,
-) -> Result<ExitStatus> {
+pub async fn run_tool(scenario: &RunningScenario, name: &str, cmd: Command) -> Result<ExitStatus> {
     let log_dir = scenario.artifacts.log_dir();
     let mut child = crate::process::ChildProcess::spawn(name, cmd, log_dir)
         .await
