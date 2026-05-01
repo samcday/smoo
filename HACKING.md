@@ -254,17 +254,44 @@ Failure to service ep0 promptly leads to EP0 STALL + possible gadget reset.
       cargo xtask test-infra-setup      # one-time per boot (sudo)
       cargo xtask integration           # runs all scenarios
 
+  VM substrate spike:
+
+      cargo xtask vm-image build       # build target/vm-images/smoo-integration-vm.qcow2
+      cargo xtask vm-image download    # pull the input-hashed GHCR artifact with oras
+      cargo xtask vm-image ref         # print the deterministic GHCR ref
+      cargo xtask vm-integration
+
+  `vm-integration` boots a disposable Fedora guest with QEMU/KVM, probes the
+  guest for `dummy_hcd`, `ublk_drv`, `usbmon`, FunctionFS/configfs, and verifies
+  `fio`, `dumpcap`, and `tshark` are already available. It does not download a
+  base image or run `dnf`; if `target/vm-images/smoo-integration-vm.qcow2` is
+  absent, run `cargo xtask vm-image build` once locally or `cargo xtask vm-image
+  download` to trade bandwidth for compute. Set `SMOO_VM_IMAGE` to use an
+  arbitrary qcow2 instead. The host must expose writable `/dev/kvm` (or set
+  `SMOO_VM_ACCEL=tcg` for a slow smoke test). For sudo-less local KVM access,
+  see `tools/udev/99-smoo-kvm.rules`.
+
+  `vm-image build` starts from the pinned Fedora cloud base image, applies
+  `tools/vm-image/guest-setup.sh`, validates the required kernel modules and
+  userspace tools, then writes the baked image and SHA256 metadata under
+  `target/vm-images/`. The GHCR tag is the SHA256 of the base image identity
+  (URL + expected checksum) and the guest setup script contents, so the default
+  `vm-image download` target is deterministic and can be inspected with
+  `cargo xtask vm-image ref`. Override the full ref with `SMOO_VM_IMAGE_REF` or
+  the repository prefix with `SMOO_VM_IMAGE_REPOSITORY` if needed.
+
   Each scenario is a `#[tokio::test]` in `crates/smoo-test-harness/tests/`.
   v1 ships `smoke` (handshake + 1 R/W) and `rw_modest` (fio randwrite-
   with-md5 against the resulting `/dev/ublkbN`). On failure the artifact
   bundle is the source of truth — open `capture.pcapng` with the
   dissector at `tools/wireshark/smoo.lua` to triage wire-level issues.
 
-  CI runs the same flow (`.github/workflows/integration-tests.yml`) on a
-  self-hosted runner tagged `[self-hosted, linux, dummy-hcd]`.
-  GitHub-hosted `ubuntu-24.04` runners ship the Azure kernel without
-  `CONFIG_USB_DUMMY_HCD` (verified in PR #41) — that's why the workflow
-  targets self-hosted infra.
+  CI runs the same VM flow (`.github/workflows/integration-tests.yml`) on
+  GitHub-hosted `ubuntu-24.04` runners: it downloads the baked qcow2 with
+  `cargo xtask vm-image download`, then runs `cargo xtask vm-integration`.
+  `.github/workflows/vm-image.yml` rebuilds and pushes the GHCR image when the
+  VM image setup changes. During the VM substrate spike it publishes from both
+  `main` and the `test-infra` WIP branch.
 
 * CLIs are thin wrappers; logic in libraries
 * Agents MUST uphold:

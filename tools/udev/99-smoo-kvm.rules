@@ -1,0 +1,10 @@
+# Optional local development helper for `cargo xtask vm-integration`.
+#
+# Install with:
+#   sudo install -m 0644 tools/udev/99-smoo-kvm.rules /etc/udev/rules.d/99-smoo-kvm.rules
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger --name-match=kvm
+#
+# This intentionally mirrors GitHub Actions' documented KVM rule so agents can
+# launch disposable QEMU/KVM guests without interactive sudo.
+KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"
