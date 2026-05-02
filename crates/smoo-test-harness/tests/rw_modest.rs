@@ -2,10 +2,11 @@
 //! ublk device.
 //!
 //! Backing: a 16 MB tmpfs file on the host side (`HostSourceSpec::File`).
-//! Workload: `fio --rw=randwrite --bs=4k --io_size=8M --verify=md5 --do_verify=1
-//! --numjobs=2 --iodepth=16` against a gadget configured with `queue_count=2`,
-//! `queue_depth=16` — pushes the data path into pipelined territory rather
-//! than the serialised default.
+//! Workload: two `fio --rw=randwrite --bs=4k --io_size=8M --verify=md5
+//! --do_verify=1 --iodepth=16` jobs pinned to disjoint 8 MiB ranges against a
+//! gadget configured with `queue_count=2`, `queue_depth=16` — pushes the data
+//! path into pipelined territory rather than the serialised default without
+//! letting fio jobs overwrite each other's verify headers.
 //!
 //! Asserts: fio exits 0, both processes shut down cleanly, pcap is balanced
 //! and free of length-mismatch / orphan bulks, and pipelining was actually
@@ -64,6 +65,8 @@ async fn rw_modest() -> Result<()> {
         .arg("--rw=randwrite")
         .arg("--bs=4k")
         .arg("--io_size=8M")
+        .arg("--size=8M")
+        .arg("--offset_increment=8M")
         .arg("--numjobs=2")
         .arg("--iodepth=16")
         .arg("--ioengine=libaio")

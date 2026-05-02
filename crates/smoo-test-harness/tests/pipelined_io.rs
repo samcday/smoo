@@ -1,6 +1,6 @@
 //! Scenario 3: pipelining stress.
 //!
-//! Two random-source exports (so both halves' multi-export concurrency is
+//! Two file-backed exports (so both halves' multi-export concurrency is
 //! exercised), `queue_count=2 queue_depth=16` on the gadget, and concurrent
 //! fio mixed-RW workloads against both ublk devices simultaneously.
 //!
@@ -22,21 +22,31 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
-use smoo_test_harness::fixture::GadgetOpts;
+use smoo_test_harness::ScenarioBuilder;
+use smoo_test_harness::fixture::{GadgetOpts, HostSourceSpec};
 use smoo_test_harness::scenario::run_tool;
-use smoo_test_harness::{ExportSpec, ScenarioBuilder};
 use tokio::process::Command;
 
 const BLOCK_SIZE: u32 = 4096;
-const TOTAL_BLOCKS: u64 = 4096; // 16 MiB per export
+const FILE_SIZE: u64 = 16 * 1024 * 1024;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn pipelined_io() -> Result<()> {
     common::init_tracing();
 
+    let backing_tmp = tempfile::tempdir().context("backing tempdir")?;
+    let backing_a = backing_tmp.path().join("a.img");
+    let backing_b = backing_tmp.path().join("b.img");
+    for path in [&backing_a, &backing_b] {
+        let f = std::fs::File::create(path)
+            .with_context(|| format!("create backing file {}", path.display()))?;
+        f.set_len(FILE_SIZE)
+            .with_context(|| format!("size backing file {}", path.display()))?;
+    }
+
     let sc = ScenarioBuilder::new("pipelined_io")
-        .with_export(ExportSpec::random(BLOCK_SIZE, TOTAL_BLOCKS, 0xA1A1_A1A1))
-        .with_export(ExportSpec::random(BLOCK_SIZE, TOTAL_BLOCKS, 0xB2B2_B2B2))
+        .with_host_source(HostSourceSpec::File(backing_a.clone()))
+        .with_host_source(HostSourceSpec::File(backing_b.clone()))
         .with_block_size(BLOCK_SIZE)
         .with_gadget_opts(GadgetOpts {
             queue_count: 2,
