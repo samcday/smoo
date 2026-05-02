@@ -20,6 +20,7 @@ const BLOCK_SIZE: u32 = 4096;
 const FILE_SIZE: u64 = 16 * 1024 * 1024;
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires dummy_hcd/ublk/configfs; run via cargo xtask integration or vm-integration"]
 async fn rw_modest() -> Result<()> {
     common::init_tracing();
 

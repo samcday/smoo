@@ -49,6 +49,7 @@ pub struct ScenarioBuilder {
     block_size: u32,
     gadget_opts: GadgetOpts,
     host_opts: HostOpts,
+    host_opts_set: bool,
     capture_enabled: bool,
     capture_full_payload: bool,
     artifact_root: PathBuf,
@@ -71,6 +72,7 @@ impl ScenarioBuilder {
             block_size: 4096,
             gadget_opts: GadgetOpts::default(),
             host_opts: HostOpts::default(),
+            host_opts_set: false,
             capture_enabled: true,
             capture_full_payload: false,
             artifact_root: default_artifact_root(),
@@ -116,6 +118,7 @@ impl ScenarioBuilder {
 
     pub fn with_host_opts(mut self, opts: HostOpts) -> Self {
         self.host_opts = opts;
+        self.host_opts_set = true;
         self
     }
 
@@ -147,7 +150,7 @@ impl ScenarioBuilder {
         host_sources.extend(self.extra_host_sources.iter().cloned());
 
         let mut host_opts = self.host_opts;
-        if host_opts.block_size == HostOpts::default().block_size {
+        if !self.host_opts_set {
             host_opts.block_size = self.block_size;
         }
 
@@ -448,8 +451,20 @@ async fn wait_for_path_absent(path: PathBuf) -> Result<()> {
 }
 
 async fn analyse_pcap(pcap: &Path) -> Result<PcapAssertions> {
-    let lua = workspace_path("tools/wireshark/smoo.lua")?;
+    let lua = wireshark_lua_path()?;
     PcapAssertions::from_pcap(pcap, &lua).await
+}
+
+fn wireshark_lua_path() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("SMOO_WIRESHARK_LUA") {
+        let path = PathBuf::from(path);
+        if !path.exists() {
+            anyhow::bail!("SMOO_WIRESHARK_LUA={} does not exist", path.display());
+        }
+        return Ok(path);
+    }
+
+    workspace_path("tools/wireshark/smoo.lua")
 }
 
 fn capture_available() -> bool {

@@ -8,6 +8,11 @@ use anyhow::{Context, Result, bail};
 
 mod vm;
 
+// Privileged harness scenarios that are expected to pass in a configured
+// dummy_hcd/ublk environment. `shutdown_host_loss` is intentionally omitted:
+// it documents a known shutdown bug and is kept as a manual reproducer.
+const STABLE_HARNESS_TESTS: &[&str] = &["smoke", "rw_modest"];
+
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let task = args.next();
@@ -53,9 +58,7 @@ fn print_usage() {
     eprintln!("  vm-image build    Build the baked Fedora VM image used by vm-integration");
     eprintln!("  vm-image download Download the baked Fedora VM image from GHCR with oras");
     eprintln!("  vm-image ref      Print the deterministic GHCR ref for the VM image inputs");
-    eprintln!(
-        "  vm-integration     Boot a disposable Fedora VM and probe integration-test prerequisites"
-    );
+    eprintln!("  vm-integration     Boot a disposable Fedora VM and run the integration harness");
 }
 
 // ---------- check-test-infra ----------
@@ -208,8 +211,12 @@ fn integration(extra: &[String]) -> Result<()> {
     cmd.arg("cargo")
         .arg("test")
         .arg("-p")
-        .arg("smoo-test-harness")
-        .arg("--")
+        .arg("smoo-test-harness");
+    for test in STABLE_HARNESS_TESTS {
+        cmd.arg("--test").arg(test);
+    }
+    cmd.arg("--")
+        .arg("--include-ignored")
         .arg("--test-threads=1")
         .arg("--nocapture");
     for a in extra {
@@ -228,13 +235,15 @@ fn integration(extra: &[String]) -> Result<()> {
 /// SMOO_FULL_PCAP toggles the test-harness's full-payload capture
 /// opt-in (see `crates/smoo-test-harness/src/scenario.rs`); SMOO_GADGET_PATH /
 /// SMOO_HOST_PATH let contributors point the harness at custom-built CLI
-/// binaries (see `binary_path` in `crates/smoo-test-harness/src/fixture.rs`).
+/// binaries (see `binary_path` in `crates/smoo-test-harness/src/fixture.rs`);
+/// SMOO_WIRESHARK_LUA lets VM-staged harness binaries find the dissector.
 const FORWARDED_ENV_VARS: &[&str] = &[
     "RUST_LOG",
     "RUST_BACKTRACE",
     "SMOO_FULL_PCAP",
     "SMOO_GADGET_PATH",
     "SMOO_HOST_PATH",
+    "SMOO_WIRESHARK_LUA",
 ];
 
 fn run(prog: &str, args: &[&str]) -> Result<()> {

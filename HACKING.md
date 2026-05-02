@@ -252,20 +252,29 @@ Failure to service ep0 promptly leads to EP0 STALL + possible gadget reset.
 
       cargo xtask check-test-infra      # diagnostic
       cargo xtask test-infra-setup      # one-time per boot (sudo)
-      cargo xtask integration           # runs all scenarios
+      cargo xtask integration           # runs stable privileged scenarios
 
-  VM substrate spike:
+  VM integration flow:
 
       cargo xtask vm-image build       # build target/vm-images/smoo-integration-vm.qcow2
       cargo xtask vm-image download    # pull the input-hashed GHCR artifact with oras
       cargo xtask vm-image ref         # print the deterministic GHCR ref
       cargo xtask vm-integration
 
-  `vm-integration` boots a disposable Fedora guest with QEMU/KVM, probes the
-  guest for `dummy_hcd`, `ublk_drv`, `usbmon`, FunctionFS/configfs, and verifies
-  `fio`, `dumpcap`, and `tshark` are already available. It does not download a
-  base image or run `dnf`; if `target/vm-images/smoo-integration-vm.qcow2` is
-  absent, run `cargo xtask vm-image build` once locally or `cargo xtask vm-image
+  The privileged `smoo-test-harness` scenarios are `#[ignore]` so ordinary
+  `cargo test --workspace` and package checks can run without dummy_hcd/ublk;
+  use `cargo xtask integration` or `cargo xtask vm-integration` to run the
+  stable scenario set. `shutdown_host_loss` is intentionally excluded from the
+  stable set while it remains a known-broken reproducer.
+
+  `vm-integration` builds the smoo CLIs and `smoo-test-harness` test binaries on
+  the host, boots a disposable Fedora guest with QEMU/KVM, copies only those
+  binaries plus `tools/wireshark/smoo.lua` into the guest, probes the guest for
+  `dummy_hcd`, `ublk_drv`, `usbmon`, FunctionFS/configfs, `fio`, `dumpcap`, and
+  `tshark`, then runs the harness inside the guest under sudo. The VM image does
+  not contain a Rust toolchain and the runtime path does not download a base
+  image or run `dnf`; if `target/vm-images/smoo-integration-vm.qcow2` is absent,
+  run `cargo xtask vm-image build` once locally or `cargo xtask vm-image
   download` to trade bandwidth for compute. Set `SMOO_VM_IMAGE` to use an
   arbitrary qcow2 instead. The host must expose writable `/dev/kvm` (or set
   `SMOO_VM_ACCEL=tcg` for a slow smoke test). For sudo-less local KVM access,
@@ -288,7 +297,8 @@ Failure to service ep0 promptly leads to EP0 STALL + possible gadget reset.
 
   CI runs the same VM flow (`.github/workflows/integration-tests.yml`) on
   GitHub-hosted `ubuntu-24.04` runners: it downloads the baked qcow2 with
-  `cargo xtask vm-image download`, then runs `cargo xtask vm-integration`.
+  `cargo xtask vm-image download`, then runs `cargo xtask vm-integration` to
+  execute the harness inside the guest.
   `.github/workflows/vm-image.yml` rebuilds and pushes the GHCR image when the
   VM image setup changes. During the VM substrate spike it publishes from both
   `main` and the `test-infra` WIP branch.

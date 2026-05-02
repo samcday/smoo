@@ -68,13 +68,14 @@ impl Default for GadgetOpts {
 }
 
 pub struct GadgetFixture {
-    pub slot: Slot,
-    /// The child smoo-gadget process. Drops first (Rust struct field order)
-    /// so that SIGKILL via `kill_on_drop` releases the FunctionFS endpoint
-    /// FDs before [`GadgetConfigFs`] tries to umount.
+    /// The child smoo-gadget process. Rust drops fields in declaration order,
+    /// so this releases FunctionFS endpoint FDs before configfs is removed.
     pub child: ChildProcess,
     pub configfs: GadgetConfigFs,
     observed_ublk_dev_ids: Mutex<Vec<u32>>,
+    /// Keep the slot guard last so the dummy_hcd index is returned only after
+    /// the child and configfs teardown have run on implicit Drop.
+    pub slot: Slot,
 }
 
 impl GadgetFixture {
@@ -123,10 +124,10 @@ impl GadgetFixture {
         configfs.bind_udc().context("bind UDC")?;
 
         Ok(Self {
-            slot,
             child,
             configfs,
             observed_ublk_dev_ids: Mutex::new(Vec::new()),
+            slot,
         })
     }
 

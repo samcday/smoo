@@ -2,6 +2,7 @@ use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -24,8 +25,11 @@ const RUNTIME_SSH_USER: &str = "smoo";
 const BAKE_SSH_USER: &str = "root";
 const DEFAULT_BOOT_TIMEOUT: Duration = Duration::from_secs(300);
 const DEFAULT_GUEST_PROBE_TIMEOUT: Duration = Duration::from_secs(900);
+const DEFAULT_GUEST_HARNESS_TIMEOUT: Duration = Duration::from_secs(1800);
 const DEFAULT_IMAGE_BUILD_TIMEOUT: Duration = Duration::from_secs(1800);
 const QMP_TIMEOUT: Duration = Duration::from_secs(30);
+const GUEST_PAYLOAD_DIR: &str = "/tmp/smoo-vm-payload";
+const GUEST_TARGET_DIR: &str = "/tmp/smoo-vm-target";
 
 #[derive(Clone)]
 struct BaseImage {
@@ -41,6 +45,16 @@ struct VmImageSpec {
     setup_script_sha256: String,
     input_sha256: String,
     oci_ref: String,
+}
+
+struct HarnessTestBinary {
+    name: String,
+    executable: PathBuf,
+}
+
+struct HarnessPayload {
+    local_dir: PathBuf,
+    tests: Vec<String>,
 }
 
 pub fn vm_image(extra: &[String]) -> Result<()> {
@@ -281,6 +295,10 @@ pub fn vm_integration(extra: &[String]) -> Result<()> {
         "SMOO_VM_GUEST_PROBE_TIMEOUT_SECS",
         DEFAULT_GUEST_PROBE_TIMEOUT,
     )?;
+    let guest_harness_timeout = env_duration(
+        "SMOO_VM_GUEST_HARNESS_TIMEOUT_SECS",
+        DEFAULT_GUEST_HARNESS_TIMEOUT,
+    )?;
 
     println!("vm-integration run dir: {}", run_dir.display());
     println!("vm-integration accelerator: {accel}");
@@ -293,6 +311,7 @@ pub fn vm_integration(extra: &[String]) -> Result<()> {
 
     let result = (|| -> Result<()> {
         ensure_host_prereqs(&accel)?;
+        let payload = build_harness_payload(&workspace, &run_dir)?;
 
         let image = resolve_integration_image(&workspace)?;
         image_for_metadata = image.display().to_string();
@@ -321,6 +340,14 @@ pub fn vm_integration(extra: &[String]) -> Result<()> {
             qemu.as_mut().unwrap(),
         )?;
         run_guest_probe(port, &ssh_key, &run_dir, guest_probe_timeout)?;
+        stage_harness_payload(port, &ssh_key, &run_dir, &payload)?;
+        run_guest_harness(
+            port,
+            &ssh_key,
+            &run_dir,
+            &payload.tests,
+            guest_harness_timeout,
+        )?;
         Ok(())
     })();
 
@@ -331,6 +358,7 @@ pub fn vm_integration(extra: &[String]) -> Result<()> {
     if let (Some(port), ssh_key) = (ssh_port, run_dir.join("id_ed25519"))
         && ssh_key.exists()
     {
+        collect_guest_test_artifacts(port, &ssh_key, RUNTIME_SSH_USER, &run_dir);
         collect_guest_logs(port, &ssh_key, RUNTIME_SSH_USER, &run_dir);
     }
 
@@ -364,8 +392,382 @@ pub fn vm_integration(extra: &[String]) -> Result<()> {
 
     result?;
     shutdown_result?;
-    println!("vm-integration guest probe passed");
+    println!("vm-integration harness passed");
     Ok(())
+}
+
+fn build_harness_payload(workspace: &Path, run_dir: &Path) -> Result<HarnessPayload> {
+    ensure_tool("cargo")?;
+    ensure_tool("scp")?;
+
+    let host_target_dir = workspace.join("target/vm-harness-target");
+    fs::create_dir_all(&host_target_dir)
+        .with_context(|| format!("mkdir {}", host_target_dir.display()))?;
+
+    println!("building smoo CLI binaries for guest harness");
+    run_checked(
+        Command::new("cargo")
+            .args([
+                "build",
+                "--bins",
+                "-p",
+                "smoo-gadget-cli",
+                "-p",
+                "smoo-host-cli",
+            ])
+            .env("CARGO_TARGET_DIR", &host_target_dir),
+        "build smoo CLI binaries",
+    )?;
+
+    println!("building smoo-test-harness test binaries for guest harness");
+    let tests = build_harness_test_binaries(&host_target_dir)?;
+
+    let payload_dir = run_dir.join("payload");
+    let bin_dir = payload_dir.join("bin");
+    let tests_dir = payload_dir.join("tests");
+    let tools_dir = payload_dir.join("tools");
+    fs::create_dir_all(&bin_dir).with_context(|| format!("mkdir {}", bin_dir.display()))?;
+    fs::create_dir_all(&tests_dir).with_context(|| format!("mkdir {}", tests_dir.display()))?;
+    fs::create_dir_all(&tools_dir).with_context(|| format!("mkdir {}", tools_dir.display()))?;
+
+    let target_debug_dir = host_target_dir.join("debug");
+    copy_executable(
+        &target_debug_dir.join("smoo-gadget"),
+        &bin_dir.join("smoo-gadget"),
+    )?;
+    copy_executable(
+        &target_debug_dir.join("smoo-host"),
+        &bin_dir.join("smoo-host"),
+    )?;
+    copy_regular_file(
+        &workspace.join("tools/wireshark/smoo.lua"),
+        &tools_dir.join("smoo.lua"),
+    )?;
+
+    let mut test_names = Vec::new();
+    for test in tests {
+        copy_executable(&test.executable, &tests_dir.join(&test.name))?;
+        test_names.push(test.name);
+    }
+
+    println!("guest harness tests: {}", test_names.join(", "));
+    Ok(HarnessPayload {
+        local_dir: payload_dir,
+        tests: test_names,
+    })
+}
+
+fn build_harness_test_binaries(host_target_dir: &Path) -> Result<Vec<HarnessTestBinary>> {
+    let output = run_output(
+        Command::new("cargo")
+            .args([
+                "test",
+                "-p",
+                "smoo-test-harness",
+                "--tests",
+                "--no-run",
+                "--message-format=json",
+            ])
+            .env("CARGO_TARGET_DIR", host_target_dir),
+        "build smoo-test-harness test binaries",
+    )?;
+
+    let mut tests = Vec::new();
+    for line in output.lines() {
+        if !line.contains(r#""reason":"compiler-artifact""#) || !line.contains(r#""kind":["test"]"#)
+        {
+            continue;
+        }
+        let name = extract_json_string_field(line, "name")
+            .with_context(|| format!("parse test target name from cargo JSON: {line}"))?;
+        let executable = extract_json_string_field(line, "executable")
+            .with_context(|| format!("parse test executable from cargo JSON for {name}"))?;
+        tests.push(HarnessTestBinary {
+            name,
+            executable: PathBuf::from(executable),
+        });
+    }
+
+    for expected in crate::STABLE_HARNESS_TESTS {
+        if !tests.iter().any(|test| test.name == *expected) {
+            bail!("missing smoo-test-harness test binary: {expected}");
+        }
+    }
+
+    let mut skipped = Vec::new();
+    tests.retain(|test| {
+        let included = crate::STABLE_HARNESS_TESTS.contains(&test.name.as_str());
+        if !included {
+            skipped.push(test.name.clone());
+        }
+        included
+    });
+    if !skipped.is_empty() {
+        println!(
+            "skipping VM harness tests outside stable set: {}",
+            skipped.join(", ")
+        );
+    }
+
+    tests.sort_by(|a, b| {
+        harness_test_rank(&a.name)
+            .cmp(&harness_test_rank(&b.name))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    tests.dedup_by(|a, b| a.name == b.name);
+    if tests.is_empty() {
+        bail!("cargo did not report any smoo-test-harness integration test binaries");
+    }
+    Ok(tests)
+}
+
+fn harness_test_rank(name: &str) -> u8 {
+    crate::STABLE_HARNESS_TESTS
+        .iter()
+        .position(|test| *test == name)
+        .unwrap_or(crate::STABLE_HARNESS_TESTS.len()) as u8
+}
+
+fn stage_harness_payload(
+    port: u16,
+    key: &Path,
+    run_dir: &Path,
+    payload: &HarnessPayload,
+) -> Result<()> {
+    let prep_script = format!(
+        r#"set -euxo pipefail
+rm -rf {payload_dir} {target_dir}
+mkdir -p {payload_dir} {target_dir}
+"#,
+        payload_dir = shell_quote(GUEST_PAYLOAD_DIR),
+        target_dir = shell_quote(GUEST_TARGET_DIR),
+    );
+    run_guest_script(
+        "prepare guest harness payload directory",
+        "guest-payload-prep.stdout.log",
+        "guest-payload-prep.stderr.log",
+        port,
+        key,
+        RUNTIME_SSH_USER,
+        run_dir,
+        &prep_script,
+        Duration::from_secs(60),
+    )?;
+
+    println!("copying guest harness payload to {GUEST_PAYLOAD_DIR}");
+    run_checked(
+        scp_command(port, key)
+            .arg("-r")
+            .arg(payload.local_dir.join("."))
+            .arg(format!("{RUNTIME_SSH_USER}@127.0.0.1:{GUEST_PAYLOAD_DIR}/")),
+        "copy guest harness payload",
+    )
+}
+
+fn run_guest_harness(
+    port: u16,
+    key: &Path,
+    run_dir: &Path,
+    tests: &[String],
+    timeout: Duration,
+) -> Result<()> {
+    let script = guest_harness_script(tests);
+    run_guest_script(
+        "guest harness tests",
+        "guest-harness.stdout.log",
+        "guest-harness.stderr.log",
+        port,
+        key,
+        RUNTIME_SSH_USER,
+        run_dir,
+        &script,
+        timeout,
+    )
+}
+
+fn guest_harness_script(test_names: &[String]) -> String {
+    let tests = test_names
+        .iter()
+        .map(|name| shell_quote(name))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let rust_log = env::var("RUST_LOG").unwrap_or_else(|_| "info,smoo_test_harness=debug".into());
+    let rust_backtrace = env::var("RUST_BACKTRACE").unwrap_or_else(|_| "1".into());
+    let full_pcap_export = env::var("SMOO_FULL_PCAP")
+        .ok()
+        .map(|value| format!("export SMOO_FULL_PCAP={}\n", shell_quote(&value)))
+        .unwrap_or_default();
+
+    format!(
+        r#"set -euxo pipefail
+payload={payload_dir}
+target_dir={target_dir}
+export PATH="$payload/bin:$PATH"
+export CARGO_TARGET_DIR="$target_dir"
+export SMOO_GADGET_PATH="$payload/bin/smoo-gadget"
+export SMOO_HOST_PATH="$payload/bin/smoo-host"
+export SMOO_WIRESHARK_LUA="$payload/tools/smoo.lua"
+export RUST_LOG={rust_log}
+export RUST_BACKTRACE={rust_backtrace}
+{full_pcap_export}
+
+rm -rf "$CARGO_TARGET_DIR"
+mkdir -p "$CARGO_TARGET_DIR"
+chmod -R a+rX "$payload"
+
+cleanup_artifacts() {{
+    if test -d "$CARGO_TARGET_DIR/integration-artifacts"; then
+        sudo chown -R "$(id -u):$(id -g)" "$CARGO_TARGET_DIR/integration-artifacts" || true
+    fi
+}}
+trap cleanup_artifacts EXIT
+
+sudo_env=(
+    "PATH=$PATH"
+    "CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
+    "SMOO_GADGET_PATH=$SMOO_GADGET_PATH"
+    "SMOO_HOST_PATH=$SMOO_HOST_PATH"
+    "SMOO_WIRESHARK_LUA=$SMOO_WIRESHARK_LUA"
+    "RUST_LOG=$RUST_LOG"
+    "RUST_BACKTRACE=$RUST_BACKTRACE"
+)
+if [[ -n "${{SMOO_FULL_PCAP+x}}" ]]; then
+    sudo_env+=("SMOO_FULL_PCAP=$SMOO_FULL_PCAP")
+fi
+
+sudo -E env "${{sudo_env[@]}}" bash -lc 'set -euxo pipefail
+modprobe configfs || true
+modprobe libcomposite
+modprobe usb_f_fs
+modprobe ublk_drv
+modprobe usbmon
+modprobe dummy_hcd num_instances=4
+mountpoint -q /sys/kernel/config || mount -t configfs configfs /sys/kernel/config
+mountpoint -q /sys/kernel/debug || mount -t debugfs debugfs /sys/kernel/debug
+'
+
+test -x "$SMOO_GADGET_PATH"
+test -x "$SMOO_HOST_PATH"
+test -f "$SMOO_WIRESHARK_LUA"
+
+tests=({tests})
+for test_name in "${{tests[@]}}"; do
+    test_path="$payload/tests/$test_name"
+    test -x "$test_path"
+    echo "running smoo VM harness test: $test_name"
+    sudo -E env "${{sudo_env[@]}}" "$test_path" --include-ignored --test-threads=1 --nocapture
+done
+
+echo "smoo VM harness tests OK"
+"#,
+        payload_dir = shell_quote(GUEST_PAYLOAD_DIR),
+        target_dir = shell_quote(GUEST_TARGET_DIR),
+        rust_log = shell_quote(&rust_log),
+        rust_backtrace = shell_quote(&rust_backtrace),
+        full_pcap_export = full_pcap_export,
+        tests = tests,
+    )
+}
+
+fn collect_guest_test_artifacts(port: u16, key: &Path, ssh_user: &str, run_dir: &Path) {
+    if let Err(err) = try_collect_guest_test_artifacts(port, key, ssh_user, run_dir) {
+        eprintln!("vm-integration: failed to collect guest integration artifacts: {err:#}");
+    }
+}
+
+fn try_collect_guest_test_artifacts(
+    port: u16,
+    key: &Path,
+    ssh_user: &str,
+    run_dir: &Path,
+) -> Result<()> {
+    let remote = format!("{GUEST_TARGET_DIR}/integration-artifacts");
+    let probe = format!("test -d {}", shell_quote(&remote));
+    if !ssh_status(port, key, ssh_user, &probe)?.success() {
+        return Ok(());
+    }
+
+    let dest = run_dir.join("guest-integration-artifacts");
+    if dest.exists() {
+        fs::remove_dir_all(&dest).with_context(|| format!("remove {}", dest.display()))?;
+    }
+    let status = scp_command(port, key)
+        .arg("-r")
+        .arg(format!("{ssh_user}@127.0.0.1:{remote}"))
+        .arg(&dest)
+        .status()
+        .context("spawn scp for guest integration artifacts")?;
+    if !status.success() {
+        bail!("scp guest integration artifacts failed: {status:?}");
+    }
+
+    println!("guest integration artifacts copied to {}", dest.display());
+    Ok(())
+}
+
+fn copy_regular_file(src: &Path, dst: &Path) -> Result<()> {
+    if !src.is_file() {
+        bail!("{} is not a regular file", src.display());
+    }
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+    }
+    fs::copy(src, dst).with_context(|| format!("copy {} -> {}", src.display(), dst.display()))?;
+    Ok(())
+}
+
+fn copy_executable(src: &Path, dst: &Path) -> Result<()> {
+    copy_regular_file(src, dst)?;
+    let mut permissions = fs::metadata(dst)
+        .with_context(|| format!("stat {}", dst.display()))?
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(dst, permissions).with_context(|| format!("chmod +x {}", dst.display()))?;
+    Ok(())
+}
+
+fn extract_json_string_field(line: &str, field: &str) -> Option<String> {
+    let needle = format!(r#""{field}":"#);
+    let (_, after) = line.split_once(&needle)?;
+    let mut chars = after.trim_start().chars();
+    if chars.next()? != '"' {
+        return None;
+    }
+
+    let mut value = String::new();
+    let mut escaped = false;
+    for ch in chars {
+        if escaped {
+            match ch {
+                '"' | '\\' | '/' => value.push(ch),
+                'n' => value.push('\n'),
+                'r' => value.push('\r'),
+                't' => value.push('\t'),
+                other => value.push(other),
+            }
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            return Some(value);
+        } else {
+            value.push(ch);
+        }
+    }
+    None
+}
+
+fn shell_quote(value: &str) -> String {
+    let mut quoted = String::from("'");
+    for ch in value.chars() {
+        if ch == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(ch);
+        }
+    }
+    quoted.push('\'');
+    quoted
 }
 
 fn ensure_host_prereqs(accel: &str) -> Result<()> {
@@ -984,6 +1386,9 @@ command -v fio >/dev/null || missing_packages+=(fio)
 if ! command -v dumpcap >/dev/null || ! command -v tshark >/dev/null; then
     missing_packages+=(wireshark-cli)
 fi
+if ! fio --enghelp=libaio >/dev/null 2>&1; then
+    missing_packages+=(fio-engine-libaio)
+fi
 
 if test "${#missing_packages[@]}" -gt 0; then
     echo "missing userspace packages: ${missing_packages[*]}"
@@ -1217,6 +1622,25 @@ fn ssh_command(port: u16, key: &Path, ssh_user: &str, remote_cmd: &str) -> Comma
         .arg("LogLevel=ERROR")
         .arg(format!("{ssh_user}@127.0.0.1"))
         .arg(remote_cmd);
+    cmd
+}
+
+fn scp_command(port: u16, key: &Path) -> Command {
+    let mut cmd = Command::new("scp");
+    cmd.arg("-i")
+        .arg(key)
+        .arg("-P")
+        .arg(port.to_string())
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=5")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=no")
+        .arg("-o")
+        .arg("UserKnownHostsFile=/dev/null")
+        .arg("-o")
+        .arg("LogLevel=ERROR");
     cmd
 }
 

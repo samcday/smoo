@@ -64,6 +64,9 @@ impl LogBuffer {
                 let guard = self.lines.lock().await;
                 guard.clone()
             };
+            if scan_from > snapshot.len() {
+                scan_from = 0;
+            }
             if let Some(line) = snapshot.iter().skip(scan_from).find(|l| regex.is_match(l)) {
                 return Ok(line.clone());
             }
@@ -182,14 +185,13 @@ impl ChildProcess {
     }
 
     pub async fn wait_for_either(&self, regex: &Regex, timeout: Duration) -> Result<String> {
-        let out = Arc::clone(&self.stdout_buf);
-        let err = Arc::clone(&self.stderr_buf);
-        let re_a = regex.clone();
-        let re_b = regex.clone();
-        tokio::select! {
-            r = async move { out.wait_for(&re_a, timeout).await } => r,
-            r = async move { err.wait_for(&re_b, timeout).await } => r,
-        }
+        wait_for_either_buffer(
+            Arc::clone(&self.stdout_buf),
+            Arc::clone(&self.stderr_buf),
+            regex,
+            timeout,
+        )
+        .await
     }
 
     /// SIGTERM, wait up to [`TERM_GRACE`], SIGKILL fallback.
@@ -220,6 +222,72 @@ impl ChildProcess {
     /// exited, None otherwise.
     pub fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
         Ok(self.child.try_wait()?)
+    }
+}
+
+async fn wait_for_either_buffer(
+    stdout: Arc<LogBuffer>,
+    stderr: Arc<LogBuffer>,
+    regex: &Regex,
+    timeout: Duration,
+) -> Result<String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut stdout_scan_from = 0usize;
+    let mut stderr_scan_from = 0usize;
+
+    loop {
+        let stdout_snapshot = stdout.snapshot().await;
+        if stdout_scan_from > stdout_snapshot.len() {
+            stdout_scan_from = 0;
+        }
+        if let Some(line) = stdout_snapshot
+            .iter()
+            .skip(stdout_scan_from)
+            .find(|line| regex.is_match(line))
+        {
+            return Ok(line.clone());
+        }
+        stdout_scan_from = stdout_snapshot.len();
+
+        let stderr_snapshot = stderr.snapshot().await;
+        if stderr_scan_from > stderr_snapshot.len() {
+            stderr_scan_from = 0;
+        }
+        if let Some(line) = stderr_snapshot
+            .iter()
+            .skip(stderr_scan_from)
+            .find(|line| regex.is_match(line))
+        {
+            return Ok(line.clone());
+        }
+        stderr_scan_from = stderr_snapshot.len();
+
+        let stdout_closed = stdout.closed.load(Ordering::Acquire);
+        let stderr_closed = stderr.closed.load(Ordering::Acquire);
+        if stdout_closed && stderr_closed {
+            bail!(
+                "streams closed before pattern '{}' matched (last {} stdout / {} stderr lines buffered)",
+                regex.as_str(),
+                stdout_snapshot.len(),
+                stderr_snapshot.len()
+            );
+        }
+
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            bail!(
+                "timeout after {:?} waiting for pattern '{}' on either stream",
+                timeout,
+                regex.as_str()
+            );
+        }
+        let remaining = deadline - now;
+
+        tokio::select! {
+            _ = stdout.notify.notified(), if !stdout_closed => {}
+            _ = stderr.notify.notified(), if !stderr_closed => {}
+            _ = tokio::time::sleep(remaining) => {}
+        }
     }
 }
 
@@ -291,6 +359,43 @@ mod tests {
         let re = Regex::new("ready").unwrap();
         let got = buf.wait_for(&re, Duration::from_millis(500)).await.unwrap();
         assert_eq!(got, "ready");
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn buffer_resets_scan_after_eviction() {
+        let buf = Arc::new(LogBuffer::default());
+        for i in 0..RING_CAP {
+            buf.push(format!("line {i}")).await;
+        }
+
+        let buf2 = Arc::clone(&buf);
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            buf2.push("needle after eviction".into()).await;
+        });
+        let re = Regex::new("needle").unwrap();
+        let got = buf.wait_for(&re, Duration::from_millis(500)).await.unwrap();
+        assert_eq!(got, "needle after eviction");
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn either_wait_ignores_single_closed_stream() {
+        let stdout = Arc::new(LogBuffer::default());
+        let stderr = Arc::new(LogBuffer::default());
+        stdout.close();
+
+        let stderr2 = Arc::clone(&stderr);
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            stderr2.push("ready on stderr".into()).await;
+        });
+        let re = Regex::new("ready").unwrap();
+        let got = wait_for_either_buffer(stdout, stderr, &re, Duration::from_millis(500))
+            .await
+            .unwrap();
+        assert_eq!(got, "ready on stderr");
         writer.await.unwrap();
     }
 
