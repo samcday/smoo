@@ -235,6 +235,7 @@ async fn run_impl(args: Args) -> Result<()> {
         io_pump: None,
         io_pump_task: None,
         io_pump_capacity,
+        inflight_io: 0,
         reconcile_queue: VecDeque::new(),
         data_plane_epoch: 0,
     };
@@ -410,6 +411,7 @@ struct RuntimeState {
     io_pump: Option<IoPumpHandle>,
     io_pump_task: Option<JoinHandle<()>>,
     io_pump_capacity: usize,
+    inflight_io: usize,
     reconcile_queue: VecDeque<u32>,
     data_plane_epoch: u64,
 }
@@ -461,9 +463,19 @@ enum QueueEvent {
     },
 }
 
-#[derive(Debug)]
 enum DataPlaneEvent {
-    IoError { epoch: u64, error: io::Error },
+    IoError {
+        epoch: u64,
+        error: io::Error,
+    },
+    RequestCompleted,
+    RequestFailed {
+        export_id: u32,
+        dev_id: u32,
+        queues: Arc<UblkQueueRuntime>,
+        request: UblkIoRequest,
+        error: anyhow::Error,
+    },
 }
 
 fn notify_data_plane_error(tx: &mpsc::UnboundedSender<DataPlaneEvent>, epoch: u64, err: io::Error) {
@@ -1093,6 +1105,7 @@ async fn run_event_loop(
                     if let Err(err) = handle_data_plane_event(
                         &mut runtime,
                         &mut link,
+                        &mut outstanding,
                         event,
                     )
                     .await
@@ -1235,7 +1248,7 @@ async fn run_event_loop(
                 io_error = Some(err);
                 break;
             }
-            let outstanding_empty = outstanding.is_empty();
+            let outstanding_empty = outstanding.is_empty() && runtime.inflight_io == 0;
             let queue_drained = queue_rx.is_closed() && queue_rx.is_empty();
             if outstanding_empty && queue_drained {
                 note_exit_reason(&mut exit_reason, "graceful shutdown complete");
@@ -2073,6 +2086,7 @@ async fn process_link_commands(
 async fn handle_data_plane_event(
     runtime: &mut RuntimeState,
     link: &mut LinkController,
+    outstanding: &mut HashMap<u32, HashMap<(u16, u16), OutstandingRequest>>,
     event: DataPlaneEvent,
 ) -> Result<()> {
     match event {
@@ -2093,6 +2107,37 @@ async fn handle_data_plane_event(
             );
             link.on_io_error(&error);
         }
+        DataPlaneEvent::RequestCompleted => {
+            runtime.inflight_io = runtime
+                .inflight_io
+                .checked_sub(1)
+                .expect("inflight_io underflow");
+        }
+        DataPlaneEvent::RequestFailed {
+            export_id,
+            dev_id,
+            queues,
+            request,
+            error,
+        } => {
+            runtime.inflight_io = runtime
+                .inflight_io
+                .checked_sub(1)
+                .expect("inflight_io underflow");
+            let io_err = io_error_from_anyhow(&error);
+            link.on_io_error(&io_err);
+            park_request(outstanding, export_id, dev_id, queues, request);
+            warn!(
+                export_id,
+                dev_id,
+                queue = request.queue_id,
+                tag = request.tag,
+                io_kind = ?io_err.kind(),
+                io_errno = io_err.raw_os_error(),
+                error = ?error,
+                "request dispatch failed; parked and forcing link offline"
+            );
+        }
     }
     process_link_commands(runtime, link).await?;
     Ok(())
@@ -2102,7 +2147,7 @@ async fn handle_queue_event(
     runtime: &mut RuntimeState,
     link: &mut LinkController,
     outstanding: &mut HashMap<u32, HashMap<(u16, u16), OutstandingRequest>>,
-    _data_plane_tx: &mpsc::UnboundedSender<DataPlaneEvent>,
+    data_plane_tx: &mpsc::UnboundedSender<DataPlaneEvent>,
     event: QueueEvent,
 ) -> Result<()> {
     match event {
@@ -2144,6 +2189,7 @@ async fn handle_queue_event(
                 park_request(outstanding, export_id, dev_id, queues.clone(), request);
                 return Ok(());
             };
+            let pump = pump.clone();
             trace!(
                 export_id,
                 dev_id,
@@ -2154,22 +2200,23 @@ async fn handle_queue_event(
                 num_sectors = request.num_sectors,
                 "dispatch ublk request to host"
             );
-            if let Err(err) = handle_request(pump.clone(), export_id, queues.clone(), request).await
-            {
-                let io_err = io_error_from_anyhow(&err);
-                link.on_io_error(&io_err);
-                park_request(outstanding, export_id, dev_id, queues.clone(), request);
-                warn!(
-                    export_id,
-                    dev_id,
-                    queue = request.queue_id,
-                    tag = request.tag,
-                    io_kind = ?io_err.kind(),
-                    io_errno = io_err.raw_os_error(),
-                    error = ?err,
-                    "request dispatch failed; parked and forcing link offline"
-                );
-            }
+            runtime.inflight_io = runtime.inflight_io.saturating_add(1);
+            let data_plane_tx = data_plane_tx.clone();
+            let queues_for_request = queues.clone();
+            tokio::spawn(async move {
+                let event = match handle_request(pump, export_id, queues_for_request, request).await
+                {
+                    Ok(()) => DataPlaneEvent::RequestCompleted,
+                    Err(error) => DataPlaneEvent::RequestFailed {
+                        export_id,
+                        dev_id,
+                        queues,
+                        request,
+                        error,
+                    },
+                };
+                let _ = data_plane_tx.send(event);
+            });
         }
         QueueEvent::QueueError {
             export_id,
