@@ -5,7 +5,7 @@ echo "preparing smoo integration VM image"
 cat /etc/os-release
 uname -a
 
-dnf install -y --setopt=install_weak_deps=False fio wireshark-cli
+dnf install -y --setopt=install_weak_deps=False fio fio-engine-libaio wireshark-cli
 
 echo "validating kernel modules"
 modprobe configfs || true
@@ -29,6 +29,7 @@ fi
 for tool in fio dumpcap tshark; do
     command -v "$tool"
 done
+fio --enghelp=libaio >/dev/null
 
 dnf clean all
 rm -rf /var/cache/dnf /var/tmp/dnf-*

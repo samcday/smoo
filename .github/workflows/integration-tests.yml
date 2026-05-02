@@ -18,8 +18,8 @@ jobs:
   vm-integration:
     # The smoo integration harness needs dummy_hcd / ublk / usbmon. Public
     # GitHub-hosted runners do not expose those modules on the runner kernel,
-    # so this job first proves the VM substrate we intend to run the real
-    # harness inside: a disposable Fedora guest booted with QEMU/KVM.
+    # so this job builds the harness on the host and runs it inside a
+    # disposable Fedora guest booted with QEMU/KVM.
     runs-on: ubuntu-24.04
     timeout-minutes: 45
 
@@ -31,7 +31,7 @@ jobs:
       - name: Install VM host tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 qemu-utils cloud-image-utils openssh-client curl
+          sudo apt-get install -y qemu-system-x86 qemu-utils cloud-image-utils openssh-client curl pkg-config libusb-1.0-0-dev libclang-dev
 
       - uses: oras-project/setup-oras@v1
 
@@ -47,7 +47,7 @@ jobs:
       - name: Download baked VM image
         run: cargo xtask vm-image download
 
-      - name: Probe VM integration substrate
+      - name: Run VM integration harness
         run: cargo xtask vm-integration
 
       - if: failure()

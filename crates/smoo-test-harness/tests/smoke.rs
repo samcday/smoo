@@ -19,6 +19,7 @@ const BLOCK_SIZE: u32 = 4096;
 const TOTAL_BLOCKS: u64 = 1024; // 4 MiB
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires dummy_hcd/ublk/configfs; run via cargo xtask integration or vm-integration"]
 async fn smoke() -> Result<()> {
     common::init_tracing();
 
