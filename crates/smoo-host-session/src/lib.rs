@@ -606,14 +606,6 @@ async fn handle_write(
         Vec::new()
     };
 
-    if buf.len() != byte_len {
-        let response = short_io_response(&request);
-        return pump
-            .send_response_with_bulk(response, None)
-            .await
-            .map_err(HandlerError::Transport);
-    }
-
     if byte_len > 0 {
         match source.write_blocks(request.lba, &buf).await {
             Ok(written) if written == byte_len => {}

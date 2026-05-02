@@ -235,7 +235,14 @@ where
                     break;
                 }
             }
-            Ok(_) => continue, // partial read; let the transport retry
+            Ok(len) => {
+                tracing::warn!(
+                    len,
+                    expected = REQUEST_LEN,
+                    "interrupt IN: partial Request read; dropping bytes"
+                );
+                continue;
+            }
             Err(err) if err.kind() == TransportErrorKind::Timeout => continue,
             Err(err) => {
                 tracing::warn!(?err, "interrupt IN read failed");
