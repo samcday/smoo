@@ -465,8 +465,7 @@ impl GadgetDataPlane {
         let start = Instant::now();
         trace!(bytes = encoded.len(), "interrupt IN: sending Request");
         let mut lock = self.interrupt_in.lock().await;
-        let transfer = lock
-            .write_all_async(&encoded);
+        let transfer = lock.write_all_async(&encoded);
         transfer.await.context("write request to interrupt IN")?;
         #[cfg(feature = "metrics")]
         crate::metrics::observe_interrupt_in(encoded.len(), start.elapsed());
@@ -480,8 +479,7 @@ impl GadgetDataPlane {
         let start = Instant::now();
         trace!(bytes = buf.len(), "interrupt OUT: reading Response");
         let mut lock = self.interrupt_out.lock().await;
-        let transfer = lock
-            .read_exact_async(&mut buf);
+        let transfer = lock.read_exact_async(&mut buf);
         transfer.await.context("read response from interrupt OUT")?;
         #[cfg(feature = "metrics")]
         crate::metrics::observe_interrupt_out(buf.len(), start.elapsed());
@@ -500,8 +498,7 @@ impl GadgetDataPlane {
         let start = Instant::now();
         trace!(bytes = buf.len(), "bulk OUT: reading payload");
         let mut lock = self.bulk_out.lock().await;
-        let transfer = lock
-            .read_exact_async(buf);
+        let transfer = lock.read_exact_async(buf);
         transfer.await.context("read payload from bulk OUT")?;
         #[cfg(feature = "metrics")]
         crate::metrics::observe_bulk_out(buf.len(), start.elapsed());
@@ -523,8 +520,7 @@ impl GadgetDataPlane {
         let start = Instant::now();
         trace!(bytes = buf.len(), "bulk IN: writing payload");
         let mut lock = self.bulk_in.lock().await;
-        let transfer = lock
-            .write_all_async(buf);
+        let transfer = lock.write_all_async(buf);
         transfer.await.context("write payload to bulk IN")?;
         #[cfg(feature = "metrics")]
         crate::metrics::observe_bulk_in(buf.len(), start.elapsed());

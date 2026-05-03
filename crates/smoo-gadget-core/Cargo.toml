@@ -27,7 +27,7 @@ smoo-gadget-ublk = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt", "sync"] }
 tracing = "0.1.41"
 async-trait = { workspace = true }
-gadgetry-most-foul = { workspace = true, features = ["tokio"] }
+gadgetry-most-foul = { workspace = true }
 metrics = { version = "0.22", optional = true }
 
 [dev-dependencies]

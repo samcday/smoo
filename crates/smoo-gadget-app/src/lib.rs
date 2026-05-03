@@ -18,6 +18,7 @@ use smoo_gadget_core::{
     SmooUblk, SmooUblkDevice, StateStore, UblkIoRequest, UblkOp, UblkQueueRuntime,
 };
 use smoo_proto::{Ident, OpCode, Request, SMOO_STATUS_REQUEST, SMOO_STATUS_REQ_TYPE};
+use std::os::fd::AsRawFd;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     convert::Infallible,
@@ -30,6 +31,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use tokio::io::Interest;
 use tokio::{
     signal::unix::{signal as unix_signal, SignalKind},
     sync::{
@@ -1403,6 +1405,14 @@ async fn handle_request(
     pump.submit(work).await
 }
 
+async fn wait_custom_event(custom: &mut Custom) -> Result<()> {
+    let async_fd =
+        tokio::io::unix::AsyncFd::with_interest(custom.fd()?.as_raw_fd(), Interest::READABLE)?;
+    let mut guard = async_fd.readable().await?;
+    guard.clear_ready();
+    Ok(())
+}
+
 async fn control_loop(
     mut custom: Custom,
     handler: GadgetControl,
@@ -1417,7 +1427,7 @@ async fn control_loop(
                 debug!("control loop stopping on shutdown signal");
                 return Ok(());
             }
-            result = custom.wait_event() => {
+            result = wait_custom_event(&mut custom) => {
                 result.context("wait for FunctionFS event")?;
             }
         }
