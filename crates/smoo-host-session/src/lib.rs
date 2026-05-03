@@ -4,6 +4,7 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
+use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -13,12 +14,15 @@ use core::marker::PhantomData;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::task::{Context, Poll};
-use futures_util::FutureExt;
+use futures_util::stream::FuturesUnordered;
+use futures_util::{FutureExt, StreamExt, future::BoxFuture, pin_mut, select_biased};
 use smoo_host_core::control::{ConfigExportsV0, read_status};
+use smoo_host_core::pump::{BulkInHandle, HostPumpHandle, RequestRx, start_host_pump};
 use smoo_host_core::{
-    BlockSource, BlockSourceHandle, ControlTransport, HostErrorKind, SmooHost, Transport,
+    BlockSource, BlockSourceError, BlockSourceErrorKind, BlockSourceHandle, ControlTransport,
+    HostErrorKind, SmooHost, Transport, TransportError,
 };
-use smoo_proto::{ConfigExport, SmooStatusV0};
+use smoo_proto::{ConfigExport, OpCode, Request, Response, SmooStatusV0};
 
 pub use smoo_host_core::ExportIdentity;
 
@@ -71,16 +75,16 @@ impl HostSession {
         T: Transport + Clone + Send + Sync + 'static,
         C: ControlTransport + Sync,
     {
-        let mut host = SmooHost::new(transport, self.sources.clone());
-
-        let setup_result = setup_session(&mut host, control, &self.sources, &self.config).await;
-        let session_id = match setup_result {
-            Ok(session_id) => session_id,
-            Err(err) => return Err(err),
-        };
+        // SmooHost is used briefly for setup (IDENT + CONFIG_EXPORTS) over
+        // ep0; we then drop it and drive the data plane through the pipelined
+        // pump directly. The pump consumes the transport, so we clone before
+        // setup so we still have one to hand off.
+        let mut host = SmooHost::new(transport.clone(), self.sources.clone());
+        let session_id = setup_session(&mut host, control, &self.sources, &self.config).await?;
+        drop(host);
 
         let state = Arc::new(SessionState::new(session_id));
-        let driver = Box::pin(run_session(self, host, state.clone()));
+        let driver = Box::pin(run_session(self, transport, state.clone()));
 
         Ok(HostSessionTask {
             state,
@@ -374,43 +378,375 @@ impl SessionState {
 
 async fn run_session<T>(
     session: HostSession,
-    mut host: SmooHost<T, BlockSourceHandle>,
+    transport: T,
     state: Arc<SessionState>,
 ) -> HostSessionFinish
 where
     T: Transport + Clone + Send + Sync + 'static,
 {
+    let sources = Arc::new(session.sources.clone());
+    let (handle, req_rx, pump_task) = start_host_pump(transport);
+
+    let dispatcher = run_dispatcher(handle, req_rx, sources, state.clone()).fuse();
+    let pump_task = pump_task.fuse();
+    pin_mut!(dispatcher, pump_task);
+
     let outcome = loop {
-        if state.stop_requested.load(Ordering::Relaxed) {
-            break Ok(HostSessionOutcome::Stopped);
-        }
-
-        if state.session_changed.load(Ordering::Relaxed) {
-            let previous = state.expected_session_id.load(Ordering::Relaxed);
-            let current = state.observed_session_id.load(Ordering::Relaxed);
-            break Ok(HostSessionOutcome::SessionChanged { previous, current });
-        }
-
-        match host.run_until_event().await {
-            Ok(()) => {}
-            Err(err) => match err.kind() {
-                HostErrorKind::Transport => break Ok(HostSessionOutcome::TransportLost),
-                HostErrorKind::Unsupported | HostErrorKind::InvalidRequest => {}
-                _ => break Err(map_host_error(err)),
-            },
-        }
-
-        if state.stop_requested.load(Ordering::Relaxed) {
-            break Ok(HostSessionOutcome::Stopped);
-        }
-        if state.session_changed.load(Ordering::Relaxed) {
-            let previous = state.expected_session_id.load(Ordering::Relaxed);
-            let current = state.observed_session_id.load(Ordering::Relaxed);
-            break Ok(HostSessionOutcome::SessionChanged { previous, current });
+        select_biased! {
+            outcome = dispatcher => break outcome,
+            _ = pump_task => {
+                // Pump exited; the dispatcher's req_rx will see None on the
+                // next iteration and resolve naturally, so just keep polling
+                // it. This branch will fall through here once dispatcher
+                // resolves.
+            }
         }
     };
 
     HostSessionFinish { session, outcome }
+}
+
+async fn run_dispatcher(
+    handle: HostPumpHandle,
+    mut req_rx: RequestRx,
+    sources: Arc<BTreeMap<u32, BlockSourceHandle>>,
+    state: Arc<SessionState>,
+) -> Result<HostSessionOutcome, HostSessionError> {
+    let mut handlers: FuturesUnordered<BoxFuture<'static, ()>> = FuturesUnordered::new();
+
+    loop {
+        if state.stop_requested.load(Ordering::Relaxed) {
+            return Ok(HostSessionOutcome::Stopped);
+        }
+        if state.session_changed.load(Ordering::Relaxed) {
+            return Ok(observed_session_change(&state));
+        }
+
+        let next_req = req_rx.next().fuse();
+        let next_done = handlers.select_next_some();
+        pin_mut!(next_req, next_done);
+
+        select_biased! {
+            _ = next_done => {
+                // Handler completed; nothing else to do here. Per-request
+                // errors are logged inside the handler so the loop continues.
+            }
+            req_opt = next_req => {
+                let Some(request) = req_opt else {
+                    // Pump closed RequestRx — transport gone or peer shut down.
+                    drain_handlers(&mut handlers).await;
+                    return Ok(HostSessionOutcome::TransportLost);
+                };
+                if let Some(handler) = build_handler(&handle, &sources, request).await? {
+                    handlers.push(handler);
+                }
+            }
+        }
+    }
+}
+
+async fn drain_handlers(handlers: &mut FuturesUnordered<BoxFuture<'static, ()>>) {
+    while handlers.next().await.is_some() {}
+}
+
+fn observed_session_change(state: &SessionState) -> HostSessionOutcome {
+    let previous = state.expected_session_id.load(Ordering::Relaxed);
+    let current = state.observed_session_id.load(Ordering::Relaxed);
+    HostSessionOutcome::SessionChanged { previous, current }
+}
+
+/// Build the per-Request handler future, queueing any required bulk-IN
+/// reservation in dispatch order before the handler is spawned.
+async fn build_handler(
+    handle: &HostPumpHandle,
+    sources: &Arc<BTreeMap<u32, BlockSourceHandle>>,
+    request: Request,
+) -> Result<Option<BoxFuture<'static, ()>>, HostSessionError> {
+    tracing::trace!(
+        export_id = request.export_id,
+        request_id = request.request_id,
+        op = ?request.op,
+        lba = request.lba,
+        blocks = request.num_blocks,
+        "session: dispatch Request"
+    );
+
+    let source = sources.get(&request.export_id).cloned();
+
+    let bulk_in = if matches!(request.op, OpCode::Write) && request.num_blocks > 0 {
+        let block_size = match &source {
+            Some(s) => s.block_size(),
+            None => {
+                // Unknown export with bulk-IN payload coming. We have to
+                // surface this rather than discard silently — without the
+                // block_size we can't drain the bulk endpoint, and the wire
+                // would desync. Promote to a session-level transport error
+                // so the outer loop tears down and re-syncs via CONFIG_EXPORTS.
+                return Err(HostSessionError::with_message(
+                    HostSessionErrorKind::InvalidRequest,
+                    format!(
+                        "Write request for unknown export {} — cannot drain bulk-IN",
+                        request.export_id
+                    ),
+                ));
+            }
+        };
+        let byte_len = blocks_to_bytes(request.num_blocks, block_size).map_err(|err| {
+            HostSessionError::with_message(HostSessionErrorKind::InvalidRequest, err.to_string())
+        })?;
+        if byte_len > 0 {
+            let bulk = handle
+                .queue_bulk_in_read(byte_len)
+                .await
+                .map_err(map_transport_error)?;
+            Some(bulk)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let pump = handle.clone();
+    Ok(Some(
+        async move {
+            handle_request(pump, source, request, bulk_in).await;
+        }
+        .boxed(),
+    ))
+}
+
+async fn handle_request(
+    pump: HostPumpHandle,
+    source: Option<BlockSourceHandle>,
+    request: Request,
+    bulk_in: Option<BulkInHandle>,
+) {
+    let result = match (source, request.op) {
+        (None, _) => respond_invalid(&pump, request, ERRNO_EINVAL).await,
+        (Some(source), OpCode::Read) => handle_read(&pump, &source, request).await,
+        (Some(source), OpCode::Write) => handle_write(&pump, &source, request, bulk_in).await,
+        (Some(source), OpCode::Flush) => handle_flush(&pump, &source, request).await,
+        (Some(source), OpCode::Discard) => handle_discard(&pump, &source, request).await,
+    };
+    if let Err(err) = result {
+        tracing::warn!(
+            export_id = request.export_id,
+            request_id = request.request_id,
+            ?err,
+            "session: handler error",
+        );
+    }
+}
+
+async fn handle_read(
+    pump: &HostPumpHandle,
+    source: &BlockSourceHandle,
+    request: Request,
+) -> Result<(), HandlerError> {
+    let block_size = source.block_size();
+    let byte_len =
+        blocks_to_bytes(request.num_blocks, block_size).map_err(HandlerError::Invalid)?;
+
+    if byte_len == 0 {
+        let response = ok_response(&request, OpCode::Read);
+        return pump
+            .send_response_with_bulk(response, None)
+            .await
+            .map_err(HandlerError::Transport);
+    }
+
+    let mut buf = alloc::vec![0u8; byte_len];
+    let read = match source.read_blocks(request.lba, &mut buf).await {
+        Ok(n) => n,
+        Err(err) => {
+            let response = response_from_block_error(&request, &err);
+            return pump
+                .send_response_with_bulk(response, None)
+                .await
+                .map_err(HandlerError::Transport);
+        }
+    };
+    if read != byte_len {
+        let response = short_io_response(&request);
+        return pump
+            .send_response_with_bulk(response, None)
+            .await
+            .map_err(HandlerError::Transport);
+    }
+
+    let response = ok_response(&request, OpCode::Read);
+    pump.send_response_with_bulk(response, Some(buf))
+        .await
+        .map_err(HandlerError::Transport)
+}
+
+async fn handle_write(
+    pump: &HostPumpHandle,
+    source: &BlockSourceHandle,
+    request: Request,
+    bulk_in: Option<BulkInHandle>,
+) -> Result<(), HandlerError> {
+    let block_size = source.block_size();
+    let byte_len =
+        blocks_to_bytes(request.num_blocks, block_size).map_err(HandlerError::Invalid)?;
+
+    let buf = if byte_len > 0 {
+        let handle = bulk_in.ok_or_else(|| {
+            HandlerError::Invalid(format!(
+                "Write request {} expected bulk_in handle but none was queued",
+                request.request_id
+            ))
+        })?;
+        handle
+            .await_payload()
+            .await
+            .map_err(HandlerError::Transport)?
+    } else {
+        Vec::new()
+    };
+
+    if byte_len > 0 {
+        match source.write_blocks(request.lba, &buf).await {
+            Ok(written) if written == byte_len => {}
+            Ok(_) => {
+                let response = short_io_response(&request);
+                return pump
+                    .send_response_with_bulk(response, None)
+                    .await
+                    .map_err(HandlerError::Transport);
+            }
+            Err(err) => {
+                let response = response_from_block_error(&request, &err);
+                return pump
+                    .send_response_with_bulk(response, None)
+                    .await
+                    .map_err(HandlerError::Transport);
+            }
+        }
+    }
+
+    let response = ok_response(&request, OpCode::Write);
+    pump.send_response(response)
+        .await
+        .map_err(HandlerError::Transport)
+}
+
+async fn handle_flush(
+    pump: &HostPumpHandle,
+    source: &BlockSourceHandle,
+    request: Request,
+) -> Result<(), HandlerError> {
+    let response = match source.flush().await {
+        Ok(()) => ok_response(&request, OpCode::Flush),
+        Err(err) => response_from_block_error(&request, &err),
+    };
+    pump.send_response(response)
+        .await
+        .map_err(HandlerError::Transport)
+}
+
+async fn handle_discard(
+    pump: &HostPumpHandle,
+    source: &BlockSourceHandle,
+    request: Request,
+) -> Result<(), HandlerError> {
+    let response = match source.discard(request.lba, request.num_blocks).await {
+        Ok(()) => ok_response(&request, OpCode::Discard),
+        Err(err) => response_from_block_error(&request, &err),
+    };
+    pump.send_response(response)
+        .await
+        .map_err(HandlerError::Transport)
+}
+
+async fn respond_invalid(
+    pump: &HostPumpHandle,
+    request: Request,
+    errno: u32,
+) -> Result<(), HandlerError> {
+    let response = Response::new(
+        request.export_id,
+        request.request_id,
+        request.op,
+        errno as u8,
+        request.lba,
+        request.num_blocks,
+        0,
+    );
+    pump.send_response(response)
+        .await
+        .map_err(HandlerError::Transport)
+}
+
+#[derive(Debug)]
+enum HandlerError {
+    Transport(TransportError),
+    Invalid(String),
+}
+
+impl fmt::Display for HandlerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Transport(err) => write!(f, "transport: {err}"),
+            Self::Invalid(msg) => write!(f, "invalid: {msg}"),
+        }
+    }
+}
+
+const ERRNO_EINVAL: u32 = 22;
+const ERRNO_EIO: u32 = 5;
+const ERRNO_EOPNOTSUPP: u32 = 95;
+
+fn ok_response(request: &Request, op: OpCode) -> Response {
+    Response::new(
+        request.export_id,
+        request.request_id,
+        op,
+        0,
+        request.lba,
+        request.num_blocks,
+        0,
+    )
+}
+
+fn short_io_response(request: &Request) -> Response {
+    Response::new(
+        request.export_id,
+        request.request_id,
+        request.op,
+        ERRNO_EIO as u8,
+        request.lba,
+        request.num_blocks,
+        0,
+    )
+}
+
+fn response_from_block_error(request: &Request, err: &BlockSourceError) -> Response {
+    let errno = match err.kind() {
+        BlockSourceErrorKind::InvalidInput | BlockSourceErrorKind::OutOfRange => ERRNO_EINVAL,
+        BlockSourceErrorKind::Unsupported => ERRNO_EOPNOTSUPP,
+        BlockSourceErrorKind::Io | BlockSourceErrorKind::Other => ERRNO_EIO,
+    };
+    Response::new(
+        request.export_id,
+        request.request_id,
+        request.op,
+        errno as u8,
+        request.lba,
+        request.num_blocks,
+        0,
+    )
+}
+
+fn blocks_to_bytes(num_blocks: u32, block_size: u32) -> Result<usize, String> {
+    if block_size == 0 {
+        return Err("block size is zero".into());
+    }
+    num_blocks
+        .checked_mul(block_size)
+        .map(|v| v as usize)
+        .ok_or_else(|| "request size overflow".into())
 }
 
 async fn setup_session<T, C>(

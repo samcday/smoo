@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, anyhow, ensure};
 use dma_heap::HeapKind;
+use gadgetry_most_foul::function::custom::{EndpointIn, EndpointOut};
 use smoo_proto::{
     CONFIG_EXPORTS_REQ_TYPE, CONFIG_EXPORTS_REQUEST, IDENT_LEN, IDENT_REQUEST, Ident, RESPONSE_LEN,
     Request, Response, SMOO_STATUS_FLAG_EXPORT_ACTIVE, SMOO_STATUS_LEN, SMOO_STATUS_REQ_TYPE,
@@ -9,18 +10,11 @@ use smoo_proto::{
 use std::time::Instant;
 use std::{
     cmp,
-    fs::File as StdFile,
-    io,
-    os::fd::{AsRawFd, OwnedFd, RawFd},
+    os::fd::{AsRawFd, RawFd},
     sync::Arc,
 };
-use tokio::{
-    fs::File,
-    io::{AsyncReadExt, AsyncWriteExt},
-    sync::Mutex,
-    task,
-};
-use tracing::trace;
+use tokio::{sync::Mutex, task};
+use tracing::{debug, trace};
 
 mod dma;
 mod link;
@@ -54,18 +48,18 @@ const SETUP_STAGE_LEN: usize = 8;
 
 /// File descriptor bundle for a FunctionFS interface (data-plane endpoints only).
 pub struct FunctionfsEndpoints {
-    pub interrupt_in: OwnedFd,
-    pub interrupt_out: OwnedFd,
-    pub bulk_in: OwnedFd,
-    pub bulk_out: OwnedFd,
+    pub interrupt_in: EndpointIn,
+    pub interrupt_out: EndpointOut,
+    pub bulk_in: EndpointIn,
+    pub bulk_out: EndpointOut,
 }
 
 impl FunctionfsEndpoints {
     pub fn new(
-        interrupt_in: OwnedFd,
-        interrupt_out: OwnedFd,
-        bulk_in: OwnedFd,
-        bulk_out: OwnedFd,
+        interrupt_in: EndpointIn,
+        interrupt_out: EndpointOut,
+        bulk_in: EndpointIn,
+        bulk_out: EndpointOut,
     ) -> Self {
         Self {
             interrupt_in,
@@ -264,10 +258,6 @@ impl SmooGadget {
         &self.data_plane
     }
 
-    pub fn response_reader(&self) -> Arc<Mutex<File>> {
-        self.data_plane.response_reader()
-    }
-
     /// Current IDENT response advertised by the gadget.
     pub fn ident(&self) -> Ident {
         self.ident
@@ -412,31 +402,35 @@ pub enum SetupCommand {
 /// allows future work to multiplex multiple exports or schedule heavy work without
 /// blocking EP0.
 pub struct GadgetDataPlane {
-    interrupt_in: Arc<Mutex<File>>,
-    interrupt_out: Arc<Mutex<File>>,
-    bulk_in: Arc<Mutex<File>>,
-    bulk_out: Arc<Mutex<File>>,
+    interrupt_in: Arc<Mutex<EndpointIn>>,
+    interrupt_out: Arc<Mutex<EndpointOut>>,
+    bulk_in: Arc<Mutex<EndpointIn>>,
+    bulk_out: Arc<Mutex<EndpointOut>>,
     bulk_in_fd: RawFd,
     bulk_out_fd: RawFd,
-    read_path_lock: Arc<Mutex<()>>,
-    write_path_lock: Arc<Mutex<()>>,
     buffers: Option<Mutex<BufferPool>>,
 }
 
 impl GadgetDataPlane {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        interrupt_in: OwnedFd,
-        interrupt_out: OwnedFd,
-        bulk_in: OwnedFd,
-        bulk_out: OwnedFd,
+        interrupt_in: EndpointIn,
+        interrupt_out: EndpointOut,
+        mut bulk_in: EndpointIn,
+        mut bulk_out: EndpointOut,
         queue_count: u16,
         queue_depth: u16,
         max_io_bytes: usize,
         dma_heap: Option<DmaHeap>,
     ) -> Result<Self> {
-        let bulk_in_raw = bulk_in.as_raw_fd();
-        let bulk_out_raw = bulk_out.as_raw_fd();
+        let bulk_in_raw = bulk_in
+            .control()
+            .context("open bulk IN endpoint control")?
+            .as_raw_fd();
+        let bulk_out_raw = bulk_out
+            .control()
+            .context("open bulk OUT endpoint control")?
+            .as_raw_fd();
         let buffers = if let Some(heap) = dma_heap {
             let prealloc = queue_count as usize * queue_depth as usize;
             let cap = prealloc;
@@ -455,14 +449,12 @@ impl GadgetDataPlane {
             None
         };
         Ok(Self {
-            interrupt_in: Arc::new(Mutex::new(to_tokio_file(interrupt_in)?)),
-            interrupt_out: Arc::new(Mutex::new(to_tokio_file(interrupt_out)?)),
-            bulk_in: Arc::new(Mutex::new(to_tokio_file(bulk_in)?)),
-            bulk_out: Arc::new(Mutex::new(to_tokio_file(bulk_out)?)),
+            interrupt_in: Arc::new(Mutex::new(interrupt_in)),
+            interrupt_out: Arc::new(Mutex::new(interrupt_out)),
+            bulk_in: Arc::new(Mutex::new(bulk_in)),
+            bulk_out: Arc::new(Mutex::new(bulk_out)),
             bulk_in_fd: bulk_in_raw,
             bulk_out_fd: bulk_out_raw,
-            read_path_lock: Arc::new(Mutex::new(())),
-            write_path_lock: Arc::new(Mutex::new(())),
             buffers,
         })
     }
@@ -473,10 +465,8 @@ impl GadgetDataPlane {
         let start = Instant::now();
         trace!(bytes = encoded.len(), "interrupt IN: sending Request");
         let mut lock = self.interrupt_in.lock().await;
-        lock.write_all(&encoded)
-            .await
-            .context("write request to interrupt IN")?;
-        lock.flush().await.context("flush interrupt IN")?;
+        let transfer = lock.write_all_async(&encoded);
+        transfer.await.context("write request to interrupt IN")?;
         #[cfg(feature = "metrics")]
         crate::metrics::observe_interrupt_in(encoded.len(), start.elapsed());
         trace!("interrupt IN: Request flushed");
@@ -489,9 +479,8 @@ impl GadgetDataPlane {
         let start = Instant::now();
         trace!(bytes = buf.len(), "interrupt OUT: reading Response");
         let mut lock = self.interrupt_out.lock().await;
-        lock.read_exact(&mut buf)
-            .await
-            .context("read response from interrupt OUT")?;
+        let transfer = lock.read_exact_async(&mut buf);
+        transfer.await.context("read response from interrupt OUT")?;
         #[cfg(feature = "metrics")]
         crate::metrics::observe_interrupt_out(buf.len(), start.elapsed());
         trace!("interrupt OUT: Response received");
@@ -502,15 +491,20 @@ impl GadgetDataPlane {
         if buf.is_empty() {
             return Ok(());
         }
+        if buf.len() > 16 * 1024 {
+            debug!(bytes = buf.len(), "bulk OUT: starting large payload read");
+        }
         #[cfg(feature = "metrics")]
         let start = Instant::now();
         trace!(bytes = buf.len(), "bulk OUT: reading payload");
         let mut lock = self.bulk_out.lock().await;
-        lock.read_exact(buf)
-            .await
-            .context("read payload from bulk OUT")?;
+        let transfer = lock.read_exact_async(buf);
+        transfer.await.context("read payload from bulk OUT")?;
         #[cfg(feature = "metrics")]
         crate::metrics::observe_bulk_out(buf.len(), start.elapsed());
+        if buf.len() > 16 * 1024 {
+            debug!(bytes = buf.len(), "bulk OUT: large payload read complete");
+        }
         trace!("bulk OUT: payload received");
         Ok(())
     }
@@ -519,16 +513,20 @@ impl GadgetDataPlane {
         if buf.is_empty() {
             return Ok(());
         }
+        if buf.len() > 16 * 1024 {
+            debug!(bytes = buf.len(), "bulk IN: starting large payload write");
+        }
         #[cfg(feature = "metrics")]
         let start = Instant::now();
         trace!(bytes = buf.len(), "bulk IN: writing payload");
         let mut lock = self.bulk_in.lock().await;
-        lock.write_all(buf)
-            .await
-            .context("write payload to bulk IN")?;
-        lock.flush().await.context("flush bulk IN")?;
+        let transfer = lock.write_all_async(buf);
+        transfer.await.context("write payload to bulk IN")?;
         #[cfg(feature = "metrics")]
         crate::metrics::observe_bulk_in(buf.len(), start.elapsed());
+        if buf.len() > 16 * 1024 {
+            debug!(bytes = buf.len(), "bulk IN: large payload write complete");
+        }
         Ok(())
     }
 
@@ -536,57 +534,57 @@ impl GadgetDataPlane {
         if buf.is_empty() {
             return Ok(());
         }
+        let Some(pool) = &self.buffers else {
+            trace!(bytes = buf.len(), "bulk OUT: reading payload via read()");
+            return self.read_bulk(buf).await.context("read bulk payload");
+        };
         let len = buf.len();
-        match &self.buffers {
-            Some(pool) => {
-                let mut pool = pool.lock().await;
-                trace!(bytes = len, "bulk OUT: reading payload via buffer pool");
-                let mut handle = pool.checkout();
-                debug_assert!(handle.len() >= len);
-                #[cfg(feature = "metrics")]
-                let start = Instant::now();
-                let result = if let Some(buf_fd) = handle.dma_fd() {
-                    self.queue_dmabuf_transfer(self.bulk_out_fd, len, buf_fd)
-                        .await
-                } else {
-                    self.read_bulk(&mut handle.as_mut_slice()[..len]).await
-                };
-                if result.is_ok() {
-                    #[cfg(feature = "metrics")]
-                    crate::metrics::observe_bulk_out(len, start.elapsed());
-                    handle
-                        .finish_device_write()
-                        .context("invalidate buffer after device write")?;
-                    buf.copy_from_slice(&handle.as_slice()[..len]);
+        trace!(bytes = len, "bulk OUT: reading payload via buffer pool");
+        let mut handle = pool.lock().await.checkout();
+        debug_assert!(handle.len() >= len);
+        #[cfg(feature = "metrics")]
+        let start = Instant::now();
+        let mut result = if let Some(buf_fd) = handle.dma_fd() {
+            self.queue_dmabuf_transfer(self.bulk_out_fd, len, buf_fd)
+                .await
+        } else {
+            self.read_bulk(&mut handle.as_mut_slice()[..len]).await
+        };
+        if result.is_ok() {
+            #[cfg(feature = "metrics")]
+            crate::metrics::observe_bulk_out(len, start.elapsed());
+            match handle.finish_device_write() {
+                Ok(()) => buf.copy_from_slice(&handle.as_slice()[..len]),
+                Err(err) => {
+                    result = Err(err).context("invalidate buffer after device write");
                 }
-                pool.checkin(handle);
-                result.context("bulk OUT buffered transfer")
-            }
-            None => {
-                trace!(bytes = len, "bulk OUT: reading payload via read()");
-                self.read_bulk(buf).await.context("read bulk payload")
             }
         }
+        pool.lock().await.checkin(handle);
+        result.context("bulk OUT buffered transfer")
     }
 
     pub async fn write_bulk_buffer(&self, buf: &mut [u8]) -> Result<()> {
         if buf.is_empty() {
             return Ok(());
         }
+        let Some(pool) = &self.buffers else {
+            trace!(bytes = buf.len(), "bulk IN: writing payload via write()");
+            return self.write_bulk(buf).await.context("write bulk payload");
+        };
         let len = buf.len();
-        match &self.buffers {
-            Some(pool) => {
-                let mut pool = pool.lock().await;
-                trace!(bytes = len, "bulk IN: writing payload via buffer pool");
-                let mut handle = pool.checkout();
-                debug_assert!(handle.len() >= len);
-                handle.as_mut_slice()[..len].copy_from_slice(&buf[..len]);
-                handle
-                    .prepare_device_read()
-                    .context("prepare buffer before device read")?;
+        trace!(bytes = len, "bulk IN: writing payload via buffer pool");
+        let mut handle = pool.lock().await.checkout();
+        debug_assert!(handle.len() >= len);
+        handle.as_mut_slice()[..len].copy_from_slice(&buf[..len]);
+        let result = match handle
+            .prepare_device_read()
+            .context("prepare buffer before device read")
+        {
+            Ok(()) => {
                 #[cfg(feature = "metrics")]
                 let start = Instant::now();
-                let result = if let Some(buf_fd) = handle.dma_fd() {
+                let xfer = if let Some(buf_fd) = handle.dma_fd() {
                     self.queue_dmabuf_transfer(self.bulk_in_fd, len, buf_fd)
                         .await
                         .context("FUNCTIONFS dmabuf transfer (IN)")
@@ -594,17 +592,15 @@ impl GadgetDataPlane {
                     self.write_bulk(&handle.as_slice()[..len]).await
                 };
                 #[cfg(feature = "metrics")]
-                if result.is_ok() {
+                if xfer.is_ok() {
                     crate::metrics::observe_bulk_in(len, start.elapsed());
                 }
-                pool.checkin(handle);
-                result.context("bulk IN buffered transfer")
+                xfer
             }
-            None => {
-                trace!(bytes = len, "bulk IN: writing payload via write()");
-                self.write_bulk(buf).await.context("write bulk payload")
-            }
-        }
+            Err(err) => Err(err),
+        };
+        pool.lock().await.checkin(handle);
+        result.context("bulk IN buffered transfer")
     }
 
     async fn queue_dmabuf_transfer(
@@ -617,31 +613,12 @@ impl GadgetDataPlane {
             .await
             .map_err(|err| anyhow!("dma-buf transfer task failed: {err}"))?
     }
-
-    pub fn response_reader(&self) -> Arc<Mutex<File>> {
-        self.interrupt_out.clone()
-    }
-
-    pub async fn with_read_path<T>(&self, fut: impl Future<Output = Result<T>>) -> Result<T> {
-        let _guard = self.read_path_lock.lock().await;
-        fut.await
-    }
-
-    pub async fn with_write_path<T>(&self, fut: impl Future<Output = Result<T>>) -> Result<T> {
-        let _guard = self.write_path_lock.lock().await;
-        fut.await
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ControlDirection {
     In,
     Out,
-}
-
-fn to_tokio_file(fd: OwnedFd) -> io::Result<File> {
-    let std_file = StdFile::from(fd);
-    Ok(File::from_std(std_file))
 }
 
 #[cfg(test)]

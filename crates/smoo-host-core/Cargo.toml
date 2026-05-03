@@ -14,6 +14,6 @@ metrics = []
 [dependencies]
 async-trait = { workspace = true }
 smoo-proto = { workspace = true }
-futures-util = { workspace = true, features = ["alloc", "async-await", "async-await-macro"] }
-futures-channel = { version = "0.3.31", default-features = false, features = ["alloc"] }
+futures-util = { workspace = true, features = ["alloc", "async-await", "async-await-macro", "sink"] }
+futures-channel = { version = "0.3.31", default-features = false, features = ["alloc", "sink", "std"] }
 tracing = { version = "0.1.40", default-features = false, features = ["attributes"] }

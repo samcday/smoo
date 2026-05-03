@@ -20,7 +20,7 @@ libc = "0.2.177"
 hyper = "0.14"
 metrics-exporter-prometheus = { version = "0.13", default-features = false }
 serde = "1.0.228"
-usb-gadget = "0.7.6"
+gadgetry-most-foul = { git = "https://github.com/samcday/gadgetry-most-foul", rev = "8d1df0e8b056dfa4b44b266bbeed704cd8ab899b" }
 js-sys = "0.3.82"
 wasm-bindgen = "0.2.105"
 wasm-bindgen-futures = "0.4.55"

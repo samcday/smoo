@@ -1,5 +1,12 @@
 use anyhow::{anyhow, ensure, Context, Result};
 use clap::{Parser, ValueEnum};
+use gadgetry_most_foul::{
+    function::custom::{
+        CtrlReceiver, CtrlReq, CtrlSender, Custom, CustomBuilder, Endpoint, EndpointDirection,
+        EndpointIn, EndpointOut, Event, Interface, TransferType,
+    },
+    Class, Config, Gadget, Id, RegGadget, Strings,
+};
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request as HttpRequest, Response as HttpResponse, Server, StatusCode};
 use metrics_exporter_prometheus::PrometheusBuilder;
@@ -11,13 +18,12 @@ use smoo_gadget_core::{
     SmooUblk, SmooUblkDevice, StateStore, UblkIoRequest, UblkOp, UblkQueueRuntime,
 };
 use smoo_proto::{Ident, OpCode, Request, SMOO_STATUS_REQUEST, SMOO_STATUS_REQ_TYPE};
+use std::os::fd::AsRawFd;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     convert::Infallible,
-    fs::File,
     io,
     net::SocketAddr,
-    os::fd::{FromRawFd, IntoRawFd, OwnedFd},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -25,6 +31,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use tokio::io::Interest;
 use tokio::{
     signal::unix::{signal as unix_signal, SignalKind},
     sync::{
@@ -36,13 +43,6 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
-use usb_gadget::{
-    function::custom::{
-        CtrlReceiver, CtrlReq, CtrlSender, Custom, CustomBuilder, Endpoint, EndpointDirection,
-        Event, Interface, TransferType,
-    },
-    Class, Config, Gadget, Id, RegGadget, Strings,
-};
 
 const SMOO_CLASS: u8 = 0xFF;
 const SMOO_SUBCLASS: u8 = 0x53;
@@ -77,7 +77,12 @@ pub struct Args {
     #[arg(long, default_value_t = 16)]
     pub queue_depth: u16,
     /// Maximum per-I/O size in bytes to advertise to ublk (block-aligned).
-    #[arg(long = "max-io", value_name = "BYTES")]
+    #[arg(
+        long = "max-io",
+        alias = "max-io-bytes",
+        value_name = "BYTES",
+        value_parser = parse_byte_size,
+    )]
     pub max_io_bytes: Option<usize>,
     /// Opt-in to the experimental DMA-BUF fast path when supported by the kernel.
     #[arg(long)]
@@ -220,7 +225,7 @@ async fn run_impl(args: Args) -> Result<()> {
     let tunables = RuntimeTunables {
         queue_count: args.queue_count,
         queue_depth: args.queue_depth,
-        max_io_bytes: args.max_io_bytes,
+        max_io_bytes: Some(max_io_bytes),
         dma_heap,
     };
     let link = LinkController::new(Duration::from_secs(3));
@@ -235,6 +240,7 @@ async fn run_impl(args: Args) -> Result<()> {
         io_pump: None,
         io_pump_task: None,
         io_pump_capacity,
+        inflight_io: 0,
         reconcile_queue: VecDeque::new(),
         data_plane_epoch: 0,
     };
@@ -410,6 +416,7 @@ struct RuntimeState {
     io_pump: Option<IoPumpHandle>,
     io_pump_task: Option<JoinHandle<()>>,
     io_pump_capacity: usize,
+    inflight_io: usize,
     reconcile_queue: VecDeque<u32>,
     data_plane_epoch: u64,
 }
@@ -461,9 +468,19 @@ enum QueueEvent {
     },
 }
 
-#[derive(Debug)]
 enum DataPlaneEvent {
-    IoError { epoch: u64, error: io::Error },
+    IoError {
+        epoch: u64,
+        error: io::Error,
+    },
+    RequestCompleted,
+    RequestFailed {
+        export_id: u32,
+        dev_id: u32,
+        queues: Arc<UblkQueueRuntime>,
+        request: UblkIoRequest,
+        error: anyhow::Error,
+    },
 }
 
 fn notify_data_plane_error(tx: &mpsc::UnboundedSender<DataPlaneEvent>, epoch: u64, err: io::Error) {
@@ -1093,6 +1110,7 @@ async fn run_event_loop(
                     if let Err(err) = handle_data_plane_event(
                         &mut runtime,
                         &mut link,
+                        &mut outstanding,
                         event,
                     )
                     .await
@@ -1235,7 +1253,7 @@ async fn run_event_loop(
                 io_error = Some(err);
                 break;
             }
-            let outstanding_empty = outstanding.is_empty();
+            let outstanding_empty = outstanding.is_empty() && runtime.inflight_io == 0;
             let queue_drained = queue_rx.is_closed() && queue_rx.is_empty();
             if outstanding_empty && queue_drained {
                 note_exit_reason(&mut exit_reason, "graceful shutdown complete");
@@ -1387,6 +1405,14 @@ async fn handle_request(
     pump.submit(work).await
 }
 
+async fn wait_custom_event(custom: &mut Custom) -> Result<()> {
+    let async_fd =
+        tokio::io::unix::AsyncFd::with_interest(custom.fd()?.as_raw_fd(), Interest::READABLE)?;
+    let mut guard = async_fd.readable().await?;
+    guard.clear_ready();
+    Ok(())
+}
+
 async fn control_loop(
     mut custom: Custom,
     handler: GadgetControl,
@@ -1401,37 +1427,37 @@ async fn control_loop(
                 debug!("control loop stopping on shutdown signal");
                 return Ok(());
             }
-            result = custom.wait_event() => {
+            result = wait_custom_event(&mut custom) => {
                 result.context("wait for FunctionFS event")?;
             }
         }
         let event = custom.event().context("read FunctionFS event")?;
         match event {
-            usb_gadget::function::custom::Event::Bind => {
+            Event::Bind => {
                 debug!("FunctionFS bind event (control loop)");
                 signals.push_lifecycle(Event::Bind).await;
             }
-            usb_gadget::function::custom::Event::Unbind => {
+            Event::Unbind => {
                 debug!("FunctionFS unbind event (control loop)");
                 signals.push_lifecycle(Event::Unbind).await;
             }
-            usb_gadget::function::custom::Event::Enable => {
+            Event::Enable => {
                 debug!("FunctionFS enable event (control loop)");
                 signals.push_lifecycle(Event::Enable).await;
             }
-            usb_gadget::function::custom::Event::Disable => {
+            Event::Disable => {
                 debug!("FunctionFS disable event (control loop)");
                 signals.push_lifecycle(Event::Disable).await;
             }
-            usb_gadget::function::custom::Event::Suspend => {
+            Event::Suspend => {
                 debug!("FunctionFS suspend event (control loop)");
                 signals.push_lifecycle(Event::Suspend).await;
             }
-            usb_gadget::function::custom::Event::Resume => {
+            Event::Resume => {
                 debug!("FunctionFS resume event (control loop)");
                 signals.push_lifecycle(Event::Resume).await;
             }
-            usb_gadget::function::custom::Event::SetupDeviceToHost(sender) => {
+            Event::SetupDeviceToHost(sender) => {
                 let report = status.report().await;
                 let setup = setup_from_ctrl_req(sender.ctrl_req());
                 let mut io = UsbControlIo::from_sender(sender);
@@ -1442,7 +1468,7 @@ async fn control_loop(
                     signals.mark_status_ping();
                 }
             }
-            usb_gadget::function::custom::Event::SetupHostToDevice(receiver) => {
+            Event::SetupHostToDevice(receiver) => {
                 let report = status.report().await;
                 let setup = setup_from_ctrl_req(receiver.ctrl_req());
                 let mut io = UsbControlIo::from_receiver(receiver);
@@ -1467,7 +1493,7 @@ async fn control_loop(
                     }
                 }
             }
-            usb_gadget::function::custom::Event::Unknown(code) => {
+            Event::Unknown(code) => {
                 debug!(event = code, "FunctionFS unknown event");
             }
             _ => {}
@@ -1834,34 +1860,32 @@ struct GadgetGuard {
 fn setup_configfs(
     args: &Args,
 ) -> Result<(Custom, FunctionfsEndpoints, Option<GadgetGuard>, PathBuf)> {
+    let (builder, endpoints) = configfs_builder(args);
     if let Some(ffs_dir) = args.ffs_dir.as_ref() {
         info!(
             ffs_dir = %ffs_dir.display(),
             "using existing FunctionFS directory; skipping configfs setup"
         );
-        let custom = configfs_builder(args)
+        let custom = builder
             .existing(ffs_dir)
             .context("initialize FunctionFS in existing directory")?;
-        let endpoints = open_data_endpoints(ffs_dir)?;
         return Ok((custom, endpoints, None, ffs_dir.clone()));
     }
 
-    usb_gadget::remove_all().context("remove existing USB gadgets")?;
-    let (mut custom, handle) = configfs_builder(args).build();
+    gadgetry_most_foul::remove_all().context("remove existing USB gadgets")?;
+    let (mut custom, handle) = builder.build();
 
     let (subclass, protocol) = interface_identity(args);
     let klass = Class::new(SMOO_CLASS, subclass, protocol);
     let id = Id::new(args.vendor_id, args.product_id);
     let strings = Strings::new("smoo", "smoo gadget", "0001");
-    let udc = usb_gadget::default_udc().context("locate UDC")?;
+    let udc = gadgetry_most_foul::default_udc().context("locate UDC")?;
     let gadget =
         Gadget::new(klass, id, strings).with_config(Config::new("config").with_function(handle));
     let reg = gadget.register().context("register gadget")?;
 
     let ffs_dir = custom.ffs_dir().context("resolve FunctionFS dir")?;
     reg.bind(Some(&udc)).context("bind gadget to UDC")?;
-
-    let endpoints = open_data_endpoints(&ffs_dir)?;
 
     Ok((
         custom,
@@ -1871,15 +1895,21 @@ fn setup_configfs(
     ))
 }
 
-fn configfs_builder(args: &Args) -> CustomBuilder {
+fn configfs_builder(args: &Args) -> (CustomBuilder, FunctionfsEndpoints) {
     let (subclass, protocol) = interface_identity(args);
-    Custom::builder().with_interface(
+    let (interrupt_in, interrupt_in_ep) = interrupt_in_ep();
+    let (interrupt_out, interrupt_out_ep) = interrupt_out_ep();
+    let (bulk_in, bulk_in_ep) = bulk_in_ep();
+    let (bulk_out, bulk_out_ep) = bulk_out_ep();
+    let builder = Custom::builder().with_interface(
         Interface::new(Class::vendor_specific(subclass, protocol), "smoo")
-            .with_endpoint(interrupt_in_ep())
-            .with_endpoint(interrupt_out_ep())
-            .with_endpoint(bulk_in_ep())
-            .with_endpoint(bulk_out_ep()),
-    )
+            .with_endpoint(interrupt_in_ep)
+            .with_endpoint(interrupt_out_ep)
+            .with_endpoint(bulk_in_ep)
+            .with_endpoint(bulk_out_ep),
+    );
+    let endpoints = FunctionfsEndpoints::new(interrupt_in, interrupt_out, bulk_in, bulk_out);
+    (builder, endpoints)
 }
 
 fn interface_identity(args: &Args) -> (u8, u8) {
@@ -1890,37 +1920,24 @@ fn interface_identity(args: &Args) -> (u8, u8) {
     }
 }
 
-fn open_data_endpoints(ffs_dir: &Path) -> Result<FunctionfsEndpoints> {
-    let interrupt_in = open_endpoint_fd(ffs_dir.join("ep1")).context("open interrupt IN")?;
-    let interrupt_out = open_endpoint_fd(ffs_dir.join("ep2")).context("open interrupt OUT")?;
-    let bulk_in = open_endpoint_fd(ffs_dir.join("ep3")).context("open bulk IN")?;
-    let bulk_out = open_endpoint_fd(ffs_dir.join("ep4")).context("open bulk OUT")?;
-    Ok(FunctionfsEndpoints::new(
-        interrupt_in,
-        interrupt_out,
-        bulk_in,
-        bulk_out,
-    ))
+fn interrupt_in_ep() -> (EndpointIn, Endpoint) {
+    let (endpoint, dir) = EndpointDirection::device_to_host();
+    (endpoint, make_ep(dir, TransferType::Interrupt, 1024))
 }
 
-fn interrupt_in_ep() -> Endpoint {
-    let (_, dir) = EndpointDirection::device_to_host();
-    make_ep(dir, TransferType::Interrupt, 1024)
+fn interrupt_out_ep() -> (EndpointOut, Endpoint) {
+    let (endpoint, dir) = EndpointDirection::host_to_device();
+    (endpoint, make_ep(dir, TransferType::Interrupt, 1024))
 }
 
-fn interrupt_out_ep() -> Endpoint {
-    let (_, dir) = EndpointDirection::host_to_device();
-    make_ep(dir, TransferType::Interrupt, 1024)
+fn bulk_in_ep() -> (EndpointIn, Endpoint) {
+    let (endpoint, dir) = EndpointDirection::device_to_host();
+    (endpoint, make_ep(dir, TransferType::Bulk, 512))
 }
 
-fn bulk_in_ep() -> Endpoint {
-    let (_, dir) = EndpointDirection::device_to_host();
-    make_ep(dir, TransferType::Bulk, 512)
-}
-
-fn bulk_out_ep() -> Endpoint {
-    let (_, dir) = EndpointDirection::host_to_device();
-    make_ep(dir, TransferType::Bulk, 512)
+fn bulk_out_ep() -> (EndpointOut, Endpoint) {
+    let (endpoint, dir) = EndpointDirection::host_to_device();
+    (endpoint, make_ep(dir, TransferType::Bulk, 512))
 }
 
 fn make_ep(direction: EndpointDirection, ty: TransferType, packet_size: u16) -> Endpoint {
@@ -1934,20 +1951,6 @@ fn make_ep(direction: EndpointDirection, ty: TransferType, packet_size: u16) -> 
         ep.interval = 1;
     }
     ep
-}
-
-fn open_endpoint_fd(path: PathBuf) -> Result<OwnedFd> {
-    let file = File::options()
-        .read(true)
-        .write(true)
-        .open(&path)
-        .with_context(|| format!("open {}", path.display()))?;
-    Ok(to_owned_fd(file))
-}
-
-fn to_owned_fd(file: File) -> OwnedFd {
-    let raw = file.into_raw_fd();
-    unsafe { OwnedFd::from_raw_fd(raw) }
 }
 
 async fn cleanup_ublk_devices(
@@ -2073,6 +2076,7 @@ async fn process_link_commands(
 async fn handle_data_plane_event(
     runtime: &mut RuntimeState,
     link: &mut LinkController,
+    outstanding: &mut HashMap<u32, HashMap<(u16, u16), OutstandingRequest>>,
     event: DataPlaneEvent,
 ) -> Result<()> {
     match event {
@@ -2093,6 +2097,37 @@ async fn handle_data_plane_event(
             );
             link.on_io_error(&error);
         }
+        DataPlaneEvent::RequestCompleted => {
+            runtime.inflight_io = runtime
+                .inflight_io
+                .checked_sub(1)
+                .expect("inflight_io underflow");
+        }
+        DataPlaneEvent::RequestFailed {
+            export_id,
+            dev_id,
+            queues,
+            request,
+            error,
+        } => {
+            runtime.inflight_io = runtime
+                .inflight_io
+                .checked_sub(1)
+                .expect("inflight_io underflow");
+            let io_err = io_error_from_anyhow(&error);
+            link.on_io_error(&io_err);
+            park_request(outstanding, export_id, dev_id, queues, request);
+            warn!(
+                export_id,
+                dev_id,
+                queue = request.queue_id,
+                tag = request.tag,
+                io_kind = ?io_err.kind(),
+                io_errno = io_err.raw_os_error(),
+                error = ?error,
+                "request dispatch failed; parked and forcing link offline"
+            );
+        }
     }
     process_link_commands(runtime, link).await?;
     Ok(())
@@ -2102,7 +2137,7 @@ async fn handle_queue_event(
     runtime: &mut RuntimeState,
     link: &mut LinkController,
     outstanding: &mut HashMap<u32, HashMap<(u16, u16), OutstandingRequest>>,
-    _data_plane_tx: &mpsc::UnboundedSender<DataPlaneEvent>,
+    data_plane_tx: &mpsc::UnboundedSender<DataPlaneEvent>,
     event: QueueEvent,
 ) -> Result<()> {
     match event {
@@ -2144,6 +2179,7 @@ async fn handle_queue_event(
                 park_request(outstanding, export_id, dev_id, queues.clone(), request);
                 return Ok(());
             };
+            let pump = pump.clone();
             trace!(
                 export_id,
                 dev_id,
@@ -2154,22 +2190,23 @@ async fn handle_queue_event(
                 num_sectors = request.num_sectors,
                 "dispatch ublk request to host"
             );
-            if let Err(err) = handle_request(pump.clone(), export_id, queues.clone(), request).await
-            {
-                let io_err = io_error_from_anyhow(&err);
-                link.on_io_error(&io_err);
-                park_request(outstanding, export_id, dev_id, queues.clone(), request);
-                warn!(
-                    export_id,
-                    dev_id,
-                    queue = request.queue_id,
-                    tag = request.tag,
-                    io_kind = ?io_err.kind(),
-                    io_errno = io_err.raw_os_error(),
-                    error = ?err,
-                    "request dispatch failed; parked and forcing link offline"
-                );
-            }
+            runtime.inflight_io = runtime.inflight_io.saturating_add(1);
+            let data_plane_tx = data_plane_tx.clone();
+            let queues_for_request = queues.clone();
+            tokio::spawn(async move {
+                let event = match handle_request(pump, export_id, queues_for_request, request).await
+                {
+                    Ok(()) => DataPlaneEvent::RequestCompleted,
+                    Err(error) => DataPlaneEvent::RequestFailed {
+                        export_id,
+                        dev_id,
+                        queues,
+                        request,
+                        error,
+                    },
+                };
+                let _ = data_plane_tx.send(event);
+            });
         }
         QueueEvent::QueueError {
             export_id,
@@ -2281,6 +2318,40 @@ fn parse_hex_u16(input: &str) -> Result<u16, String> {
     u16::from_str_radix(trimmed, 16).map_err(|err| err.to_string())
 }
 
+fn parse_byte_size(input: &str) -> Result<usize, String> {
+    let input = input.trim();
+    let digits = input
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(input.len());
+    if digits == 0 {
+        return Err("byte size must start with a number".to_string());
+    }
+
+    let value = input[..digits]
+        .parse::<usize>()
+        .map_err(|err| err.to_string())?;
+    if value == 0 {
+        return Err("byte size must be non-zero".to_string());
+    }
+
+    let suffix = input[digits..].trim().to_ascii_lowercase();
+    let multiplier = match suffix.as_str() {
+        "" | "b" => 1usize,
+        "k" | "kb" | "kib" => 1024,
+        "m" | "mb" | "mib" => 1024 * 1024,
+        "g" | "gb" | "gib" => 1024 * 1024 * 1024,
+        _ => {
+            return Err(format!(
+                "unsupported byte-size suffix {suffix:?}; use B, KiB, MiB, or GiB"
+            ));
+        }
+    };
+
+    value
+        .checked_mul(multiplier)
+        .ok_or_else(|| "byte size overflows usize".to_string())
+}
+
 fn validate_persisted_record(record: &PersistedExportRecord) -> Result<()> {
     ensure!(
         record.export_id != 0,
@@ -2353,4 +2424,29 @@ fn build_spec_from_export(export: ConfigExport) -> Result<ExportSpec> {
         size_bytes: export.size_bytes,
         flags: ExportFlags::empty(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_byte_size;
+
+    #[test]
+    fn parse_byte_size_accepts_raw_bytes() {
+        assert_eq!(parse_byte_size("4096").unwrap(), 4096);
+        assert_eq!(parse_byte_size("4096B").unwrap(), 4096);
+    }
+
+    #[test]
+    fn parse_byte_size_accepts_binary_suffixes() {
+        assert_eq!(parse_byte_size("256KiB").unwrap(), 256 * 1024);
+        assert_eq!(parse_byte_size("1MiB").unwrap(), 1024 * 1024);
+        assert_eq!(parse_byte_size("2 GiB").unwrap(), 2 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_byte_size_rejects_invalid_values() {
+        assert!(parse_byte_size("0").is_err());
+        assert!(parse_byte_size("MiB").is_err());
+        assert!(parse_byte_size("1TiB").is_err());
+    }
 }

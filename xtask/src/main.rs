@@ -11,7 +11,7 @@ mod vm;
 // Privileged harness scenarios that are expected to pass in a configured
 // dummy_hcd/ublk environment. `shutdown_host_loss` is intentionally omitted:
 // it documents a known shutdown bug and is kept as a manual reproducer.
-const STABLE_HARNESS_TESTS: &[&str] = &["smoke", "rw_modest"];
+const STABLE_HARNESS_TESTS: &[&str] = &["smoke", "rw_modest", "pipelined_io", "max_io_read"];
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);

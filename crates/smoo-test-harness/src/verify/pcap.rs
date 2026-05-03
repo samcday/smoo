@@ -4,7 +4,9 @@
 //!
 //! ```sh
 //! tshark -X lua_script:tools/wireshark/smoo.lua -r <pcap> -T fields \
-//!   -e frame.number -e smoo.request.op -e smoo.response.op \
+//!   -e frame.number \
+//!   -e smoo.request.op -e smoo.request.export_id -e smoo.request.request_id \
+//!   -e smoo.response.op -e smoo.response.export_id -e smoo.response.request_id \
 //!   -e smoo.bulk.dir -e smoo.bulk.len_mismatch -e smoo.bulk.orphan \
 //!   -e smoo.config.export_id -Y smoo
 //! ```
@@ -27,6 +29,7 @@
 //! traversable by the original user, so the dropped-privilege tshark can read
 //! it without further chown gymnastics.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -50,6 +53,7 @@ struct Summary {
     length_mismatch_frames: Vec<u64>,
     orphan_frames: Vec<u64>,
     smoo_frame_count: u64,
+    peak_inflight: u32,
 }
 
 pub struct PcapAssertions {
@@ -71,7 +75,15 @@ impl PcapAssertions {
             .arg("-e")
             .arg("smoo.request.op")
             .arg("-e")
+            .arg("smoo.request.export_id")
+            .arg("-e")
+            .arg("smoo.request.request_id")
+            .arg("-e")
             .arg("smoo.response.op")
+            .arg("-e")
+            .arg("smoo.response.export_id")
+            .arg("-e")
+            .arg("smoo.response.request_id")
             .arg("-e")
             .arg("smoo.bulk.dir")
             .arg("-e")
@@ -113,6 +125,16 @@ impl PcapAssertions {
 
     pub fn config_exports_count(&self) -> u64 {
         self.summary.config_exports_count
+    }
+
+    /// Maximum number of `(export_id, request_id)` pairs observed in flight at
+    /// any point during the capture. Computed by walking smoo frames in
+    /// capture order, inserting on request frames and removing on response
+    /// frames. Zero if no smoo traffic was captured.
+    ///
+    /// A peak ≥ 2 is direct wire-level evidence that pipelining occurred.
+    pub fn peak_inflight(&self) -> u32 {
+        self.summary.peak_inflight
     }
 
     pub fn pcap_path(&self) -> &Path {
@@ -189,11 +211,15 @@ fn build_tshark_command() -> Command {
 
 /// Parse tshark's tab-separated `-T fields` output. Column order must match
 /// the `-e` flags in [`PcapAssertions::from_pcap`]: frame.number,
-/// smoo.request.op, smoo.response.op, smoo.bulk.dir,
-/// smoo.bulk.len_mismatch, smoo.bulk.orphan, smoo.config.export_id.
+/// smoo.request.op, smoo.request.export_id, smoo.request.request_id,
+/// smoo.response.op, smoo.response.export_id, smoo.response.request_id,
+/// smoo.bulk.dir, smoo.bulk.len_mismatch, smoo.bulk.orphan,
+/// smoo.config.export_id.
 /// Empty cells indicate the field was absent on that frame.
 fn summarize(tsv: &str) -> Summary {
     let mut s = Summary::default();
+    let mut inflight: HashSet<(u64, u64)> = HashSet::new();
+
     for line in tsv.lines() {
         if line.is_empty() {
             continue;
@@ -201,7 +227,11 @@ fn summarize(tsv: &str) -> Summary {
         let mut cols = line.split('\t');
         let frame_no = cols.next().and_then(|c| c.parse::<u64>().ok()).unwrap_or(0);
         let req = cols.next().unwrap_or("");
+        let req_export_id = cols.next().unwrap_or("");
+        let req_request_id = cols.next().unwrap_or("");
         let resp = cols.next().unwrap_or("");
+        let resp_export_id = cols.next().unwrap_or("");
+        let resp_request_id = cols.next().unwrap_or("");
         let bulk_dir = cols.next().unwrap_or("");
         let len_mismatch = cols.next().unwrap_or("");
         let orphan = cols.next().unwrap_or("");
@@ -210,9 +240,16 @@ fn summarize(tsv: &str) -> Summary {
         s.smoo_frame_count += 1;
         if !req.is_empty() {
             s.requests += 1;
+            if let Some(key) = request_key(req_export_id, req_request_id) {
+                inflight.insert(key);
+                s.peak_inflight = s.peak_inflight.max(inflight.len() as u32);
+            }
         }
         if !resp.is_empty() {
             s.responses += 1;
+            if let Some(key) = request_key(resp_export_id, resp_request_id) {
+                inflight.remove(&key);
+            }
         }
         // Dissector labels: bulk_out endpoint == "read" (host→gadget,
         // read-response payload); bulk_in endpoint == "write" (gadget→host,
@@ -235,13 +272,18 @@ fn summarize(tsv: &str) -> Summary {
     s
 }
 
+fn request_key(export_id: &str, request_id: &str) -> Option<(u64, u64)> {
+    Some((export_id.parse().ok()?, request_id.parse().ok()?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // Column order: frame.number, request.op, response.op, bulk.dir,
-    // len_mismatch, orphan, config.export_id. Tab-separated, empty cells
-    // mean field-absent.
+    // Column order: frame.number, request.op, request.export_id,
+    // request.request_id, response.op, response.export_id,
+    // response.request_id, bulk.dir, len_mismatch, orphan,
+    // config.export_id. Tab-separated, empty cells mean field-absent.
 
     #[test]
     fn summarize_empty_returns_zero() {
@@ -252,10 +294,13 @@ mod tests {
 
     #[test]
     fn summarize_counts_requests_and_responses() {
-        let tsv = "1\t0\t\t\t\t\t\n\
-                   2\t\t0\t\t\t\t\n\
-                   3\t\t\twrite\t\t\t\n";
-        let s = summarize(tsv);
+        let tsv = format!(
+            "{}{}{}",
+            request_line(1, 0, 1),
+            response_line(2, 0, 1),
+            "3\t\t\t\t\t\t\twrite\t\t\t\n"
+        );
+        let s = summarize(&tsv);
         assert_eq!(s.smoo_frame_count, 3);
         assert_eq!(s.requests, 1);
         assert_eq!(s.responses, 1);
@@ -265,9 +310,54 @@ mod tests {
     }
 
     #[test]
+    fn peak_inflight_zero_when_no_smoo() {
+        let s = summarize("");
+        assert_eq!(s.peak_inflight, 0);
+    }
+
+    #[test]
+    fn peak_inflight_sequential_is_one() {
+        // req(0,1) → resp(0,1) → req(0,2) → resp(0,2): never more than 1 open.
+        let tsv = format!(
+            "{}{}{}{}",
+            request_line(1, 0, 1),
+            response_line(2, 0, 1),
+            request_line(3, 0, 2),
+            response_line(4, 0, 2)
+        );
+        let s = summarize(&tsv);
+        assert_eq!(s.peak_inflight, 1);
+    }
+
+    #[test]
+    fn peak_inflight_three_overlapping_is_three() {
+        // Three requests open before any response → peak 3, even though pairs
+        // come back interleaved afterwards.
+        let tsv = format!(
+            "{}{}{}{}{}{}",
+            request_line(1, 0, 1),
+            request_line(2, 0, 2),
+            request_line(3, 1, 1),
+            response_line(4, 0, 2),
+            response_line(5, 0, 1),
+            response_line(6, 1, 1)
+        );
+        let s = summarize(&tsv);
+        assert_eq!(s.peak_inflight, 3);
+    }
+
+    fn request_line(frame_no: u64, export_id: u64, request_id: u64) -> String {
+        format!("{frame_no}\t0\t{export_id}\t{request_id}\t\t\t\t\t\t\t\n")
+    }
+
+    fn response_line(frame_no: u64, export_id: u64, request_id: u64) -> String {
+        format!("{frame_no}\t\t\t\t0\t{export_id}\t{request_id}\t\t\t\t\n")
+    }
+
+    #[test]
     fn summarize_flags_mismatch_and_orphan() {
-        let tsv = "5\t\t\tread\t1\t\t\n\
-                   7\t\t\twrite\t\t1\t\n";
+        let tsv = "5\t\t\t\t\t\t\tread\t1\t\t\n\
+                   7\t\t\t\t\t\t\twrite\t\t1\t\n";
         let s = summarize(tsv);
         assert_eq!(s.length_mismatch_frames, vec![5]);
         assert_eq!(s.orphan_frames, vec![7]);
