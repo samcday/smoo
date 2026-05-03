@@ -2,11 +2,11 @@
 //! ublk device.
 //!
 //! Backing: a 16 MB tmpfs file on the host side (`HostSourceSpec::File`).
-//! Workload: two `fio --rw=randwrite --bs=4k --io_size=8M --verify=md5
+//! Workload: two `fio --rw=randwrite --bs=256k --io_size=8M --verify=md5
 //! --do_verify=1 --iodepth=16` jobs pinned to disjoint 8 MiB ranges against a
-//! gadget configured with `queue_count=2`, `queue_depth=16` — pushes the data
-//! path into pipelined territory rather than the serialised default without
-//! letting fio jobs overwrite each other's verify headers.
+//! gadget configured with `queue_count=2`, `queue_depth=16`, `max_io=256KiB` —
+//! pushes the data path into pipelined territory rather than the serialised
+//! default without letting fio jobs overwrite each other's verify headers.
 //!
 //! Asserts: fio exits 0, both processes shut down cleanly, pcap is balanced
 //! and free of length-mismatch / orphan bulks, and pipelining was actually
@@ -25,6 +25,7 @@ use tokio::process::Command;
 
 const BLOCK_SIZE: u32 = 4096;
 const FILE_SIZE: u64 = 16 * 1024 * 1024;
+const MAX_IO_BYTES: u64 = 256 * 1024;
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires dummy_hcd/ublk/configfs; run via cargo xtask integration or vm-integration"]
@@ -46,6 +47,7 @@ async fn rw_modest() -> Result<()> {
         .with_gadget_opts(GadgetOpts {
             queue_count: 2,
             queue_depth: 16,
+            max_io_bytes: Some(MAX_IO_BYTES),
             ..GadgetOpts::default()
         })
         .start()
@@ -63,7 +65,7 @@ async fn rw_modest() -> Result<()> {
         .arg(format!("--filename={}", dev_path.display()))
         .arg("--name=integrity")
         .arg("--rw=randwrite")
-        .arg("--bs=4k")
+        .arg("--bs=256k")
         .arg("--io_size=8M")
         .arg("--size=8M")
         .arg("--offset_increment=8M")
