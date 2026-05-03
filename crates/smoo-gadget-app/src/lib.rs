@@ -1,5 +1,12 @@
 use anyhow::{anyhow, ensure, Context, Result};
 use clap::{Parser, ValueEnum};
+use gadgetry_most_foul::{
+    function::custom::{
+        CtrlReceiver, CtrlReq, CtrlSender, Custom, CustomBuilder, Endpoint, EndpointDirection,
+        EndpointIn, EndpointOut, Event, Interface, TransferType,
+    },
+    Class, Config, Gadget, Id, RegGadget, Strings,
+};
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request as HttpRequest, Response as HttpResponse, Server, StatusCode};
 use metrics_exporter_prometheus::PrometheusBuilder;
@@ -14,10 +21,8 @@ use smoo_proto::{Ident, OpCode, Request, SMOO_STATUS_REQUEST, SMOO_STATUS_REQ_TY
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     convert::Infallible,
-    fs::File,
     io,
     net::SocketAddr,
-    os::fd::{FromRawFd, IntoRawFd, OwnedFd},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -36,13 +41,6 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
-use usb_gadget::{
-    function::custom::{
-        CtrlReceiver, CtrlReq, CtrlSender, Custom, CustomBuilder, Endpoint, EndpointDirection,
-        Event, Interface, TransferType,
-    },
-    Class, Config, Gadget, Id, RegGadget, Strings,
-};
 
 const SMOO_CLASS: u8 = 0xFF;
 const SMOO_SUBCLASS: u8 = 0x53;
@@ -220,7 +218,7 @@ async fn run_impl(args: Args) -> Result<()> {
     let tunables = RuntimeTunables {
         queue_count: args.queue_count,
         queue_depth: args.queue_depth,
-        max_io_bytes: args.max_io_bytes,
+        max_io_bytes: Some(max_io_bytes),
         dma_heap,
     };
     let link = LinkController::new(Duration::from_secs(3));
@@ -1420,31 +1418,31 @@ async fn control_loop(
         }
         let event = custom.event().context("read FunctionFS event")?;
         match event {
-            usb_gadget::function::custom::Event::Bind => {
+            Event::Bind => {
                 debug!("FunctionFS bind event (control loop)");
                 signals.push_lifecycle(Event::Bind).await;
             }
-            usb_gadget::function::custom::Event::Unbind => {
+            Event::Unbind => {
                 debug!("FunctionFS unbind event (control loop)");
                 signals.push_lifecycle(Event::Unbind).await;
             }
-            usb_gadget::function::custom::Event::Enable => {
+            Event::Enable => {
                 debug!("FunctionFS enable event (control loop)");
                 signals.push_lifecycle(Event::Enable).await;
             }
-            usb_gadget::function::custom::Event::Disable => {
+            Event::Disable => {
                 debug!("FunctionFS disable event (control loop)");
                 signals.push_lifecycle(Event::Disable).await;
             }
-            usb_gadget::function::custom::Event::Suspend => {
+            Event::Suspend => {
                 debug!("FunctionFS suspend event (control loop)");
                 signals.push_lifecycle(Event::Suspend).await;
             }
-            usb_gadget::function::custom::Event::Resume => {
+            Event::Resume => {
                 debug!("FunctionFS resume event (control loop)");
                 signals.push_lifecycle(Event::Resume).await;
             }
-            usb_gadget::function::custom::Event::SetupDeviceToHost(sender) => {
+            Event::SetupDeviceToHost(sender) => {
                 let report = status.report().await;
                 let setup = setup_from_ctrl_req(sender.ctrl_req());
                 let mut io = UsbControlIo::from_sender(sender);
@@ -1455,7 +1453,7 @@ async fn control_loop(
                     signals.mark_status_ping();
                 }
             }
-            usb_gadget::function::custom::Event::SetupHostToDevice(receiver) => {
+            Event::SetupHostToDevice(receiver) => {
                 let report = status.report().await;
                 let setup = setup_from_ctrl_req(receiver.ctrl_req());
                 let mut io = UsbControlIo::from_receiver(receiver);
@@ -1480,7 +1478,7 @@ async fn control_loop(
                     }
                 }
             }
-            usb_gadget::function::custom::Event::Unknown(code) => {
+            Event::Unknown(code) => {
                 debug!(event = code, "FunctionFS unknown event");
             }
             _ => {}
@@ -1847,34 +1845,32 @@ struct GadgetGuard {
 fn setup_configfs(
     args: &Args,
 ) -> Result<(Custom, FunctionfsEndpoints, Option<GadgetGuard>, PathBuf)> {
+    let (builder, endpoints) = configfs_builder(args);
     if let Some(ffs_dir) = args.ffs_dir.as_ref() {
         info!(
             ffs_dir = %ffs_dir.display(),
             "using existing FunctionFS directory; skipping configfs setup"
         );
-        let custom = configfs_builder(args)
+        let custom = builder
             .existing(ffs_dir)
             .context("initialize FunctionFS in existing directory")?;
-        let endpoints = open_data_endpoints(ffs_dir)?;
         return Ok((custom, endpoints, None, ffs_dir.clone()));
     }
 
-    usb_gadget::remove_all().context("remove existing USB gadgets")?;
-    let (mut custom, handle) = configfs_builder(args).build();
+    gadgetry_most_foul::remove_all().context("remove existing USB gadgets")?;
+    let (mut custom, handle) = builder.build();
 
     let (subclass, protocol) = interface_identity(args);
     let klass = Class::new(SMOO_CLASS, subclass, protocol);
     let id = Id::new(args.vendor_id, args.product_id);
     let strings = Strings::new("smoo", "smoo gadget", "0001");
-    let udc = usb_gadget::default_udc().context("locate UDC")?;
+    let udc = gadgetry_most_foul::default_udc().context("locate UDC")?;
     let gadget =
         Gadget::new(klass, id, strings).with_config(Config::new("config").with_function(handle));
     let reg = gadget.register().context("register gadget")?;
 
     let ffs_dir = custom.ffs_dir().context("resolve FunctionFS dir")?;
     reg.bind(Some(&udc)).context("bind gadget to UDC")?;
-
-    let endpoints = open_data_endpoints(&ffs_dir)?;
 
     Ok((
         custom,
@@ -1884,15 +1880,21 @@ fn setup_configfs(
     ))
 }
 
-fn configfs_builder(args: &Args) -> CustomBuilder {
+fn configfs_builder(args: &Args) -> (CustomBuilder, FunctionfsEndpoints) {
     let (subclass, protocol) = interface_identity(args);
-    Custom::builder().with_interface(
+    let (interrupt_in, interrupt_in_ep) = interrupt_in_ep();
+    let (interrupt_out, interrupt_out_ep) = interrupt_out_ep();
+    let (bulk_in, bulk_in_ep) = bulk_in_ep();
+    let (bulk_out, bulk_out_ep) = bulk_out_ep();
+    let builder = Custom::builder().with_interface(
         Interface::new(Class::vendor_specific(subclass, protocol), "smoo")
-            .with_endpoint(interrupt_in_ep())
-            .with_endpoint(interrupt_out_ep())
-            .with_endpoint(bulk_in_ep())
-            .with_endpoint(bulk_out_ep()),
-    )
+            .with_endpoint(interrupt_in_ep)
+            .with_endpoint(interrupt_out_ep)
+            .with_endpoint(bulk_in_ep)
+            .with_endpoint(bulk_out_ep),
+    );
+    let endpoints = FunctionfsEndpoints::new(interrupt_in, interrupt_out, bulk_in, bulk_out);
+    (builder, endpoints)
 }
 
 fn interface_identity(args: &Args) -> (u8, u8) {
@@ -1903,37 +1905,24 @@ fn interface_identity(args: &Args) -> (u8, u8) {
     }
 }
 
-fn open_data_endpoints(ffs_dir: &Path) -> Result<FunctionfsEndpoints> {
-    let interrupt_in = open_endpoint_fd(ffs_dir.join("ep1")).context("open interrupt IN")?;
-    let interrupt_out = open_endpoint_fd(ffs_dir.join("ep2")).context("open interrupt OUT")?;
-    let bulk_in = open_endpoint_fd(ffs_dir.join("ep3")).context("open bulk IN")?;
-    let bulk_out = open_endpoint_fd(ffs_dir.join("ep4")).context("open bulk OUT")?;
-    Ok(FunctionfsEndpoints::new(
-        interrupt_in,
-        interrupt_out,
-        bulk_in,
-        bulk_out,
-    ))
+fn interrupt_in_ep() -> (EndpointIn, Endpoint) {
+    let (endpoint, dir) = EndpointDirection::device_to_host();
+    (endpoint, make_ep(dir, TransferType::Interrupt, 1024))
 }
 
-fn interrupt_in_ep() -> Endpoint {
-    let (_, dir) = EndpointDirection::device_to_host();
-    make_ep(dir, TransferType::Interrupt, 1024)
+fn interrupt_out_ep() -> (EndpointOut, Endpoint) {
+    let (endpoint, dir) = EndpointDirection::host_to_device();
+    (endpoint, make_ep(dir, TransferType::Interrupt, 1024))
 }
 
-fn interrupt_out_ep() -> Endpoint {
-    let (_, dir) = EndpointDirection::host_to_device();
-    make_ep(dir, TransferType::Interrupt, 1024)
+fn bulk_in_ep() -> (EndpointIn, Endpoint) {
+    let (endpoint, dir) = EndpointDirection::device_to_host();
+    (endpoint, make_ep(dir, TransferType::Bulk, 512))
 }
 
-fn bulk_in_ep() -> Endpoint {
-    let (_, dir) = EndpointDirection::device_to_host();
-    make_ep(dir, TransferType::Bulk, 512)
-}
-
-fn bulk_out_ep() -> Endpoint {
-    let (_, dir) = EndpointDirection::host_to_device();
-    make_ep(dir, TransferType::Bulk, 512)
+fn bulk_out_ep() -> (EndpointOut, Endpoint) {
+    let (endpoint, dir) = EndpointDirection::host_to_device();
+    (endpoint, make_ep(dir, TransferType::Bulk, 512))
 }
 
 fn make_ep(direction: EndpointDirection, ty: TransferType, packet_size: u16) -> Endpoint {
@@ -1947,20 +1936,6 @@ fn make_ep(direction: EndpointDirection, ty: TransferType, packet_size: u16) -> 
         ep.interval = 1;
     }
     ep
-}
-
-fn open_endpoint_fd(path: PathBuf) -> Result<OwnedFd> {
-    let file = File::options()
-        .read(true)
-        .write(true)
-        .open(&path)
-        .with_context(|| format!("open {}", path.display()))?;
-    Ok(to_owned_fd(file))
-}
-
-fn to_owned_fd(file: File) -> OwnedFd {
-    let raw = file.into_raw_fd();
-    unsafe { OwnedFd::from_raw_fd(raw) }
 }
 
 async fn cleanup_ublk_devices(
