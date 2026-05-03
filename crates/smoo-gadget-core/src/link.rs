@@ -1,6 +1,6 @@
+use gadgetry_most_foul::function::custom::Event;
 use std::io;
 use std::time::{Duration, Instant};
-use usb_gadget::function::custom::Event;
 
 /// Current USB link state as observed from FunctionFS lifecycle events and liveness pings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
