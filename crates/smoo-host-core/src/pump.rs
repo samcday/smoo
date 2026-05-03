@@ -302,6 +302,9 @@ where
 {
     while let Some(pending) = rx.next().await {
         let BulkInPending { deliver, byte_len } = pending;
+        if byte_len > 16 * 1024 {
+            tracing::debug!(bytes = byte_len, "bulk IN: starting large payload read");
+        }
         let mut buf = vec![0u8; byte_len];
         let result = match transport.read_bulk(&mut buf).await {
             Ok(read) if read == byte_len => Ok(buf),
@@ -312,6 +315,9 @@ where
             Err(err) => Err(err),
         };
         let was_err = result.is_err();
+        if !was_err && byte_len > 16 * 1024 {
+            tracing::debug!(bytes = byte_len, "bulk IN: large payload read complete");
+        }
         let _ = deliver.send(result);
         if was_err {
             break;
@@ -326,8 +332,16 @@ where
     while let Some(pending) = rx.next().await {
         let BulkOutPending { payload } = pending;
         let len = payload.len();
+        if len > 16 * 1024 {
+            tracing::debug!(bytes = len, "bulk OUT: starting large payload write");
+        }
         match transport.write_bulk(&payload).await {
-            Ok(written) if written == len => continue,
+            Ok(written) if written == len => {
+                if len > 16 * 1024 {
+                    tracing::debug!(bytes = len, "bulk OUT: large payload write complete");
+                }
+                continue;
+            }
             Ok(written) => {
                 tracing::warn!(
                     expected = len,
