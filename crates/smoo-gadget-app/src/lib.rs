@@ -75,7 +75,12 @@ pub struct Args {
     #[arg(long, default_value_t = 16)]
     pub queue_depth: u16,
     /// Maximum per-I/O size in bytes to advertise to ublk (block-aligned).
-    #[arg(long = "max-io", value_name = "BYTES")]
+    #[arg(
+        long = "max-io",
+        alias = "max-io-bytes",
+        value_name = "BYTES",
+        value_parser = parse_byte_size,
+    )]
     pub max_io_bytes: Option<usize>,
     /// Opt-in to the experimental DMA-BUF fast path when supported by the kernel.
     #[arg(long)]
@@ -2303,6 +2308,40 @@ fn parse_hex_u16(input: &str) -> Result<u16, String> {
     u16::from_str_radix(trimmed, 16).map_err(|err| err.to_string())
 }
 
+fn parse_byte_size(input: &str) -> Result<usize, String> {
+    let input = input.trim();
+    let digits = input
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(input.len());
+    if digits == 0 {
+        return Err("byte size must start with a number".to_string());
+    }
+
+    let value = input[..digits]
+        .parse::<usize>()
+        .map_err(|err| err.to_string())?;
+    if value == 0 {
+        return Err("byte size must be non-zero".to_string());
+    }
+
+    let suffix = input[digits..].trim().to_ascii_lowercase();
+    let multiplier = match suffix.as_str() {
+        "" | "b" => 1usize,
+        "k" | "kb" | "kib" => 1024,
+        "m" | "mb" | "mib" => 1024 * 1024,
+        "g" | "gb" | "gib" => 1024 * 1024 * 1024,
+        _ => {
+            return Err(format!(
+                "unsupported byte-size suffix {suffix:?}; use B, KiB, MiB, or GiB"
+            ));
+        }
+    };
+
+    value
+        .checked_mul(multiplier)
+        .ok_or_else(|| "byte size overflows usize".to_string())
+}
+
 fn validate_persisted_record(record: &PersistedExportRecord) -> Result<()> {
     ensure!(
         record.export_id != 0,
@@ -2375,4 +2414,29 @@ fn build_spec_from_export(export: ConfigExport) -> Result<ExportSpec> {
         size_bytes: export.size_bytes,
         flags: ExportFlags::empty(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_byte_size;
+
+    #[test]
+    fn parse_byte_size_accepts_raw_bytes() {
+        assert_eq!(parse_byte_size("4096").unwrap(), 4096);
+        assert_eq!(parse_byte_size("4096B").unwrap(), 4096);
+    }
+
+    #[test]
+    fn parse_byte_size_accepts_binary_suffixes() {
+        assert_eq!(parse_byte_size("256KiB").unwrap(), 256 * 1024);
+        assert_eq!(parse_byte_size("1MiB").unwrap(), 1024 * 1024);
+        assert_eq!(parse_byte_size("2 GiB").unwrap(), 2 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_byte_size_rejects_invalid_values() {
+        assert!(parse_byte_size("0").is_err());
+        assert!(parse_byte_size("MiB").is_err());
+        assert!(parse_byte_size("1TiB").is_err());
+    }
 }
