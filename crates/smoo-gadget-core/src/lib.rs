@@ -14,7 +14,7 @@ use std::{
     sync::Arc,
 };
 use tokio::{sync::Mutex, task};
-use tracing::trace;
+use tracing::{debug, trace};
 
 mod dma;
 mod link;
@@ -493,6 +493,9 @@ impl GadgetDataPlane {
         if buf.is_empty() {
             return Ok(());
         }
+        if buf.len() > 16 * 1024 {
+            debug!(bytes = buf.len(), "bulk OUT: starting large payload read");
+        }
         #[cfg(feature = "metrics")]
         let start = Instant::now();
         trace!(bytes = buf.len(), "bulk OUT: reading payload");
@@ -502,6 +505,9 @@ impl GadgetDataPlane {
         transfer.await.context("read payload from bulk OUT")?;
         #[cfg(feature = "metrics")]
         crate::metrics::observe_bulk_out(buf.len(), start.elapsed());
+        if buf.len() > 16 * 1024 {
+            debug!(bytes = buf.len(), "bulk OUT: large payload read complete");
+        }
         trace!("bulk OUT: payload received");
         Ok(())
     }
@@ -509,6 +515,9 @@ impl GadgetDataPlane {
     pub async fn write_bulk(&self, buf: &[u8]) -> Result<()> {
         if buf.is_empty() {
             return Ok(());
+        }
+        if buf.len() > 16 * 1024 {
+            debug!(bytes = buf.len(), "bulk IN: starting large payload write");
         }
         #[cfg(feature = "metrics")]
         let start = Instant::now();
@@ -519,6 +528,9 @@ impl GadgetDataPlane {
         transfer.await.context("write payload to bulk IN")?;
         #[cfg(feature = "metrics")]
         crate::metrics::observe_bulk_in(buf.len(), start.elapsed());
+        if buf.len() > 16 * 1024 {
+            debug!(bytes = buf.len(), "bulk IN: large payload write complete");
+        }
         Ok(())
     }
 
