@@ -1,8 +1,8 @@
 //! Scenario 3: pipelining stress.
 //!
 //! Two file-backed exports (so both halves' multi-export concurrency is
-//! exercised), `queue_count=2 queue_depth=16` on the gadget, and concurrent
-//! fio mixed-RW workloads against both ublk devices simultaneously.
+//! exercised), `queue_count=2 queue_depth=16 max_io=8KiB` on the gadget, and
+//! concurrent fio mixed-RW workloads against both ublk devices simultaneously.
 //!
 //! The intent is to put genuine pressure on:
 //!
@@ -29,6 +29,7 @@ use tokio::process::Command;
 
 const BLOCK_SIZE: u32 = 4096;
 const FILE_SIZE: u64 = 16 * 1024 * 1024;
+const MAX_IO_BYTES: u64 = 8 * 1024;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn pipelined_io() -> Result<()> {
@@ -51,6 +52,7 @@ async fn pipelined_io() -> Result<()> {
         .with_gadget_opts(GadgetOpts {
             queue_count: 2,
             queue_depth: 16,
+            max_io_bytes: Some(MAX_IO_BYTES),
             ..GadgetOpts::default()
         })
         .start()

@@ -99,7 +99,7 @@ impl GadgetFixture {
             .arg("--ffs-dir")
             .arg(&configfs.ffs_mount_dir);
         if let Some(max_io) = opts.max_io_bytes {
-            cmd.arg("--max-io-bytes").arg(max_io.to_string());
+            cmd.arg("--max-io").arg(max_io.to_string());
         }
         for arg in &opts.extra_args {
             cmd.arg(arg);
