@@ -398,7 +398,7 @@ async fn bulk_in_worker(
             tag,
             req_len,
         } = pending;
-        let mut buffer = match queues.checkout_buffer(queue_id, tag) {
+        let buffer = match queues.checkout_buffer(queue_id, tag) {
             Ok(b) => b,
             Err(err) => {
                 warn!(queue_id, tag, ?err, "checkout buffer for bulk IN");
@@ -407,7 +407,7 @@ async fn bulk_in_worker(
             }
         };
         if let Err(err) = gadget
-            .write_bulk_buffer(&mut buffer.as_mut_slice()[..req_len])
+            .write_bulk_buffer(&buffer.as_slice()[..req_len])
             .await
         {
             warn!(queue_id, tag, ?err, "bulk IN write failed");
