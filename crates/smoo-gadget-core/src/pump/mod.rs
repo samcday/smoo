@@ -339,6 +339,15 @@ async fn handle_response(
     response: Response,
 ) -> Result<()> {
     let key: InFlightKey = (response.export_id, response.request_id);
+    trace!(
+        export_id = response.export_id,
+        request_id = response.request_id,
+        op = ?response.op,
+        status = response.status,
+        lba = response.lba,
+        blocks = response.num_blocks,
+        "interrupt OUT: received Response"
+    );
     let Some(entry) = registry.take(key) else {
         warn!(
             export_id = response.export_id,

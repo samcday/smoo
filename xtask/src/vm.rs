@@ -30,6 +30,7 @@ const DEFAULT_IMAGE_BUILD_TIMEOUT: Duration = Duration::from_secs(1800);
 const QMP_TIMEOUT: Duration = Duration::from_secs(30);
 const GUEST_PAYLOAD_DIR: &str = "/tmp/smoo-vm-payload";
 const GUEST_TARGET_DIR: &str = "/tmp/smoo-vm-target";
+const DEFAULT_VM_RUST_LOG: &str = "info,smoo_test_harness=debug,smoo_host_core::pump=trace,smoo_host_session=trace,smoo_gadget_core::pump=trace";
 
 #[derive(Clone)]
 struct BaseImage {
@@ -591,7 +592,7 @@ fn guest_harness_script(test_names: &[String]) -> String {
         .map(|name| shell_quote(name))
         .collect::<Vec<_>>()
         .join(" ");
-    let rust_log = env::var("RUST_LOG").unwrap_or_else(|_| "info,smoo_test_harness=debug".into());
+    let rust_log = env::var("RUST_LOG").unwrap_or_else(|_| DEFAULT_VM_RUST_LOG.into());
     let rust_backtrace = env::var("RUST_BACKTRACE").unwrap_or_else(|_| "1".into());
     let full_pcap_export = env::var("SMOO_FULL_PCAP")
         .ok()
