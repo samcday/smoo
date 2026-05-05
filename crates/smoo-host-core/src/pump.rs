@@ -231,6 +231,14 @@ where
                         break;
                     }
                 };
+                tracing::trace!(
+                    export_id = request.export_id,
+                    request_id = request.request_id,
+                    op = ?request.op,
+                    lba = request.lba,
+                    blocks = request.num_blocks,
+                    "interrupt IN: decoded Request"
+                );
                 if req_tx.send(request).await.is_err() {
                     break;
                 }
@@ -266,6 +274,17 @@ async fn run_interrupt_out_writer<T>(
             reply,
         } = cmd;
         let encoded = response.encode();
+        let bulk_bytes = bulk_out.as_ref().map(Vec::len).unwrap_or(0);
+        tracing::trace!(
+            export_id = response.export_id,
+            request_id = response.request_id,
+            op = ?response.op,
+            status = response.status,
+            lba = response.lba,
+            blocks = response.num_blocks,
+            bulk_bytes,
+            "interrupt OUT: writing Response"
+        );
         let interrupt_result: TransportResult<()> = match transport.write_interrupt(&encoded).await
         {
             Ok(written) if written == RESPONSE_LEN => Ok(()),

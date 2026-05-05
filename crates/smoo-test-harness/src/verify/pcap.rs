@@ -29,7 +29,9 @@
 //! traversable by the original user, so the dropped-privilege tshark can read
 //! it without further chown gymnastics.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::fmt::Write as _;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -61,6 +63,70 @@ pub struct PcapAssertions {
     pcap_path: PathBuf,
 }
 
+const TSHARK_COLUMNS: &[&str] = &[
+    // Keep the original summary columns first; summarize() depends on this
+    // order and older unit-test fixtures intentionally omit the appended
+    // diagnostics columns.
+    "frame.number",
+    "smoo.request.op",
+    "smoo.request.export_id",
+    "smoo.request.request_id",
+    "smoo.response.op",
+    "smoo.response.export_id",
+    "smoo.response.request_id",
+    "smoo.bulk.dir",
+    "smoo.bulk.len_mismatch",
+    "smoo.bulk.orphan",
+    "smoo.config.export_id",
+    // Extra fields persisted to capture.smoo.tsv for post-failure triage.
+    "frame.time_epoch",
+    "usb.bus_id",
+    "usb.device_address",
+    "usb.endpoint_address",
+    "usb.transfer_type",
+    "usb.urb_type",
+    "usb.data_len",
+    "smoo.request.lba",
+    "smoo.request.num_blocks",
+    "smoo.request.flags",
+    "smoo.response.status",
+    "smoo.response.lba",
+    "smoo.response.num_blocks",
+    "smoo.response.flags",
+    "smoo.bulk.export_id",
+    "smoo.bulk.request_id",
+    "smoo.bulk.lba",
+    "smoo.bulk.num_blocks",
+    "smoo.bulk.expected_len",
+    "smoo.bulk.actual_len",
+];
+
+const COL_FRAME_NO: usize = 0;
+const COL_REQ_OP: usize = 1;
+const COL_REQ_EXPORT_ID: usize = 2;
+const COL_REQ_REQUEST_ID: usize = 3;
+const COL_RESP_OP: usize = 4;
+const COL_RESP_EXPORT_ID: usize = 5;
+const COL_RESP_REQUEST_ID: usize = 6;
+const COL_BULK_DIR: usize = 7;
+const COL_LEN_MISMATCH: usize = 8;
+const COL_ORPHAN: usize = 9;
+const COL_CONFIG_EXPORT_ID: usize = 10;
+const COL_TIME_EPOCH: usize = 11;
+const COL_USB_BUS_ID: usize = 12;
+const COL_USB_DEVICE_ADDRESS: usize = 13;
+const COL_USB_ENDPOINT_ADDRESS: usize = 14;
+const COL_USB_TRANSFER_TYPE: usize = 15;
+const COL_USB_URB_TYPE: usize = 16;
+const COL_USB_DATA_LEN: usize = 17;
+const COL_REQ_LBA: usize = 18;
+const COL_REQ_BLOCKS: usize = 19;
+const COL_REQ_FLAGS: usize = 20;
+const COL_RESP_STATUS: usize = 21;
+const COL_RESP_LBA: usize = 22;
+const COL_RESP_BLOCKS: usize = 23;
+const COL_RESP_FLAGS: usize = 24;
+
 impl PcapAssertions {
     pub async fn from_pcap(pcap: &Path, lua: &Path) -> Result<Self> {
         let mut cmd = build_tshark_command();
@@ -69,31 +135,11 @@ impl PcapAssertions {
             .arg("-r")
             .arg(pcap)
             .arg("-T")
-            .arg("fields")
-            .arg("-e")
-            .arg("frame.number")
-            .arg("-e")
-            .arg("smoo.request.op")
-            .arg("-e")
-            .arg("smoo.request.export_id")
-            .arg("-e")
-            .arg("smoo.request.request_id")
-            .arg("-e")
-            .arg("smoo.response.op")
-            .arg("-e")
-            .arg("smoo.response.export_id")
-            .arg("-e")
-            .arg("smoo.response.request_id")
-            .arg("-e")
-            .arg("smoo.bulk.dir")
-            .arg("-e")
-            .arg("smoo.bulk.len_mismatch")
-            .arg("-e")
-            .arg("smoo.bulk.orphan")
-            .arg("-e")
-            .arg("smoo.config.export_id")
-            .arg("-Y")
-            .arg("smoo");
+            .arg("fields");
+        for column in TSHARK_COLUMNS {
+            cmd.arg("-e").arg(column);
+        }
+        cmd.arg("-Y").arg("smoo");
         let output = cmd.output().await.context("spawn tshark")?;
         if !output.status.success() {
             bail!(
@@ -103,6 +149,7 @@ impl PcapAssertions {
             );
         }
         let tsv = std::str::from_utf8(&output.stdout).context("tshark output not utf-8")?;
+        write_pcap_diagnostics(pcap, tsv);
         let summary = summarize(tsv);
         Ok(Self {
             summary,
@@ -174,19 +221,21 @@ impl PcapAssertions {
         let s = &self.summary;
         if s.responses > s.requests {
             bail!(
-                "more responses than requests: {} requests, {} responses",
+                "more responses than requests: {} requests, {} responses (diagnostics: {})",
                 s.requests,
-                s.responses
+                s.responses,
+                diagnostics_path(&self.pcap_path).display()
             );
         }
         let unanswered = s.requests - s.responses;
         if unanswered > tolerated_in_flight {
             bail!(
-                "request/response imbalance: {} requests, {} responses ({} unanswered, tolerance {})",
+                "request/response imbalance: {} requests, {} responses ({} unanswered, tolerance {}, diagnostics: {})",
                 s.requests,
                 s.responses,
                 unanswered,
-                tolerated_in_flight
+                tolerated_in_flight,
+                diagnostics_path(&self.pcap_path).display()
             );
         }
         Ok(())
@@ -209,6 +258,342 @@ fn build_tshark_command() -> Command {
     Command::new("tshark")
 }
 
+fn write_pcap_diagnostics(pcap: &Path, tsv: &str) {
+    let columns = format!("{}\n", TSHARK_COLUMNS.join("\n"));
+    let diagnostics = build_diagnostic_report(tsv);
+    for (path, contents) in [
+        (pcap.with_extension("smoo.tsv"), tsv.to_string()),
+        (pcap.with_extension("smoo-columns.txt"), columns),
+        (diagnostics_path(pcap), diagnostics.report),
+        (
+            pcap.with_extension("smoo-anomaly-context.tsv"),
+            diagnostics.context_tsv,
+        ),
+    ] {
+        if let Err(err) = fs::write(&path, contents) {
+            tracing::warn!(?err, path = %path.display(), "write pcap diagnostic artifact failed");
+        }
+    }
+}
+
+fn diagnostics_path(pcap: &Path) -> PathBuf {
+    pcap.with_extension("smoo-anomalies.txt")
+}
+
+#[derive(Clone, Debug, Default)]
+struct DiagnosticReport {
+    report: String,
+    context_tsv: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct MessageTuple {
+    op: String,
+    export_id: String,
+    request_id: String,
+    lba: String,
+    blocks: String,
+    flags: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct RequestKey {
+    export_id: String,
+    request_id: String,
+}
+
+#[derive(Clone, Debug)]
+struct FrameRef {
+    frame_no: u64,
+    time_epoch: String,
+    bus_id: String,
+    device_address: String,
+    endpoint: String,
+    transfer_type: String,
+    urb_type: String,
+    data_len: String,
+    status: Option<String>,
+}
+
+fn build_diagnostic_report(tsv: &str) -> DiagnosticReport {
+    let mut request_tuples: BTreeMap<MessageTuple, Vec<FrameRef>> = BTreeMap::new();
+    let mut response_tuples: BTreeMap<MessageTuple, Vec<FrameRef>> = BTreeMap::new();
+    let mut request_keys: BTreeMap<RequestKey, Vec<FrameRef>> = BTreeMap::new();
+    let mut response_keys: BTreeMap<RequestKey, Vec<FrameRef>> = BTreeMap::new();
+    let mut anomaly_frames = BTreeSet::new();
+
+    for line in tsv.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let cols: Vec<_> = line.split('\t').collect();
+        let frame = frame_ref(&cols, None);
+
+        if !col(&cols, COL_REQ_OP).is_empty() {
+            let tuple = MessageTuple {
+                op: col(&cols, COL_REQ_OP).to_string(),
+                export_id: col(&cols, COL_REQ_EXPORT_ID).to_string(),
+                request_id: col(&cols, COL_REQ_REQUEST_ID).to_string(),
+                lba: col(&cols, COL_REQ_LBA).to_string(),
+                blocks: col(&cols, COL_REQ_BLOCKS).to_string(),
+                flags: col(&cols, COL_REQ_FLAGS).to_string(),
+            };
+            let key = RequestKey {
+                export_id: tuple.export_id.clone(),
+                request_id: tuple.request_id.clone(),
+            };
+            request_tuples.entry(tuple).or_default().push(frame.clone());
+            request_keys.entry(key).or_default().push(frame.clone());
+        }
+
+        if !col(&cols, COL_RESP_OP).is_empty() {
+            let tuple = MessageTuple {
+                op: col(&cols, COL_RESP_OP).to_string(),
+                export_id: col(&cols, COL_RESP_EXPORT_ID).to_string(),
+                request_id: col(&cols, COL_RESP_REQUEST_ID).to_string(),
+                lba: col(&cols, COL_RESP_LBA).to_string(),
+                blocks: col(&cols, COL_RESP_BLOCKS).to_string(),
+                flags: col(&cols, COL_RESP_FLAGS).to_string(),
+            };
+            let key = RequestKey {
+                export_id: tuple.export_id.clone(),
+                request_id: tuple.request_id.clone(),
+            };
+            let frame = frame_ref(&cols, Some(col(&cols, COL_RESP_STATUS).to_string()));
+            response_tuples
+                .entry(tuple)
+                .or_default()
+                .push(frame.clone());
+            response_keys.entry(key).or_default().push(frame);
+        }
+    }
+
+    let summary = summarize(tsv);
+
+    let mut report = String::new();
+    writeln!(
+        report,
+        "counts: smoo_frames={} requests={} responses={} bulk_in={} bulk_out={} config_exports={} peak_inflight={}",
+        summary.smoo_frame_count,
+        summary.requests,
+        summary.responses,
+        summary.bulk_in,
+        summary.bulk_out,
+        summary.config_exports_count,
+        summary.peak_inflight,
+    )
+    .ok();
+    writeln!(report).ok();
+
+    append_tuple_imbalances(
+        &mut report,
+        &request_tuples,
+        &response_tuples,
+        &mut anomaly_frames,
+    );
+    append_key_imbalances(
+        &mut report,
+        &request_keys,
+        &response_keys,
+        &mut anomaly_frames,
+    );
+    append_flagged_frames(
+        &mut report,
+        "bulk length mismatch frames",
+        &summary.length_mismatch_frames,
+        &mut anomaly_frames,
+    );
+    append_flagged_frames(
+        &mut report,
+        "orphan bulk frames",
+        &summary.orphan_frames,
+        &mut anomaly_frames,
+    );
+
+    let context_tsv = build_context_tsv(tsv, &anomaly_frames);
+    DiagnosticReport {
+        report,
+        context_tsv,
+    }
+}
+
+fn append_tuple_imbalances(
+    report: &mut String,
+    requests: &BTreeMap<MessageTuple, Vec<FrameRef>>,
+    responses: &BTreeMap<MessageTuple, Vec<FrameRef>>,
+    anomaly_frames: &mut BTreeSet<u64>,
+) {
+    let mut keys: BTreeSet<MessageTuple> = requests.keys().cloned().collect();
+    keys.extend(responses.keys().cloned());
+
+    writeln!(report, "exact request/response tuple imbalances:").ok();
+    let mut count = 0usize;
+    for tuple in keys {
+        let req_frames = requests.get(&tuple).map(Vec::as_slice).unwrap_or(&[]);
+        let resp_frames = responses.get(&tuple).map(Vec::as_slice).unwrap_or(&[]);
+        if req_frames.len() == resp_frames.len() {
+            continue;
+        }
+        count += 1;
+        for frame in req_frames.iter().chain(resp_frames.iter()) {
+            anomaly_frames.insert(frame.frame_no);
+        }
+        writeln!(
+            report,
+            "  op={} export_id={} request_id={} lba={} blocks={} flags={} requests={} responses={}",
+            tuple.op,
+            tuple.export_id,
+            tuple.request_id,
+            tuple.lba,
+            tuple.blocks,
+            tuple.flags,
+            req_frames.len(),
+            resp_frames.len(),
+        )
+        .ok();
+        append_frame_refs(report, "request frames", req_frames);
+        append_frame_refs(report, "response frames", resp_frames);
+    }
+    if count == 0 {
+        writeln!(report, "  none").ok();
+    }
+    writeln!(report).ok();
+}
+
+fn append_key_imbalances(
+    report: &mut String,
+    requests: &BTreeMap<RequestKey, Vec<FrameRef>>,
+    responses: &BTreeMap<RequestKey, Vec<FrameRef>>,
+    anomaly_frames: &mut BTreeSet<u64>,
+) {
+    let mut keys: BTreeSet<RequestKey> = requests.keys().cloned().collect();
+    keys.extend(responses.keys().cloned());
+
+    writeln!(report, "request-id key imbalances:").ok();
+    let mut count = 0usize;
+    for key in keys {
+        let req_frames = requests.get(&key).map(Vec::as_slice).unwrap_or(&[]);
+        let resp_frames = responses.get(&key).map(Vec::as_slice).unwrap_or(&[]);
+        if req_frames.len() == resp_frames.len() {
+            continue;
+        }
+        count += 1;
+        for frame in req_frames.iter().chain(resp_frames.iter()) {
+            anomaly_frames.insert(frame.frame_no);
+        }
+        writeln!(
+            report,
+            "  export_id={} request_id={} requests={} responses={}",
+            key.export_id,
+            key.request_id,
+            req_frames.len(),
+            resp_frames.len(),
+        )
+        .ok();
+        append_frame_refs(report, "request frames", req_frames);
+        append_frame_refs(report, "response frames", resp_frames);
+    }
+    if count == 0 {
+        writeln!(report, "  none").ok();
+    }
+    writeln!(report).ok();
+}
+
+fn append_flagged_frames(
+    report: &mut String,
+    label: &str,
+    frames: &[u64],
+    anomaly_frames: &mut BTreeSet<u64>,
+) {
+    writeln!(report, "{label}:").ok();
+    if frames.is_empty() {
+        writeln!(report, "  none").ok();
+        writeln!(report).ok();
+        return;
+    }
+    for frame in frames {
+        anomaly_frames.insert(*frame);
+    }
+    writeln!(report, "  {frames:?}").ok();
+    writeln!(report).ok();
+}
+
+fn append_frame_refs(report: &mut String, label: &str, frames: &[FrameRef]) {
+    write!(report, "    {label}:").ok();
+    if frames.is_empty() {
+        writeln!(report, " none").ok();
+        return;
+    }
+    for frame in frames.iter().take(24) {
+        write!(
+            report,
+            " {}@{} bus={} dev={} ep={} xfer={} urb={} len={}",
+            frame.frame_no,
+            frame.time_epoch,
+            frame.bus_id,
+            frame.device_address,
+            frame.endpoint,
+            frame.transfer_type,
+            frame.urb_type,
+            frame.data_len,
+        )
+        .ok();
+        if let Some(status) = &frame.status {
+            write!(report, " status={status}").ok();
+        }
+        write!(report, ";").ok();
+    }
+    if frames.len() > 24 {
+        write!(report, " ... +{} more", frames.len() - 24).ok();
+    }
+    writeln!(report).ok();
+}
+
+fn build_context_tsv(tsv: &str, anomaly_frames: &BTreeSet<u64>) -> String {
+    let mut context_frames = BTreeSet::new();
+    for frame in anomaly_frames {
+        let start = frame.saturating_sub(8);
+        let end = frame.saturating_add(8);
+        for context_frame in start..=end {
+            context_frames.insert(context_frame);
+        }
+    }
+
+    let mut out = String::new();
+    writeln!(out, "{}", TSHARK_COLUMNS.join("\t")).ok();
+    for line in tsv.lines() {
+        let cols: Vec<_> = line.split('\t').collect();
+        if let Some(frame) = parse_u64(col(&cols, COL_FRAME_NO))
+            && context_frames.contains(&frame)
+        {
+            writeln!(out, "{line}").ok();
+        }
+    }
+    out
+}
+
+fn frame_ref(cols: &[&str], status: Option<String>) -> FrameRef {
+    FrameRef {
+        frame_no: parse_u64(col(cols, COL_FRAME_NO)).unwrap_or(0),
+        time_epoch: col(cols, COL_TIME_EPOCH).to_string(),
+        bus_id: col(cols, COL_USB_BUS_ID).to_string(),
+        device_address: col(cols, COL_USB_DEVICE_ADDRESS).to_string(),
+        endpoint: col(cols, COL_USB_ENDPOINT_ADDRESS).to_string(),
+        transfer_type: col(cols, COL_USB_TRANSFER_TYPE).to_string(),
+        urb_type: col(cols, COL_USB_URB_TYPE).to_string(),
+        data_len: col(cols, COL_USB_DATA_LEN).to_string(),
+        status,
+    }
+}
+
+fn col<'a>(cols: &'a [&'a str], index: usize) -> &'a str {
+    cols.get(index).copied().unwrap_or("")
+}
+
+fn parse_u64(value: &str) -> Option<u64> {
+    value.parse().ok()
+}
+
 /// Parse tshark's tab-separated `-T fields` output. Column order must match
 /// the `-e` flags in [`PcapAssertions::from_pcap`]: frame.number,
 /// smoo.request.op, smoo.request.export_id, smoo.request.request_id,
@@ -224,18 +609,18 @@ fn summarize(tsv: &str) -> Summary {
         if line.is_empty() {
             continue;
         }
-        let mut cols = line.split('\t');
-        let frame_no = cols.next().and_then(|c| c.parse::<u64>().ok()).unwrap_or(0);
-        let req = cols.next().unwrap_or("");
-        let req_export_id = cols.next().unwrap_or("");
-        let req_request_id = cols.next().unwrap_or("");
-        let resp = cols.next().unwrap_or("");
-        let resp_export_id = cols.next().unwrap_or("");
-        let resp_request_id = cols.next().unwrap_or("");
-        let bulk_dir = cols.next().unwrap_or("");
-        let len_mismatch = cols.next().unwrap_or("");
-        let orphan = cols.next().unwrap_or("");
-        let export_id = cols.next().unwrap_or("");
+        let cols: Vec<_> = line.split('\t').collect();
+        let frame_no = parse_u64(col(&cols, COL_FRAME_NO)).unwrap_or(0);
+        let req = col(&cols, COL_REQ_OP);
+        let req_export_id = col(&cols, COL_REQ_EXPORT_ID);
+        let req_request_id = col(&cols, COL_REQ_REQUEST_ID);
+        let resp = col(&cols, COL_RESP_OP);
+        let resp_export_id = col(&cols, COL_RESP_EXPORT_ID);
+        let resp_request_id = col(&cols, COL_RESP_REQUEST_ID);
+        let bulk_dir = col(&cols, COL_BULK_DIR);
+        let len_mismatch = col(&cols, COL_LEN_MISMATCH);
+        let orphan = col(&cols, COL_ORPHAN);
+        let export_id = col(&cols, COL_CONFIG_EXPORT_ID);
 
         s.smoo_frame_count += 1;
         if !req.is_empty() {
