@@ -30,7 +30,8 @@ jobs:
         with:
           token: ${{ secrets.RELEASE_GITHUB_TOKEN }}
 
-      - uses: taiki-e/install-action@just
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
 
       - name: Configure git
         run: |
@@ -64,7 +65,7 @@ jobs:
           fi
 
           git checkout -B "$branch" "origin/$base"
-          just bump "$version"
+          cargo xtask bump "$version"
 
           if git diff --quiet; then
             echo "No version file changes for $version; creating empty bootstrap commit"
@@ -98,7 +99,7 @@ jobs:
           fi
 
           git checkout -B "$branch" "origin/$base"
-          just bump "$version"
+          cargo xtask bump "$version"
 
           if git diff --quiet; then
             echo "No version changes for $version; skipping"
