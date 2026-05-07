@@ -110,7 +110,8 @@ jobs:
         uses: actions/checkout@v4
 
       - if: needs.gate.outputs.mode == 'pr'
-        uses: taiki-e/install-action@just
+        name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
 
       - if: needs.gate.outputs.mode == 'pr'
         name: Validate bump is idempotent
@@ -118,7 +119,7 @@ jobs:
           VERSION: ${{ needs.gate.outputs.version }}
         run: |
           set -euo pipefail
-          just bump "$VERSION"
+          cargo xtask bump "$VERSION"
 
           if ! git diff --quiet; then
             echo "::error::release branch is not in a post-bump state for ${VERSION}"
@@ -138,17 +139,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: taiki-e/install-action@just
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
 
       - if: needs.gate.outputs.mode == 'pr'
         name: Validate crate publish (dry-run)
-        run: just publish-dry-run
+        run: cargo xtask publish-dry-run
 
       - if: needs.gate.outputs.mode == 'tag'
         name: Publish crates to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: just publish
+        run: cargo xtask publish
 
   publish-assets:
     needs: [gate, release, ci-build, ci-alpine-arm64]

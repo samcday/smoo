@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 
-/// Default number of `dummy_hcd` instances expected. Matches `just
+/// Default number of `dummy_hcd` instances expected. Matches `cargo xtask
 /// test-infra-setup` (`modprobe dummy_hcd num_instances=4`).
 pub const DEFAULT_NUM_INSTANCES: u32 = 4;
 
@@ -161,7 +161,9 @@ pub fn probe_kernel() -> Result<()> {
     let need_dirs: &[&str] = &["/sys/kernel/config/usb_gadget", "/sys/class/udc"];
     for dir in need_dirs {
         if !Path::new(dir).is_dir() {
-            bail!("{dir} not present — load configfs+libcomposite (try `just test-infra-setup`)");
+            bail!(
+                "{dir} not present — load configfs+libcomposite (try `cargo xtask test-infra-setup`)"
+            );
         }
     }
     if !udc_present(0) {

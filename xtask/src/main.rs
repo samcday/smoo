@@ -6,6 +6,7 @@ use std::process::{Command, ExitCode, Stdio};
 
 use anyhow::{Context, Result, bail};
 
+mod release;
 mod vm;
 
 // Privileged harness scenarios that are expected to pass in a configured
@@ -21,6 +22,9 @@ fn main() -> ExitCode {
         Some("check-test-infra") => check_test_infra(&rest),
         Some("test-infra-setup") => test_infra_setup(&rest),
         Some("integration") => integration(&rest),
+        Some("bump") => release::bump(&rest),
+        Some("publish-dry-run") => release::publish_dry_run(&rest),
+        Some("publish") => release::publish(&rest),
         Some("vm-image") => vm::vm_image(&rest),
         Some("vm-integration") => vm::vm_integration(&rest),
         Some("help") | Some("-h") | Some("--help") | None => {
@@ -55,6 +59,9 @@ fn print_usage() {
     eprintln!(
         "  integration        Build the gadget+host CLIs and run the smoo-test-harness suite"
     );
+    eprintln!("  bump <version>    Bump workspace and packaging versions");
+    eprintln!("  publish-dry-run   Validate publishable crates with cargo package --locked");
+    eprintln!("  publish           Publish publishable crates to crates.io in dependency order");
     eprintln!("  vm-image build    Build the baked Fedora VM image used by vm-integration");
     eprintln!("  vm-image download Download the baked Fedora VM image from GHCR with oras");
     eprintln!("  vm-image ref      Print the deterministic GHCR ref for the VM image inputs");
