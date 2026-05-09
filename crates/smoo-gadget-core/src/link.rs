@@ -13,8 +13,8 @@ pub enum LinkState {
 /// Commands emitted by the link controller for the runtime to act upon.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LinkCommand {
-    /// Link state became invalid and the runtime should terminate.
-    Fatal,
+    /// Link state became offline; the runtime should park/replay transport I/O.
+    TransportOffline,
 }
 
 /// Most recent reason the link transitioned Offline.
@@ -147,7 +147,7 @@ impl LinkController {
     pub fn take_command(&mut self) -> Option<LinkCommand> {
         if self.pending_drop {
             self.pending_drop = false;
-            return Some(LinkCommand::Fatal);
+            return Some(LinkCommand::TransportOffline);
         }
         None
     }
@@ -192,7 +192,7 @@ mod tests {
         ctrl.on_io_error(&err);
         assert_eq!(ctrl.state(), LinkState::Offline);
         assert_eq!(ctrl.last_offline_reason(), Some(LinkOfflineReason::IoError));
-        assert_eq!(ctrl.take_command(), Some(LinkCommand::Fatal));
+        assert_eq!(ctrl.take_command(), Some(LinkCommand::TransportOffline));
     }
 
     #[test]
@@ -208,7 +208,7 @@ mod tests {
             ctrl.last_offline_reason(),
             Some(LinkOfflineReason::LivenessTimeout)
         );
-        assert_eq!(ctrl.take_command(), Some(LinkCommand::Fatal));
+        assert_eq!(ctrl.take_command(), Some(LinkCommand::TransportOffline));
     }
 
     #[test]
@@ -231,7 +231,7 @@ mod tests {
         ctrl.on_ep0_event(Event::Enable);
         ctrl.on_status_ping();
         ctrl.tick(Instant::now() + Duration::from_millis(250));
-        assert_eq!(ctrl.take_command(), Some(LinkCommand::Fatal));
+        assert_eq!(ctrl.take_command(), Some(LinkCommand::TransportOffline));
 
         ctrl.on_data_activity();
         assert_eq!(ctrl.state(), LinkState::Online);

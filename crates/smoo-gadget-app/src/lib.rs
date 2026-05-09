@@ -14,8 +14,9 @@ use smoo_gadget_core::{
     ConfigExport, ConfigExportsV0, ControlIo, DeviceHandle, DmaHeap, ExportController, ExportFlags,
     ExportReconcileContext, ExportSpec, ExportState, FunctionfsEndpoints, GadgetConfig,
     GadgetControl, GadgetStatusReport, IoPumpHandle, IoWork, LinkCommand, LinkController,
-    LinkState, PersistedExportRecord, RuntimeTunables, SetupCommand, SetupPacket, SmooGadget,
-    SmooUblk, SmooUblkDevice, StateStore, UblkIoRequest, UblkOp, UblkQueueRuntime,
+    LinkOfflineReason, LinkState, PersistedExportRecord, RuntimeTunables, SetupCommand,
+    SetupPacket, SmooGadget, SmooUblk, SmooUblkDevice, StateStore, UblkIoRequest, UblkOp,
+    UblkQueueRuntime,
 };
 use smoo_proto::{Ident, OpCode, Request, SMOO_STATUS_REQUEST, SMOO_STATUS_REQ_TYPE};
 use std::os::fd::RawFd;
@@ -2070,15 +2071,24 @@ async fn process_link_commands(
     runtime: &mut RuntimeState,
     link: &mut LinkController,
 ) -> Result<()> {
-    if let Some(LinkCommand::Fatal) = link.take_command() {
+    if let Some(LinkCommand::TransportOffline) = link.take_command() {
         let reason = link.last_offline_reason();
         let active_exports = count_active_exports(&runtime.exports);
-        warn!(
-            ?reason,
-            state = ?link.state(),
-            active_exports,
-            "link controller emitted fatal command; keeping ublk runtime alive"
-        );
+        if matches!(reason, Some(LinkOfflineReason::LivenessTimeout)) {
+            info!(
+                ?reason,
+                state = ?link.state(),
+                active_exports,
+                "link liveness timeout; preserving ublk runtime"
+            );
+        } else {
+            warn!(
+                ?reason,
+                state = ?link.state(),
+                active_exports,
+                "link transport offline; preserving ublk runtime"
+            );
+        }
     }
     Ok(())
 }
