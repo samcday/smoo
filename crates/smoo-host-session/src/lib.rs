@@ -117,15 +117,7 @@ where
     where
         C: ControlTransport + Sync,
     {
-        let status = read_status(control).await.map_err(map_transport_error)?;
-        let expected = self.state.expected_session_id.load(Ordering::Relaxed);
-        if status.session_id != expected {
-            self.state
-                .observed_session_id
-                .store(status.session_id, Ordering::Relaxed);
-            self.state.session_changed.store(true, Ordering::Relaxed);
-        }
-        Ok(status)
+        heartbeat_with_state(&self.state, control).await
     }
 }
 
@@ -171,11 +163,11 @@ pub enum HostSessionDriveOutcome {
 
 pub async fn drive_host_session<T, C, Shutdown, Tick, TickFuture, OnEvent>(
     mut task: HostSessionTask<T>,
-    mut control: C,
+    control: C,
     shutdown: Shutdown,
-    mut heartbeat_tick: Tick,
+    heartbeat_tick: Tick,
     config: HostSessionDriveConfig,
-    mut on_event: OnEvent,
+    on_event: OnEvent,
 ) -> HostSessionDriveOutcome
 where
     T: Transport + Clone + Send + Sync + 'static,
@@ -185,51 +177,74 @@ where
     TickFuture: Future<Output = ()>,
     OnEvent: FnMut(HostSessionDriveEvent),
 {
+    let heartbeat_state = task.state.clone();
+    let heartbeat_driver =
+        drive_heartbeats(heartbeat_state, control, heartbeat_tick, config, on_event).fuse();
+    let shutdown = shutdown.fuse();
+    futures_util::pin_mut!(shutdown, heartbeat_driver);
+
+    futures_util::select_biased! {
+        _ = shutdown => {
+            task.stop();
+            HostSessionDriveOutcome::Shutdown
+        }
+        finish = (&mut task).fuse() => {
+            map_drive_finish(finish.outcome)
+        }
+        outcome = heartbeat_driver => {
+            outcome
+        }
+    }
+}
+
+async fn drive_heartbeats<C, Tick, TickFuture, OnEvent>(
+    state: Arc<SessionState>,
+    mut control: C,
+    mut heartbeat_tick: Tick,
+    config: HostSessionDriveConfig,
+    mut on_event: OnEvent,
+) -> HostSessionDriveOutcome
+where
+    C: ControlTransport + Sync,
+    Tick: FnMut() -> TickFuture,
+    TickFuture: Future<Output = ()>,
+    OnEvent: FnMut(HostSessionDriveEvent),
+{
     let mut heartbeat_budget = match HeartbeatBudget::new(config.heartbeat_miss_budget) {
         Ok(budget) => budget,
         Err(err) => return HostSessionDriveOutcome::Failed(err),
     };
 
-    let shutdown = shutdown.fuse();
-    futures_util::pin_mut!(shutdown);
-
     loop {
-        let heartbeat_tick = heartbeat_tick().fuse();
-        futures_util::pin_mut!(heartbeat_tick);
-
-        futures_util::select_biased! {
-            _ = shutdown => {
-                task.stop();
-                return HostSessionDriveOutcome::Shutdown;
-            }
-            finish = (&mut task).fuse() => {
-                return map_drive_finish(finish.outcome);
-            }
-            _ = heartbeat_tick => {
-                match task.heartbeat(&mut control).await {
-                    Ok(status) => {
-                        if let Some(missed_heartbeats) = heartbeat_budget.record_success() {
-                            on_event(HostSessionDriveEvent::HeartbeatRecovered {
-                                missed_heartbeats,
-                            });
-                        }
-                        on_event(HostSessionDriveEvent::HeartbeatStatus { status });
+        heartbeat_tick().await;
+        match heartbeat_with_state(&state, &mut control).await {
+            Ok(status) => {
+                if let Some(missed_heartbeats) = heartbeat_budget.record_success() {
+                    on_event(HostSessionDriveEvent::HeartbeatRecovered { missed_heartbeats });
+                }
+                let session_changed = state.session_changed.load(Ordering::Relaxed);
+                on_event(HostSessionDriveEvent::HeartbeatStatus { status });
+                if session_changed {
+                    if let HostSessionOutcome::SessionChanged { previous, current } =
+                        observed_session_change(&state)
+                    {
+                        return HostSessionDriveOutcome::SessionChanged { previous, current };
                     }
-                    Err(error) => {
-                        let update = heartbeat_budget.record_miss();
-                        on_event(HostSessionDriveEvent::HeartbeatMiss {
-                            error,
-                            missed_heartbeats: update.missed_heartbeats,
-                            budget: update.budget,
-                        });
-                        if update.exhausted {
-                            on_event(HostSessionDriveEvent::HeartbeatMissBudgetExhausted {
-                                missed_heartbeats: update.missed_heartbeats,
-                                budget: update.budget,
-                            });
-                            return HostSessionDriveOutcome::TransportLost;
-                        }
-                    }
+                }
+            }
+            Err(error) => {
+                let update = heartbeat_budget.record_miss();
+                on_event(HostSessionDriveEvent::HeartbeatMiss {
+                    error,
+                    missed_heartbeats: update.missed_heartbeats,
+                    budget: update.budget,
+                });
+                if update.exhausted {
+                    on_event(HostSessionDriveEvent::HeartbeatMissBudgetExhausted {
+                        missed_heartbeats: update.missed_heartbeats,
+                        budget: update.budget,
+                    });
+                    return HostSessionDriveOutcome::TransportLost;
                 }
             }
         }
@@ -455,6 +470,24 @@ fn observed_session_change(state: &SessionState) -> HostSessionOutcome {
     let previous = state.expected_session_id.load(Ordering::Relaxed);
     let current = state.observed_session_id.load(Ordering::Relaxed);
     HostSessionOutcome::SessionChanged { previous, current }
+}
+
+async fn heartbeat_with_state<C>(
+    state: &SessionState,
+    control: &mut C,
+) -> Result<SmooStatusV0, HostSessionError>
+where
+    C: ControlTransport + Sync,
+{
+    let status = read_status(control).await.map_err(map_transport_error)?;
+    let expected = state.expected_session_id.load(Ordering::Relaxed);
+    if status.session_id != expected {
+        state
+            .observed_session_id
+            .store(status.session_id, Ordering::Relaxed);
+        state.session_changed.store(true, Ordering::Relaxed);
+    }
+    Ok(status)
 }
 
 /// Build the per-Request handler future, queueing any required bulk-IN
