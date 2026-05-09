@@ -2108,6 +2108,7 @@ async fn handle_data_plane_event(
             link.on_io_error(&error);
         }
         DataPlaneEvent::RequestCompleted => {
+            link.on_data_activity();
             runtime.inflight_io = runtime
                 .inflight_io
                 .checked_sub(1)

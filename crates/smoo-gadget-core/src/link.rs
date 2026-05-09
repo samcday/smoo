@@ -34,7 +34,7 @@ pub enum LinkOfflineReason {
 /// replaying or parking I/O.
 pub struct LinkController {
     state: LinkState,
-    last_status: Option<Instant>,
+    last_activity: Option<Instant>,
     last_offline_reason: Option<LinkOfflineReason>,
     liveness_timeout: Duration,
     reopen_backoff: Duration,
@@ -48,7 +48,7 @@ impl LinkController {
     pub fn new(liveness_timeout: Duration) -> Self {
         Self {
             state: LinkState::Offline,
-            last_status: None,
+            last_activity: None,
             last_offline_reason: None,
             liveness_timeout,
             reopen_backoff: Duration::from_secs(1),
@@ -95,8 +95,17 @@ impl LinkController {
 
     /// Notify the controller that a SMOO_STATUS (or equivalent heartbeat) was seen.
     pub fn on_status_ping(&mut self) {
+        self.record_host_activity();
+    }
+
+    /// Notify the controller that the host made data-plane progress.
+    pub fn on_data_activity(&mut self) {
+        self.record_host_activity();
+    }
+
+    fn record_host_activity(&mut self) {
         let now = Instant::now();
-        self.last_status = Some(now);
+        self.last_activity = Some(now);
         if matches!(self.state, LinkState::Offline) {
             if let Some(not_before) = self.reopen_not_before {
                 if now < not_before {
@@ -127,7 +136,7 @@ impl LinkController {
 
     /// Advance the controller based on the current time to detect liveness timeouts.
     pub fn tick(&mut self, now: Instant) {
-        if let Some(last) = self.last_status {
+        if let Some(last) = self.last_activity {
             if now.saturating_duration_since(last) > self.liveness_timeout {
                 self.enter_offline(LinkOfflineReason::LivenessTimeout);
             }
@@ -152,7 +161,7 @@ impl LinkController {
 
     fn enter_offline(&mut self, reason: LinkOfflineReason) {
         self.state = LinkState::Offline;
-        self.last_status = None;
+        self.last_activity = None;
         self.last_offline_reason = Some(reason);
         self.pending_drop = true;
     }
@@ -200,5 +209,33 @@ mod tests {
             Some(LinkOfflineReason::LivenessTimeout)
         );
         assert_eq!(ctrl.take_command(), Some(LinkCommand::Fatal));
+    }
+
+    #[test]
+    fn data_activity_keeps_link_live() {
+        let mut ctrl = LinkController::new(Duration::from_millis(100));
+        ctrl.on_ep0_event(Event::Enable);
+        ctrl.on_status_ping();
+        ctrl.tick(Instant::now() + Duration::from_millis(75));
+        assert_eq!(ctrl.state(), LinkState::Online);
+
+        ctrl.on_data_activity();
+        ctrl.tick(Instant::now() + Duration::from_millis(75));
+        assert_eq!(ctrl.state(), LinkState::Online);
+        assert_eq!(ctrl.take_command(), None);
+    }
+
+    #[test]
+    fn data_activity_recovers_liveness_timeout() {
+        let mut ctrl = LinkController::new(Duration::from_millis(100));
+        ctrl.on_ep0_event(Event::Enable);
+        ctrl.on_status_ping();
+        ctrl.tick(Instant::now() + Duration::from_millis(250));
+        assert_eq!(ctrl.take_command(), Some(LinkCommand::Fatal));
+
+        ctrl.on_data_activity();
+        assert_eq!(ctrl.state(), LinkState::Online);
+        assert_eq!(ctrl.last_offline_reason(), None);
+        assert_eq!(ctrl.take_command(), None);
     }
 }
