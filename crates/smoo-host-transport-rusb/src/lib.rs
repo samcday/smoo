@@ -590,7 +590,7 @@ fn run_control_worker(
             }) => {
                 trace!(op = "control-in", bytes = buf.len(), "rusb worker: start");
                 let result =
-                    run_read_loop("control-in", buf, &handle, &shutdown, &abort, &|h, data| {
+                    run_read_once("control-in", buf, &handle, &shutdown, &abort, &|h, data| {
                         h.read_control(
                             request_type,
                             request,
@@ -614,7 +614,7 @@ fn run_control_worker(
                 abort,
             }) => {
                 trace!(op = "control-out", bytes = data.len(), "rusb worker: start");
-                let result = run_write_loop(
+                let result = run_write_once(
                     "control-out",
                     data,
                     &handle,
@@ -708,6 +708,66 @@ where
             }
             Err(err) => return Err(map_rusb_error(op_label, err)),
         }
+    }
+}
+
+fn run_read_once<F>(
+    op_label: &'static str,
+    mut buf: Vec<u8>,
+    handle: &DeviceHandle<Context>,
+    shutdown: &AtomicBool,
+    abort: &AtomicBool,
+    op: &F,
+) -> TransportResult<Vec<u8>>
+where
+    F: Fn(&DeviceHandle<Context>, &mut [u8]) -> Result<usize, rusb::Error>,
+{
+    if shutdown.load(Ordering::SeqCst) {
+        return Err(disconnected_err(op_label));
+    }
+    if abort.load(Ordering::SeqCst) {
+        return Err(timeout_err(op_label));
+    }
+    match op(handle, &mut buf[..]) {
+        Ok(read) => {
+            if read > buf.len() {
+                return Err(protocol_error(format!(
+                    "{op_label} reported too many bytes ({read} > {})",
+                    buf.len()
+                )));
+            }
+            buf.truncate(read);
+            Ok(buf)
+        }
+        Err(rusb::Error::Timeout | rusb::Error::Interrupted) => Err(timeout_err(op_label)),
+        Err(err) => Err(map_rusb_error(op_label, err)),
+    }
+}
+
+fn run_write_once<F>(
+    op_label: &'static str,
+    buf: Vec<u8>,
+    handle: &DeviceHandle<Context>,
+    shutdown: &AtomicBool,
+    abort: &AtomicBool,
+    op: &F,
+) -> TransportResult<usize>
+where
+    F: Fn(&DeviceHandle<Context>, &[u8]) -> Result<usize, rusb::Error>,
+{
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    if shutdown.load(Ordering::SeqCst) {
+        return Err(disconnected_err(op_label));
+    }
+    if abort.load(Ordering::SeqCst) {
+        return Err(timeout_err(op_label));
+    }
+    match op(handle, &buf) {
+        Ok(written) => Ok(written),
+        Err(rusb::Error::Timeout | rusb::Error::Interrupted) => Err(timeout_err(op_label)),
+        Err(err) => Err(map_rusb_error(op_label, err)),
     }
 }
 
