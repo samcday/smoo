@@ -43,7 +43,7 @@ use anyhow::{Result, anyhow};
 use registry::{InFlightKey, InFlightRegistry};
 use smoo_proto::{OpCode, Request, Response};
 use state::{PumpState, PumpStateHandle};
-use std::sync::Arc;
+use std::{io, sync::Arc};
 use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch},
     task::{JoinHandle, JoinSet},
@@ -318,6 +318,15 @@ async fn interrupt_out_reader(
             res = gadget.read_response() => match res {
                 Ok(r) => r,
                 Err(err) => {
+                    if is_short_interrupt_out_junk(&err) {
+                        // When smoo intentionally mimics a fastboot interface, host daemons
+                        // such as fwupd may write fastboot probes (for example
+                        // "getvar:product") to the first OUT endpoint they see. A real smoo
+                        // Response is always RESPONSE_LEN bytes, so short interrupt OUT reads
+                        // are foreign traffic that has already been consumed by FunctionFS.
+                        debug!(?err, "interrupt OUT: dropping short non-smoo packet");
+                        continue;
+                    }
                     warn!(?err, "interrupt OUT read failed");
                     state.fault();
                     break;
@@ -331,6 +340,14 @@ async fn interrupt_out_reader(
         }
     }
     state.shutdown();
+}
+
+fn is_short_interrupt_out_junk(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|err| err.kind() == io::ErrorKind::UnexpectedEof)
+    })
 }
 
 async fn handle_response(
@@ -516,4 +533,31 @@ fn complete_entry(entry: InFlightEntry, status: i32) {
         );
     }
     let _ = completion.send(result);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Context;
+
+    #[test]
+    fn short_interrupt_out_junk_detects_unexpected_eof() {
+        let err = Err::<(), _>(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "short AIO read: expected 28 bytes, received 14",
+        ))
+        .context("read response from interrupt OUT")
+        .unwrap_err();
+
+        assert!(is_short_interrupt_out_junk(&err));
+    }
+
+    #[test]
+    fn short_interrupt_out_junk_rejects_other_io_errors() {
+        let err = Err::<(), _>(io::Error::other("endpoint gone"))
+            .context("read response from interrupt OUT")
+            .unwrap_err();
+
+        assert!(!is_short_interrupt_out_junk(&err));
+    }
 }
