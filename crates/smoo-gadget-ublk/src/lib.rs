@@ -26,7 +26,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
-use std::thread::JoinHandle;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use tracing::{Level, debug, error, info, trace, warn};
 /// Top level interface to ublk. Creates SmooUblkDevices
@@ -136,6 +136,128 @@ struct QueueCompletion {
     result: i32,
 }
 
+struct PendingDeviceCleanup {
+    sender: Sender<CtrlCommand>,
+    dev_id: u32,
+    armed: bool,
+}
+
+impl PendingDeviceCleanup {
+    fn new(sender: Sender<CtrlCommand>, dev_id: u32) -> Self {
+        Self {
+            sender,
+            dev_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn is_armed(&self) -> bool {
+        self.armed
+    }
+}
+
+impl Drop for PendingDeviceCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let sender = self.sender.clone();
+        let dev_id = self.dev_id;
+        warn!(dev_id, "cleaning up partially initialized ublk device");
+        if let Err(err) = thread::Builder::new()
+            .name(format!("smoo-gadget-ublk-cleanup-{dev_id}"))
+            .spawn(move || cleanup_device_blocking(sender, dev_id))
+        {
+            warn!(dev_id, error = ?err, "spawn partial cleanup thread failed; cleaning up inline");
+            cleanup_device_blocking(self.sender.clone(), dev_id);
+        }
+    }
+}
+
+struct PendingSetupDevice {
+    device: Option<SmooUblkDevice>,
+    cleanup: PendingDeviceCleanup,
+}
+
+impl PendingSetupDevice {
+    fn new(device: SmooUblkDevice, cleanup: PendingDeviceCleanup) -> Self {
+        Self {
+            device: Some(device),
+            cleanup,
+        }
+    }
+
+    fn dev_id(&self) -> u32 {
+        self.device
+            .as_ref()
+            .expect("pending setup device missing")
+            .dev_id()
+    }
+
+    fn into_device(mut self) -> SmooUblkDevice {
+        self.cleanup.disarm();
+        self.device
+            .take()
+            .expect("pending setup device already taken")
+    }
+}
+
+impl Drop for PendingSetupDevice {
+    fn drop(&mut self) {
+        if !self.cleanup.is_armed() {
+            return;
+        }
+        let Some(mut device) = self.device.take() else {
+            return;
+        };
+        let sender = self.cleanup.sender.clone();
+        let dev_id = self.cleanup.dev_id;
+        match thread::Builder::new()
+            .name(format!("smoo-gadget-ublk-cancel-{dev_id}"))
+            .spawn(move || {
+                device.cancel_for_partial_cleanup();
+                drop(device);
+                cleanup_device_blocking(sender, dev_id);
+            }) {
+            Ok(_) => self.cleanup.disarm(),
+            Err(err) => {
+                warn!(dev_id, error = ?err, "spawn setup cancellation cleanup failed");
+            }
+        }
+    }
+}
+
+fn cleanup_device_blocking(sender: Sender<CtrlCommand>, dev_id: u32) {
+    let cmd = ublksrv_ctrl_cmd {
+        dev_id,
+        queue_id: u16::MAX,
+        ..Default::default()
+    };
+    if let Err(err) =
+        submit_ctrl_command_blocking(&sender, UBLK_CMD_STOP_DEV, cmd, "cleanup stop device", None)
+    {
+        warn!(dev_id, error = ?err, "partial cleanup STOP_DEV failed");
+    }
+    let cmd = ublksrv_ctrl_cmd {
+        dev_id,
+        queue_id: u16::MAX,
+        ..Default::default()
+    };
+    if let Err(err) = submit_ctrl_command_blocking(
+        &sender,
+        UBLK_CMD_DEL_DEV,
+        cmd,
+        "cleanup delete device",
+        None,
+    ) {
+        warn!(dev_id, error = ?err, "partial cleanup DEL_DEV failed");
+    }
+}
+
 struct RecoverDeviceParams {
     block_size: usize,
     block_count: usize,
@@ -143,6 +265,40 @@ struct RecoverDeviceParams {
     queue_depth: u16,
     max_io_bytes: u32,
     ioctl_encode: bool,
+}
+
+async fn run_control_task<T, F>(name: String, f: F) -> anyhow::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+{
+    let (tx, rx) = async_channel::bounded::<anyhow::Result<T>>(1);
+    let thread_name = name.clone();
+    thread::Builder::new()
+        .name(name.clone())
+        .spawn(move || {
+            let result = f();
+            if tx.send_blocking(result).is_err() {
+                trace!(thread = thread_name, "control task receiver dropped");
+            }
+        })
+        .with_context(|| format!("spawn {name} thread"))?;
+    rx.recv()
+        .await
+        .with_context(|| format!("{name} thread exited without result"))?
+}
+
+async fn submit_ctrl_command_threaded(
+    sender: Sender<CtrlCommand>,
+    opcode: u32,
+    cmd: ublksrv_ctrl_cmd,
+    label: &'static str,
+    timeout: Option<Duration>,
+) -> anyhow::Result<()> {
+    run_control_task(format!("smoo-gadget-ublk-{label}"), move || {
+        submit_ctrl_command_blocking(&sender, opcode, cmd, label, timeout)
+    })
+    .await
 }
 
 pub type UblkBuffer<'a> = BufferGuard<'a>;
@@ -293,63 +449,67 @@ impl SmooUblk {
     }
 
     async fn get_device_info(&self, dev_id: u32) -> anyhow::Result<ublksrv_ctrl_dev_info> {
-        let mut info = ublksrv_ctrl_dev_info {
-            dev_id,
-            ..Default::default()
-        };
-        let mut cmd = ublksrv_ctrl_cmd {
-            dev_id,
-            queue_id: u16::MAX,
-            ..Default::default()
-        };
-        cmd.len = ctrl_cmd_len::<ublksrv_ctrl_dev_info>();
-        cmd.addr = &mut info as *mut _ as u64;
-        if let Err(err) = submit_ctrl_command(
-            &self.sender,
-            UBLK_CMD_GET_DEV_INFO2,
-            cmd,
-            "get device info",
-            None,
-        )
-        .await
-        {
-            if is_errno(&err, libc::EINVAL) {
-                submit_ctrl_command(
-                    &self.sender,
-                    UBLK_CMD_GET_DEV_INFO,
-                    cmd,
-                    "get device info (fallback)",
-                    None,
-                )
-                .await?;
-            } else {
-                return Err(err);
+        let sender = self.sender.clone();
+        run_control_task(format!("smoo-gadget-ublk-info-{dev_id}"), move || {
+            let mut info = ublksrv_ctrl_dev_info {
+                dev_id,
+                ..Default::default()
+            };
+            let mut cmd = ublksrv_ctrl_cmd {
+                dev_id,
+                queue_id: u16::MAX,
+                ..Default::default()
+            };
+            cmd.len = ctrl_cmd_len::<ublksrv_ctrl_dev_info>();
+            cmd.addr = &mut info as *mut _ as u64;
+            if let Err(err) = submit_ctrl_command_blocking(
+                &sender,
+                UBLK_CMD_GET_DEV_INFO2,
+                cmd,
+                "get device info",
+                None,
+            ) {
+                if is_errno(&err, libc::EINVAL) {
+                    submit_ctrl_command_blocking(
+                        &sender,
+                        UBLK_CMD_GET_DEV_INFO,
+                        cmd,
+                        "get device info (fallback)",
+                        None,
+                    )?;
+                } else {
+                    return Err(err);
+                }
             }
-        }
-        Ok(info)
+            Ok(info)
+        })
+        .await
     }
 
     async fn get_params(&self, dev_id: u32) -> anyhow::Result<ublk_params> {
-        let mut params = ublk_params {
-            len: size_of::<ublk_params>() as u32,
-            ..Default::default()
-        };
-        let mut cmd = ublksrv_ctrl_cmd {
-            dev_id,
-            queue_id: u16::MAX,
-            ..Default::default()
-        };
-        cmd.len = params.len as u16;
-        cmd.addr = &mut params as *mut _ as u64;
-        submit_ctrl_command(
-            &self.sender,
-            UBLK_CMD_GET_PARAMS,
-            cmd,
-            "get params",
-            Some(Duration::from_secs(1)),
-        )
-        .await?;
-        Ok(params)
+        let sender = self.sender.clone();
+        run_control_task(format!("smoo-gadget-ublk-params-{dev_id}"), move || {
+            let mut params = ublk_params {
+                len: size_of::<ublk_params>() as u32,
+                ..Default::default()
+            };
+            let mut cmd = ublksrv_ctrl_cmd {
+                dev_id,
+                queue_id: u16::MAX,
+                ..Default::default()
+            };
+            cmd.len = params.len as u16;
+            cmd.addr = &mut params as *mut _ as u64;
+            submit_ctrl_command_blocking(
+                &sender,
+                UBLK_CMD_GET_PARAMS,
+                cmd,
+                "get params",
+                Some(Duration::from_secs(1)),
+            )?;
+            Ok(params)
+        })
+        .await
     }
 
     pub async fn setup_device(
@@ -360,201 +520,210 @@ impl SmooUblk {
         queue_depth: u16,
         max_io_bytes: Option<usize>,
     ) -> anyhow::Result<SmooUblkDevice> {
-        debug!(
-            block_size = block_size,
-            block_count = block_count,
-            queue_count = queue_count,
-            queue_depth = queue_depth,
-            "setup_device requested"
-        );
-        ensure!(block_size != 0, "block size must be non-zero");
-        ensure!(
-            block_size.is_power_of_two(),
-            "block size must be a power of two"
-        );
-        let logical_shift = block_size.trailing_zeros() as u8;
-        ensure!(
-            logical_shift >= 9,
-            "logical block size must be at least 512 bytes"
-        );
+        let sender = self.sender.clone();
+        let pending = run_control_task("smoo-gadget-ublk-setup".to_string(), move || {
+            debug!(
+                block_size = block_size,
+                block_count = block_count,
+                queue_count = queue_count,
+                queue_depth = queue_depth,
+                "setup_device requested"
+            );
+            ensure!(block_size != 0, "block size must be non-zero");
+            ensure!(
+                block_size.is_power_of_two(),
+                "block size must be a power of two"
+            );
+            let logical_shift = block_size.trailing_zeros() as u8;
+            ensure!(
+                logical_shift >= 9,
+                "logical block size must be at least 512 bytes"
+            );
 
-        let total_bytes = block_count
-            .checked_mul(block_size)
-            .context("device capacity overflow")?;
-        ensure!(
-            total_bytes % 512 == 0,
-            "device capacity must be divisible by 512"
-        );
-        let dev_sectors = (total_bytes / 512) as u64;
-        let max_io_bytes = compute_max_io_bytes(block_size, queue_depth, max_io_bytes)?;
-        let max_io_buf_bytes = max_io_bytes as u32;
-        let buffers = QueueBuffers::new(queue_count, queue_depth, max_io_bytes)
-            .context("allocate ublk buffers")?;
-        let queue_buf_ptrs = buffers.raw_ptrs();
+            let total_bytes = block_count
+                .checked_mul(block_size)
+                .context("device capacity overflow")?;
+            ensure!(
+                total_bytes % 512 == 0,
+                "device capacity must be divisible by 512"
+            );
+            let dev_sectors = (total_bytes / 512) as u64;
+            let max_io_bytes = compute_max_io_bytes(block_size, queue_depth, max_io_bytes)?;
+            let max_io_buf_bytes = max_io_bytes as u32;
+            let buffers = QueueBuffers::new(queue_count, queue_depth, max_io_bytes)
+                .context("allocate ublk buffers")?;
+            let queue_buf_ptrs = buffers.raw_ptrs();
 
-        // For now we use -1 as the dev_id, so that a fresh dev is created for us.
-        // Once we support resuming this needs to change.
-        let dev_id = u32::MAX;
+            // For now we use -1 as the dev_id, so that a fresh dev is created for us.
+            // Once we support resuming this needs to change.
+            let dev_id = u32::MAX;
 
-        // ublksrv_ctrl_dev_info is passed in ublksrv_ctrl_dev_info during UBLK_CMD_ADD_DEV
-        let mut info = ublksrv_ctrl_dev_info {
-            dev_id,
-            nr_hw_queues: queue_count,
-            queue_depth,
-            max_io_buf_bytes,
-            ublksrv_pid: unsafe { libc::getpid() } as i32,
-            ..Default::default()
-        };
-        info.flags |= (UBLK_F_USER_RECOVERY | UBLK_F_USER_RECOVERY_REISSUE) as u64;
-
-        // ublk_params is passed in ublksrv_ctrl_dev_info during UBLK_CMD_SET_PARAMS
-        let mut params = ublk_params {
-            len: size_of::<ublk_params>() as u32,
-            types: UBLK_PARAM_TYPE_BASIC,
-            basic: ublk_param_basic {
-                logical_bs_shift: logical_shift,
-                physical_bs_shift: logical_shift,
-                io_opt_shift: logical_shift,
-                io_min_shift: logical_shift,
-                max_sectors: cmp::max(info.max_io_buf_bytes >> 9, 1),
-                dev_sectors,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        // the ublksrv_ctrl_cmd descriptor is passed in for all UBLK_CMD_* requests.
-        let mut cmd = ublksrv_ctrl_cmd {
-            dev_id,
-            // queue is -1 for all UBLK_CMD_* requests
-            queue_id: u16::MAX,
-            ..Default::default()
-        };
-
-        // We begin the process by sending ublksrv_ctrl_dev_info along in a UBLK_CMD_ADD_DEV op
-        cmd.len = ctrl_cmd_len::<sys::ublksrv_ctrl_dev_info>();
-        cmd.addr = &raw mut info as _;
-        submit_ctrl_command(&self.sender, UBLK_CMD_ADD_DEV, cmd, "add device", None).await?;
-        debug!(dev_id = info.dev_id, "add_dev completed");
-
-        // Whilst completing our UBLK_CMD_ADD_DEV op, the kernel wrote our true dev_id into the
-        // ublksrv_ctrl_dev_info struct.
-        let dev_id = info.dev_id as u32;
-        cmd.dev_id = dev_id;
-        self.managed_devs.insert(dev_id);
-
-        // Now we pass the ublk_params in a UBLK_CMD_SET_PARAMS to inform ublk of geometry/capacity.
-        cmd.len = params.len as _;
-        cmd.addr = &raw mut params as _;
-        submit_ctrl_command(&self.sender, UBLK_CMD_SET_PARAMS, cmd, "set params", None).await?;
-
-        let ioctl_encode = (info.flags & (sys::UBLK_F_CMD_IOCTL_ENCODE as u64)) != 0;
-        let max_io_bytes =
-            usize::try_from(info.max_io_buf_bytes).context("max_io_buf_bytes overflow")?;
-        let cdev_path = format!("/dev/ublkc{dev_id}");
-        let base_cdev = File::options()
-            .read(true)
-            .write(true)
-            .open(&cdev_path)
-            .with_context(|| format!("open {cdev_path}"))?;
-        let mut request_rxs = Vec::with_capacity(queue_count as usize);
-        let mut completion_txs = Vec::with_capacity(queue_count as usize);
-        let mut workers = Vec::with_capacity(queue_count as usize);
-        let mut ready_rxs = Vec::with_capacity(queue_count as usize);
-
-        for queue_id in 0..queue_count {
-            let (request_tx, request_rx) = async_channel::unbounded::<UblkIoRequest>();
-            request_rxs.push(request_rx);
-            let (complete_tx, complete_rx) = async_channel::unbounded::<QueueCompletion>();
-            let stop = Arc::new(AtomicBool::new(false));
-            let (ready_tx, ready_rx) = mpsc::channel();
-            let cdev = base_cdev
-                .try_clone()
-                .with_context(|| format!("clone {cdev_path}"))?;
-            let start = queue_id as usize * queue_depth as usize;
-            let end = start + queue_depth as usize;
-            let buf_ptrs = queue_buf_ptrs[start..end].to_vec();
-            let worker_cfg = QueueWorkerConfig {
+            // ublksrv_ctrl_dev_info is passed in ublksrv_ctrl_dev_info during UBLK_CMD_ADD_DEV
+            let mut info = ublksrv_ctrl_dev_info {
                 dev_id,
-                queue_id,
+                nr_hw_queues: queue_count,
+                queue_depth,
+                max_io_buf_bytes,
+                ublksrv_pid: unsafe { libc::getpid() } as i32,
+                ..Default::default()
+            };
+            info.flags |= (UBLK_F_USER_RECOVERY | UBLK_F_USER_RECOVERY_REISSUE) as u64;
+
+            // ublk_params is passed in ublksrv_ctrl_dev_info during UBLK_CMD_SET_PARAMS
+            let mut params = ublk_params {
+                len: size_of::<ublk_params>() as u32,
+                types: UBLK_PARAM_TYPE_BASIC,
+                basic: ublk_param_basic {
+                    logical_bs_shift: logical_shift,
+                    physical_bs_shift: logical_shift,
+                    io_opt_shift: logical_shift,
+                    io_min_shift: logical_shift,
+                    max_sectors: cmp::max(info.max_io_buf_bytes >> 9, 1),
+                    dev_sectors,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+
+            // the ublksrv_ctrl_cmd descriptor is passed in for all UBLK_CMD_* requests.
+            let mut cmd = ublksrv_ctrl_cmd {
+                dev_id,
+                // queue is -1 for all UBLK_CMD_* requests
+                queue_id: u16::MAX,
+                ..Default::default()
+            };
+
+            // We begin the process by sending ublksrv_ctrl_dev_info along in a UBLK_CMD_ADD_DEV op
+            cmd.len = ctrl_cmd_len::<sys::ublksrv_ctrl_dev_info>();
+            cmd.addr = &raw mut info as _;
+            submit_ctrl_command_blocking(&sender, UBLK_CMD_ADD_DEV, cmd, "add device", None)?;
+            debug!(dev_id = info.dev_id, "add_dev completed");
+
+            // Whilst completing our UBLK_CMD_ADD_DEV op, the kernel wrote our true dev_id into the
+            // ublksrv_ctrl_dev_info struct.
+            let dev_id = info.dev_id as u32;
+            cmd.dev_id = dev_id;
+            let cleanup = PendingDeviceCleanup::new(sender.clone(), dev_id);
+
+            // Now we pass the ublk_params in a UBLK_CMD_SET_PARAMS to inform ublk of geometry/capacity.
+            cmd.len = params.len as _;
+            cmd.addr = &raw mut params as _;
+            submit_ctrl_command_blocking(&sender, UBLK_CMD_SET_PARAMS, cmd, "set params", None)?;
+
+            let ioctl_encode = (info.flags & (sys::UBLK_F_CMD_IOCTL_ENCODE as u64)) != 0;
+            let max_io_bytes =
+                usize::try_from(info.max_io_buf_bytes).context("max_io_buf_bytes overflow")?;
+            let cdev_path = format!("/dev/ublkc{dev_id}");
+            let base_cdev = File::options()
+                .read(true)
+                .write(true)
+                .open(&cdev_path)
+                .with_context(|| format!("open {cdev_path}"))?;
+            let mut request_rxs = Vec::with_capacity(queue_count as usize);
+            let mut completion_txs = Vec::with_capacity(queue_count as usize);
+            let mut workers = Vec::with_capacity(queue_count as usize);
+            let mut ready_rxs = Vec::with_capacity(queue_count as usize);
+
+            for queue_id in 0..queue_count {
+                let (request_tx, request_rx) = async_channel::unbounded::<UblkIoRequest>();
+                request_rxs.push(request_rx);
+                let (complete_tx, complete_rx) = async_channel::unbounded::<QueueCompletion>();
+                let stop = Arc::new(AtomicBool::new(false));
+                let (ready_tx, ready_rx) = mpsc::channel();
+                let cdev = base_cdev
+                    .try_clone()
+                    .with_context(|| format!("clone {cdev_path}"))?;
+                let start = queue_id as usize * queue_depth as usize;
+                let end = start + queue_depth as usize;
+                let buf_ptrs = queue_buf_ptrs[start..end].to_vec();
+                let worker_cfg = QueueWorkerConfig {
+                    dev_id,
+                    queue_id,
+                    queue_depth,
+                    ioctl_encode,
+                    buf_ptrs,
+                    request_tx,
+                    completion_rx: complete_rx,
+                    stop: stop.clone(),
+                    cdev,
+                    ready_tx,
+                };
+                debug!(queue_id = queue_id, "spawning queue worker");
+                let thread = spawn_queue_worker(worker_cfg)?;
+                completion_txs.push(complete_tx);
+                workers.push(QueueWorkerHandle { stop, thread });
+                ready_rxs.push(ready_rx);
+            }
+
+            for (queue_idx, ready_rx) in ready_rxs.into_iter().enumerate() {
+                ready_rx.recv().context("queue worker init failed")?;
+                debug!(
+                    queue_ready = true,
+                    queue_id = queue_idx,
+                    "queue worker ready"
+                );
+            }
+
+            let queues = Arc::new(UblkQueueRuntime {
+                dev_id,
+                queue_count,
+                queue_depth,
+                block_size,
+                block_count,
+                max_io_bytes,
+                ioctl_encode,
+                buffers,
+                request_rxs,
+                completion_txs: completion_txs.clone(),
+            });
+
+            let mut ctrl = UblkCtrlHandle {
+                dev_id,
+                queue_count,
                 queue_depth,
                 ioctl_encode,
-                buf_ptrs,
-                request_tx,
-                completion_rx: complete_rx,
-                stop: stop.clone(),
-                cdev,
-                ready_tx,
+                recovery_pending: false,
+                completion_txs,
+                workers,
+                start_handle: None,
+                start_deadline: None,
+                start_result: None,
+                shutdown: false,
             };
-            debug!(queue_id = queue_id, "spawning queue worker");
-            let thread = spawn_queue_worker(worker_cfg)?;
-            completion_txs.push(complete_tx);
-            workers.push(QueueWorkerHandle { stop, thread });
-            ready_rxs.push(ready_rx);
-        }
 
-        for (queue_idx, ready_rx) in ready_rxs.into_iter().enumerate() {
-            ready_rx.recv().context("queue worker init failed")?;
-            debug!(
-                queue_ready = true,
-                queue_id = queue_idx,
-                "queue worker ready"
-            );
-        }
+            cmd.len = 0;
+            cmd.addr = 0;
+            cmd.data[0] = unsafe { libc::getpid() } as u64;
+            let ctrl_sender = sender.clone();
+            let start_cmd = cmd;
+            let start_thread = std::thread::Builder::new()
+                .name(format!("smoo-gadget-ublk-start-{dev_id}"))
+                .spawn(move || {
+                    info!(dev_id = dev_id, "start_dev thread begin");
+                    let res = submit_ctrl_command_blocking(
+                        &ctrl_sender,
+                        UBLK_CMD_START_DEV,
+                        start_cmd,
+                        "start device",
+                        None,
+                    );
+                    match &res {
+                        Ok(()) => info!(dev_id = dev_id, "start_dev completed"),
+                        Err(err) => error!(dev_id = dev_id, "start_dev failed: {:?}", err),
+                    }
+                    res
+                })
+                .context("spawn start_dev thread")?;
 
-        let queues = Arc::new(UblkQueueRuntime {
-            dev_id,
-            queue_count,
-            queue_depth,
-            block_size,
-            block_count,
-            max_io_bytes,
-            ioctl_encode,
-            buffers,
-            request_rxs,
-            completion_txs: completion_txs.clone(),
-        });
-
-        let mut ctrl = UblkCtrlHandle {
-            dev_id,
-            queue_count,
-            queue_depth,
-            ioctl_encode,
-            recovery_pending: false,
-            completion_txs,
-            workers,
-            start_handle: None,
-            start_deadline: None,
-            start_result: None,
-            shutdown: false,
-        };
-
-        cmd.len = 0;
-        cmd.addr = 0;
-        cmd.data[0] = unsafe { libc::getpid() } as u64;
-        let ctrl_sender = self.sender.clone();
-        let start_cmd = cmd;
-        let start_thread = std::thread::Builder::new()
-            .name(format!("smoo-gadget-ublk-start-{dev_id}"))
-            .spawn(move || {
-                info!(dev_id = dev_id, "start_dev thread begin");
-                let res = submit_ctrl_command_blocking(
-                    &ctrl_sender,
-                    UBLK_CMD_START_DEV,
-                    start_cmd,
-                    "start device",
-                );
-                match &res {
-                    Ok(()) => info!(dev_id = dev_id, "start_dev completed"),
-                    Err(err) => error!(dev_id = dev_id, "start_dev failed: {:?}", err),
-                }
-                res
-            })
-            .context("spawn start_dev thread")?;
-
-        ctrl.start_deadline = Some(Instant::now() + START_DEV_TIMEOUT);
-        ctrl.start_handle = Some(start_thread);
-        Ok(SmooUblkDevice { ctrl, queues })
+            ctrl.start_deadline = Some(Instant::now() + START_DEV_TIMEOUT);
+            ctrl.start_handle = Some(start_thread);
+            let device = SmooUblkDevice { ctrl, queues };
+            Ok(PendingSetupDevice::new(device, cleanup))
+        })
+        .await?;
+        let dev_id = pending.dev_id();
+        self.managed_devs.insert(dev_id);
+        Ok(pending.into_device())
     }
 
     /// Attempt to recover a previously configured ublk device using kernel-queryable metadata.
@@ -600,124 +769,142 @@ impl SmooUblk {
         dev_id: u32,
         params: RecoverDeviceParams,
     ) -> anyhow::Result<SmooUblkDevice> {
-        let RecoverDeviceParams {
-            block_size,
-            block_count,
-            queue_count,
-            queue_depth,
-            max_io_bytes,
-            ioctl_encode,
-        } = params;
-        ensure!(block_size != 0, "block size must be non-zero");
-        ensure!(
-            block_size.is_power_of_two(),
-            "block size must be a power of two"
-        );
-        let logical_shift = block_size.trailing_zeros() as u8;
-        ensure!(
-            logical_shift >= 9,
-            "logical block size must be at least 512 bytes"
-        );
-
-        let total_bytes = block_count
-            .checked_mul(block_size)
-            .context("device capacity overflow")?;
-        ensure!(
-            total_bytes % 512 == 0,
-            "device capacity must be divisible by 512"
-        );
-        let max_io_bytes = if max_io_bytes == 0 {
-            compute_max_io_bytes(block_size, queue_depth, None)?
-        } else {
-            normalize_max_io_bytes(block_size, max_io_bytes as usize)?
-        };
-        let buffers = QueueBuffers::new(queue_count, queue_depth, max_io_bytes)
-            .context("allocate ublk buffers")?;
-        let queue_buf_ptrs = buffers.raw_ptrs();
-        self.start_user_recovery(dev_id).await?;
-        let cdev_path = format!("/dev/ublkc{dev_id}");
-        let base_cdev = File::options()
-            .read(true)
-            .write(true)
-            .open(&cdev_path)
-            .with_context(|| format!("open {cdev_path}"))?;
-        let mut request_rxs = Vec::with_capacity(queue_count as usize);
-        let mut completion_txs = Vec::with_capacity(queue_count as usize);
-        let mut workers = Vec::with_capacity(queue_count as usize);
-        let mut ready_rxs = Vec::with_capacity(queue_count as usize);
-
-        for queue_id in 0..queue_count {
-            let (request_tx, request_rx) = async_channel::unbounded::<UblkIoRequest>();
-            request_rxs.push(request_rx);
-            let (complete_tx, complete_rx) = async_channel::unbounded::<QueueCompletion>();
-            let stop = Arc::new(AtomicBool::new(false));
-            let (ready_tx, ready_rx) = mpsc::channel();
-            let cdev = base_cdev
-                .try_clone()
-                .with_context(|| format!("clone {cdev_path}"))?;
-            let start = queue_id as usize * queue_depth as usize;
-            let end = start + queue_depth as usize;
-            let buf_ptrs = queue_buf_ptrs[start..end].to_vec();
-            let worker_cfg = QueueWorkerConfig {
-                dev_id,
-                queue_id,
+        let sender = self.sender.clone();
+        let device = run_control_task(format!("smoo-gadget-ublk-recover-{dev_id}"), move || {
+            let RecoverDeviceParams {
+                block_size,
+                block_count,
+                queue_count,
                 queue_depth,
+                max_io_bytes,
                 ioctl_encode,
-                buf_ptrs,
-                request_tx,
-                completion_rx: complete_rx,
-                stop: stop.clone(),
-                cdev,
-                ready_tx,
-            };
-            debug!(queue_id = queue_id, "spawning queue worker (recovery)");
-            let thread = spawn_queue_worker(worker_cfg)?;
-            completion_txs.push(complete_tx);
-            workers.push(QueueWorkerHandle { stop, thread });
-            ready_rxs.push(ready_rx);
-        }
-
-        for (queue_idx, ready_rx) in ready_rxs.into_iter().enumerate() {
-            ready_rx
-                .recv()
-                .context("queue worker init failed (recovery)")?;
-            debug!(
-                queue_ready = true,
-                queue_id = queue_idx,
-                "queue worker ready (recovery)"
+            } = params;
+            ensure!(block_size != 0, "block size must be non-zero");
+            ensure!(
+                block_size.is_power_of_two(),
+                "block size must be a power of two"
             );
-        }
+            let logical_shift = block_size.trailing_zeros() as u8;
+            ensure!(
+                logical_shift >= 9,
+                "logical block size must be at least 512 bytes"
+            );
 
-        let queues = Arc::new(UblkQueueRuntime {
-            dev_id,
-            queue_count,
-            queue_depth,
-            block_size,
-            block_count,
-            max_io_bytes,
-            ioctl_encode,
-            buffers,
-            request_rxs,
-            completion_txs: completion_txs.clone(),
-        });
+            let total_bytes = block_count
+                .checked_mul(block_size)
+                .context("device capacity overflow")?;
+            ensure!(
+                total_bytes % 512 == 0,
+                "device capacity must be divisible by 512"
+            );
+            let max_io_bytes = if max_io_bytes == 0 {
+                compute_max_io_bytes(block_size, queue_depth, None)?
+            } else {
+                normalize_max_io_bytes(block_size, max_io_bytes as usize)?
+            };
+            let buffers = QueueBuffers::new(queue_count, queue_depth, max_io_bytes)
+                .context("allocate ublk buffers")?;
+            let queue_buf_ptrs = buffers.raw_ptrs();
+            let mut cmd = ublksrv_ctrl_cmd {
+                dev_id,
+                queue_id: u16::MAX,
+                ..Default::default()
+            };
+            cmd.data[0] = unsafe { libc::getpid() } as u64;
+            info!(dev_id, "issuing UBLK_CMD_START_USER_RECOVERY");
+            submit_ctrl_command_blocking(
+                &sender,
+                UBLK_CMD_START_USER_RECOVERY,
+                cmd,
+                "start user recovery",
+                None,
+            )?;
+            let cdev_path = format!("/dev/ublkc{dev_id}");
+            let base_cdev = File::options()
+                .read(true)
+                .write(true)
+                .open(&cdev_path)
+                .with_context(|| format!("open {cdev_path}"))?;
+            let mut request_rxs = Vec::with_capacity(queue_count as usize);
+            let mut completion_txs = Vec::with_capacity(queue_count as usize);
+            let mut workers = Vec::with_capacity(queue_count as usize);
+            let mut ready_rxs = Vec::with_capacity(queue_count as usize);
 
-        let device = SmooUblkDevice {
-            ctrl: UblkCtrlHandle {
+            for queue_id in 0..queue_count {
+                let (request_tx, request_rx) = async_channel::unbounded::<UblkIoRequest>();
+                request_rxs.push(request_rx);
+                let (complete_tx, complete_rx) = async_channel::unbounded::<QueueCompletion>();
+                let stop = Arc::new(AtomicBool::new(false));
+                let (ready_tx, ready_rx) = mpsc::channel();
+                let cdev = base_cdev
+                    .try_clone()
+                    .with_context(|| format!("clone {cdev_path}"))?;
+                let start = queue_id as usize * queue_depth as usize;
+                let end = start + queue_depth as usize;
+                let buf_ptrs = queue_buf_ptrs[start..end].to_vec();
+                let worker_cfg = QueueWorkerConfig {
+                    dev_id,
+                    queue_id,
+                    queue_depth,
+                    ioctl_encode,
+                    buf_ptrs,
+                    request_tx,
+                    completion_rx: complete_rx,
+                    stop: stop.clone(),
+                    cdev,
+                    ready_tx,
+                };
+                debug!(queue_id = queue_id, "spawning queue worker (recovery)");
+                let thread = spawn_queue_worker(worker_cfg)?;
+                completion_txs.push(complete_tx);
+                workers.push(QueueWorkerHandle { stop, thread });
+                ready_rxs.push(ready_rx);
+            }
+
+            for (queue_idx, ready_rx) in ready_rxs.into_iter().enumerate() {
+                ready_rx
+                    .recv()
+                    .context("queue worker init failed (recovery)")?;
+                debug!(
+                    queue_ready = true,
+                    queue_id = queue_idx,
+                    "queue worker ready (recovery)"
+                );
+            }
+
+            let queues = Arc::new(UblkQueueRuntime {
                 dev_id,
                 queue_count,
                 queue_depth,
+                block_size,
+                block_count,
+                max_io_bytes,
                 ioctl_encode,
-                recovery_pending: true,
-                completion_txs,
-                workers,
-                start_handle: None,
-                start_deadline: None,
-                start_result: Some(Ok(())),
-                shutdown: false,
-            },
-            queues,
-        };
+                buffers,
+                request_rxs,
+                completion_txs: completion_txs.clone(),
+            });
 
+            let device = SmooUblkDevice {
+                ctrl: UblkCtrlHandle {
+                    dev_id,
+                    queue_count,
+                    queue_depth,
+                    ioctl_encode,
+                    recovery_pending: true,
+                    completion_txs,
+                    workers,
+                    start_handle: None,
+                    start_deadline: None,
+                    start_result: Some(Ok(())),
+                    shutdown: false,
+                },
+                queues,
+            };
+
+            Ok(device)
+        })
+        .await?;
         self.managed_devs.insert(dev_id);
         Ok(device)
     }
@@ -734,8 +921,8 @@ impl SmooUblk {
             ..Default::default()
         };
         cmd.data[0] = unsafe { libc::getpid() } as u64;
-        submit_ctrl_command(
-            &self.sender,
+        submit_ctrl_command_threaded(
+            self.sender.clone(),
             UBLK_CMD_END_USER_RECOVERY,
             cmd,
             "end user recovery",
@@ -754,8 +941,8 @@ impl SmooUblk {
         };
         cmd.data[0] = unsafe { libc::getpid() } as u64;
         info!(dev_id, "issuing UBLK_CMD_START_USER_RECOVERY");
-        submit_ctrl_command(
-            &self.sender,
+        submit_ctrl_command_threaded(
+            self.sender.clone(),
             UBLK_CMD_START_USER_RECOVERY,
             cmd,
             "start user recovery",
@@ -777,57 +964,78 @@ impl SmooUblk {
         delete_ctrl: bool,
     ) -> anyhow::Result<()> {
         let dev_id = device.dev_id();
-        device.shutdown();
-        drop(device);
+        let sender = self.sender.clone();
+        run_control_task(format!("smoo-gadget-ublk-stop-{dev_id}"), move || {
+            device.shutdown();
+            drop(device);
 
-        let cmd = ublksrv_ctrl_cmd {
-            dev_id,
-            queue_id: u16::MAX,
-            ..Default::default()
-        };
-        submit_ctrl_command(&self.sender, UBLK_CMD_STOP_DEV, cmd, "stop device", None).await?;
-
-        if delete_ctrl {
-            let del_cmd = ublksrv_ctrl_cmd {
+            let cmd = ublksrv_ctrl_cmd {
                 dev_id,
                 queue_id: u16::MAX,
                 ..Default::default()
             };
-            submit_ctrl_command(
-                &self.sender,
-                UBLK_CMD_DEL_DEV,
-                del_cmd,
-                "delete device",
-                None,
-            )
-            .await?;
-        }
+            submit_ctrl_command_blocking(&sender, UBLK_CMD_STOP_DEV, cmd, "stop device", None)?;
+
+            if delete_ctrl {
+                let del_cmd = ublksrv_ctrl_cmd {
+                    dev_id,
+                    queue_id: u16::MAX,
+                    ..Default::default()
+                };
+                submit_ctrl_command_blocking(
+                    &sender,
+                    UBLK_CMD_DEL_DEV,
+                    del_cmd,
+                    "delete device",
+                    None,
+                )?;
+            }
+
+            Ok(())
+        })
+        .await?;
 
         self.managed_devs.remove(&dev_id);
         Ok(())
     }
 
     pub async fn force_remove_device(&mut self, dev_id: u32) -> anyhow::Result<()> {
-        let cmd = ublksrv_ctrl_cmd {
-            dev_id,
-            queue_id: u16::MAX,
-            ..Default::default()
-        };
-        if let Err(err) =
-            submit_ctrl_command(&self.sender, UBLK_CMD_STOP_DEV, cmd, "stop device", None).await
-        {
-            warn!(dev_id, error = ?err, "force stop failed");
-        }
-        let cmd = ublksrv_ctrl_cmd {
-            dev_id,
-            queue_id: u16::MAX,
-            ..Default::default()
-        };
-        if let Err(err) =
-            submit_ctrl_command(&self.sender, UBLK_CMD_DEL_DEV, cmd, "delete device", None).await
-        {
-            warn!(dev_id, error = ?err, "force delete failed");
-        }
+        let sender = self.sender.clone();
+        run_control_task(
+            format!("smoo-gadget-ublk-force-remove-{dev_id}"),
+            move || {
+                let cmd = ublksrv_ctrl_cmd {
+                    dev_id,
+                    queue_id: u16::MAX,
+                    ..Default::default()
+                };
+                if let Err(err) = submit_ctrl_command_blocking(
+                    &sender,
+                    UBLK_CMD_STOP_DEV,
+                    cmd,
+                    "stop device",
+                    None,
+                ) {
+                    warn!(dev_id, error = ?err, "force stop failed");
+                }
+                let cmd = ublksrv_ctrl_cmd {
+                    dev_id,
+                    queue_id: u16::MAX,
+                    ..Default::default()
+                };
+                if let Err(err) = submit_ctrl_command_blocking(
+                    &sender,
+                    UBLK_CMD_DEL_DEV,
+                    cmd,
+                    "delete device",
+                    None,
+                ) {
+                    warn!(dev_id, error = ?err, "force delete failed");
+                }
+                Ok(())
+            },
+        )
+        .await?;
         self.managed_devs.remove(&dev_id);
         Ok(())
     }
@@ -866,9 +1074,13 @@ impl SmooUblk {
             queue_id: u16::MAX,
             ..Default::default()
         };
-        if let Err(err) =
-            submit_ctrl_command_blocking(&self.sender, UBLK_CMD_STOP_DEV, stop_cmd, "stop device")
-        {
+        if let Err(err) = submit_ctrl_command_blocking(
+            &self.sender,
+            UBLK_CMD_STOP_DEV,
+            stop_cmd,
+            "stop device",
+            None,
+        ) {
             warn!(dev_id, error = ?err, "drop STOP_DEV failed");
             stop_err = Some(err);
         }
@@ -878,9 +1090,13 @@ impl SmooUblk {
             queue_id: u16::MAX,
             ..Default::default()
         };
-        if let Err(err) =
-            submit_ctrl_command_blocking(&self.sender, UBLK_CMD_DEL_DEV, del_cmd, "delete device")
-        {
+        if let Err(err) = submit_ctrl_command_blocking(
+            &self.sender,
+            UBLK_CMD_DEL_DEV,
+            del_cmd,
+            "delete device",
+            None,
+        ) {
             warn!(dev_id, error = ?err, "drop DEL_DEV failed");
             del_err = Some(err);
         }
@@ -960,6 +1176,10 @@ impl SmooUblkDevice {
 
     fn shutdown(&mut self) {
         self.ctrl.shutdown();
+    }
+
+    fn cancel_for_partial_cleanup(&mut self) {
+        self.ctrl.cancel_for_partial_cleanup();
     }
 }
 
@@ -1041,6 +1261,17 @@ impl UblkCtrlHandle {
         self.shutdown = true;
         self.stop_workers();
         self.join_start_handle();
+    }
+
+    fn cancel_for_partial_cleanup(&mut self) {
+        if self.shutdown {
+            return;
+        }
+        self.shutdown = true;
+        self.start_deadline = None;
+        self.start_result = None;
+        self.start_handle = None;
+        self.stop_workers();
     }
 
     fn stop_workers(&mut self) {
@@ -1580,13 +1811,15 @@ fn queue_ctrl_cmd(
     Ok(())
 }
 
-async fn submit_ctrl_command(
+fn submit_ctrl_command_blocking(
     sender: &Sender<CtrlCommand>,
     opcode: u32,
     cmd: ublksrv_ctrl_cmd,
     label: &'static str,
     timeout: Option<Duration>,
 ) -> anyhow::Result<()> {
+    // Some ublk commands borrow stack-local payloads through cmd.addr. Waiting
+    // synchronously keeps those payloads alive even if the caller is async.
     let (reply_tx, reply_rx) = async_channel::bounded::<Result<(), io::Error>>(1);
     debug!(
         opcode = opcode,
@@ -1598,12 +1831,10 @@ async fn submit_ctrl_command(
         "{label} submitting"
     );
     sender
-        .send((opcode, cmd, reply_tx, timeout))
-        .await
-        .context("send ctrl command")?;
+        .send_blocking((opcode, cmd, reply_tx, timeout))
+        .context("send ctrl command blocking")?;
     let res = reply_rx
-        .recv()
-        .await
+        .recv_blocking()
         .context("ctrl loop closed")?
         .map_err(anyhow::Error::from)
         .with_context(|| format!("{label} failed"));
@@ -1612,32 +1843,6 @@ async fn submit_ctrl_command(
         Err(err) => debug!(opcode = opcode, error = ?err, "{label} failed"),
     }
     res?;
-    Ok(())
-}
-
-fn submit_ctrl_command_blocking(
-    sender: &Sender<CtrlCommand>,
-    opcode: u32,
-    cmd: ublksrv_ctrl_cmd,
-    label: &'static str,
-) -> anyhow::Result<()> {
-    let (reply_tx, reply_rx) = async_channel::bounded::<Result<(), io::Error>>(1);
-    debug!(
-        opcode = opcode,
-        dev_id = cmd.dev_id,
-        queue_id = cmd.queue_id,
-        len = cmd.len,
-        addr = cmd.addr,
-        "{label} submitting"
-    );
-    sender
-        .send_blocking((opcode, cmd, reply_tx, None))
-        .context("send ctrl command blocking")?;
-    reply_rx
-        .recv_blocking()
-        .context("ctrl loop closed")?
-        .map_err(anyhow::Error::from)
-        .with_context(|| format!("{label} failed"))?;
     Ok(())
 }
 
