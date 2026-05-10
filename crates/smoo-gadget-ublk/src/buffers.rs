@@ -124,6 +124,7 @@ unsafe impl Sync for AlignedBuffer {}
 
 impl AlignedBuffer {
     fn new(len: usize) -> Result<Self> {
+        ensure!(len > 0, "buffer length must be nonzero");
         ensure!(
             BUFFER_ALIGNMENT <= page_size(),
             "buffer alignment exceeds page size"
