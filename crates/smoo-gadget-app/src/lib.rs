@@ -58,7 +58,6 @@ const OUTSTANDING_BATCH_MAX: usize = 32;
 const IDLE_INTERVAL_MS: u64 = 10;
 const LIVENESS_INTERVAL_MS: u64 = 500;
 const MAINTENANCE_SLICE_MS: u64 = 200;
-const RECONCILE_TIMEOUT_MS: u64 = 200;
 const GRACEFUL_SHUTDOWN_TIMEOUT_MS: u64 = 5_000;
 
 #[derive(Debug, Parser)]
@@ -858,20 +857,13 @@ async fn run_reconcile_slice(
                 state_store: runtime.state_store(),
                 tunables,
             };
-            match tokio::time::timeout(
-                Duration::from_millis(RECONCILE_TIMEOUT_MS),
-                controller.reconcile(&mut cx),
-            )
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => {
+            // ublk control commands borrow kernel-visible payloads; do not cancel
+            // a reconciliation future while one may be in flight.
+            match controller.reconcile(&mut cx).await {
+                Ok(()) => {}
+                Err(err) => {
                     warn!(export_id, error = ?err, "reconcile failed; backing off");
                     controller.fail_device(format!("reconcile failed: {err:#}"));
-                }
-                Err(_) => {
-                    warn!(export_id, "reconcile timed out; backing off");
-                    controller.fail_device("reconcile timed out".to_string());
                 }
             }
         }

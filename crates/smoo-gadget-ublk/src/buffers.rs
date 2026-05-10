@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow, ensure};
-use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::cell::UnsafeCell;
-use std::ptr::NonNull;
+use std::io;
+use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const BUFFER_ALIGNMENT: usize = 4096;
@@ -124,9 +124,26 @@ unsafe impl Sync for AlignedBuffer {}
 
 impl AlignedBuffer {
     fn new(len: usize) -> Result<Self> {
-        let layout = Layout::from_size_align(len, BUFFER_ALIGNMENT).context("buffer layout")?;
-        let ptr = unsafe { alloc_zeroed(layout) };
-        let ptr = NonNull::new(ptr).context("allocate buffer")?;
+        ensure!(
+            BUFFER_ALIGNMENT <= page_size(),
+            "buffer alignment exceeds page size"
+        );
+        // Anonymous mmap gives us zero-filled memory without eagerly touching
+        // every page during device setup.
+        let raw = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if raw == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error()).context("allocate buffer");
+        }
+        let ptr = NonNull::new(raw.cast::<u8>()).context("mmap returned null")?;
         Ok(Self { ptr, len })
     }
 
@@ -150,10 +167,11 @@ impl AlignedBuffer {
 impl Drop for AlignedBuffer {
     fn drop(&mut self) {
         unsafe {
-            dealloc(
-                self.ptr.as_ptr(),
-                Layout::from_size_align(self.len, BUFFER_ALIGNMENT).expect("buffer layout"),
-            );
+            let _ = libc::munmap(self.ptr.as_ptr().cast(), self.len);
         }
     }
+}
+
+fn page_size() -> usize {
+    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
 }
