@@ -15,7 +15,7 @@ use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail, ensure};
 use hyper::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, RANGE};
@@ -124,6 +124,112 @@ async fn link_replay() -> Result<()> {
     // A replayed request is deliberately visible twice on the wire but has only
     // one final response, so strict request/response balance is not meaningful.
     result.assert(true, false).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires dummy_hcd/ublk/configfs; run via cargo xtask integration or vm-integration"]
+async fn user_recovery_handover_drains_inflight_io() -> Result<()> {
+    common::init_tracing();
+
+    let server = StallingHttpSource::start(BLOCK_SIZE, TOTAL_BLOCKS, SEED, READ_LBA)?;
+    let state_path = temp_state_path("user_recovery_handover_drains_inflight_io")?;
+    let state_arg = state_path.display().to_string();
+    let initial_opts = GadgetOpts {
+        queue_count: 1,
+        queue_depth: 4,
+        max_io_bytes: Some(BLOCK_SIZE as u64),
+        extra_args: vec!["--state-file".to_string(), state_arg.clone()],
+        readiness_timeout: Duration::from_secs(20),
+        ..GadgetOpts::default()
+    };
+
+    let mut sc = ScenarioBuilder::new("user_recovery_handover_drains_inflight_io")
+        .with_host_source(HostSourceSpec::Http(server.url()))
+        .with_block_size(BLOCK_SIZE)
+        .with_capture(false)
+        .with_gadget_opts(initial_opts.clone())
+        .start()
+        .await?;
+
+    let dev_id = sc
+        .gadget()
+        .wait_for_ublk_dev_id(Duration::from_secs(15))
+        .await?;
+    let dev_path = PathBuf::from(format!("/dev/ublkb{dev_id}"));
+    common::wait_for_block_device(&dev_path, Duration::from_secs(5)).await?;
+
+    server.arm();
+    let expected = expected_bytes(READ_LBA, 1).await?;
+    let initial_data_requests = server.target_request_count();
+    let mut read_task = tokio::spawn(read_device_bytes(
+        dev_path.clone(),
+        READ_LBA,
+        BLOCK_SIZE as usize,
+    ));
+    server
+        .wait_for_data_requests(initial_data_requests + 1, Duration::from_secs(15))
+        .await?;
+
+    let mut adopt_opts = initial_opts;
+    adopt_opts.readiness_timeout = Duration::from_secs(35);
+    adopt_opts.extra_args.push("--adopt".to_string());
+    adopt_opts
+        .extra_args
+        .extend(["--adopt-deadline".to_string(), "25s".to_string()]);
+    let mut adopt_fut = Box::pin(sc.adopt_restart_gadget(adopt_opts));
+
+    assert_device_read_pending(&mut read_task, Duration::from_secs(2)).await?;
+    match tokio::time::timeout(Duration::from_secs(2), adopt_fut.as_mut()).await {
+        Ok(Ok(status)) => bail!(
+            "adopt completed while HTTP read was still stalled; prior gadget status={status:?}"
+        ),
+        Ok(Err(err)) => bail!("adopt failed while HTTP read was still stalled: {err:#}"),
+        Err(_) => {}
+    }
+
+    server.release();
+    let actual = tokio::time::timeout(Duration::from_secs(15), &mut read_task)
+        .await
+        .context("timed out waiting for handover read to drain")?
+        .context("device read task panicked")??;
+    ensure_read_matches(&actual, &expected)?;
+    ensure!(
+        server.target_request_count() == initial_data_requests + 1,
+        "handover reissued the stalled read instead of draining it first"
+    );
+
+    let old_status = tokio::time::timeout(Duration::from_secs(20), adopt_fut.as_mut())
+        .await
+        .context("timed out waiting for adopting gadget to finish handover")??;
+    drop(adopt_fut);
+    ensure!(
+        old_status.success(),
+        "prior gadget exited unsuccessfully: {old_status:?}"
+    );
+    server.disarm();
+
+    let recovered_dev_id = sc
+        .gadget()
+        .wait_for_ublk_dev_id(Duration::from_secs(20))
+        .await?;
+    ensure!(
+        recovered_dev_id == dev_id,
+        "handover changed ublk dev_id: before={dev_id} after={recovered_dev_id}"
+    );
+    let after_lba = READ_LBA + 1;
+    let after_expected = expected_bytes(after_lba, 1).await?;
+    let after = tokio::time::timeout(
+        Duration::from_secs(30),
+        read_device_bytes(dev_path, after_lba, BLOCK_SIZE as usize),
+    )
+    .await
+    .context("timed out reading device after user-recovery handover")??;
+    ensure_read_matches(&after, &after_expected)?;
+
+    let result = sc.stop().await?;
+    result.assert(true, false).await?;
+    let _ = tokio::fs::remove_file(&state_path).await;
     Ok(())
 }
 
@@ -264,6 +370,10 @@ impl StallingHttpSource {
 
     fn arm(&self) {
         self.state.armed.store(true, Ordering::Release);
+    }
+
+    fn disarm(&self) {
+        self.state.armed.store(false, Ordering::Release);
     }
 
     fn target_request_count(&self) -> usize {
@@ -425,4 +535,12 @@ fn response(status: StatusCode, body: impl Into<Body>) -> Response<Body> {
         .status(status)
         .body(body.into())
         .expect("valid response")
+}
+
+fn temp_state_path(name: &str) -> Result<PathBuf> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock before UNIX_EPOCH")?
+        .as_nanos();
+    Ok(std::env::temp_dir().join(format!("smoo-{name}-{}-{nanos}.json", std::process::id())))
 }

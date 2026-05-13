@@ -208,6 +208,7 @@ impl ScenarioBuilder {
             host: Some(host),
             host_sources,
             host_opts,
+            gadget_opts: self.gadget_opts,
             capture,
             exports: self.exports,
             queue_depth,
@@ -223,6 +224,7 @@ pub struct RunningScenario {
     pub host: Option<HostFixture>,
     host_sources: Vec<HostSourceSpec>,
     host_opts: HostOpts,
+    gadget_opts: GadgetOpts,
     pub capture: Option<CaptureSession>,
     pub exports: Vec<ExportSpec>,
     pub queue_depth: u32,
@@ -274,6 +276,23 @@ impl RunningScenario {
         let status = self.stop_host().await?;
         self.start_host().await?;
         Ok(status)
+    }
+
+    /// Spawn a successor gadget with `--adopt`-style options against the same
+    /// FunctionFS/configfs instance. The successor is responsible for signaling
+    /// and waiting for the current gadget owner via its CLI flags.
+    pub async fn adopt_restart_gadget(&mut self, successor_opts: GadgetOpts) -> Result<ExitStatus> {
+        let gadget = self.gadget.as_mut().context("gadget already shut down")?;
+        let status = gadget
+            .adopt_restart(successor_opts.clone(), self.artifacts.log_dir())
+            .await
+            .context("adopt-restart gadget")?;
+        self.gadget_opts = successor_opts;
+        Ok(status)
+    }
+
+    pub fn gadget_opts(&self) -> &GadgetOpts {
+        &self.gadget_opts
     }
 
     /// Shut down gadget, host, then capture. Keeping the host alive while the

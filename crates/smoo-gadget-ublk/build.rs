@@ -17,6 +17,14 @@ fn add_serialize(outdir: &std::path::Path) -> anyhow::Result<i32> {
         "use serde::{{Serialize, Deserialize}};\n{}",
         regex::Regex::new(r"#\s*\[\s*derive\s*\((?P<d>[^)]+)\)\s*\]\s*pub\s*(?P<s>struct|enum)")?
             .replace_all(&res, "#[derive($d, Serialize, Deserialize)] pub $s")
+    )
+    .replace(
+        "#[derive(Copy, Clone, Serialize, Deserialize)] pub struct ublksrv_io_desc",
+        "#[derive(Copy, Clone)] pub struct ublksrv_io_desc",
+    )
+    .replace(
+        "#[derive(Copy, Clone, Serialize, Deserialize)] pub struct ublksrv_io_cmd",
+        "#[derive(Copy, Clone)] pub struct ublksrv_io_cmd",
     );
     let mut fd = File::create(outdir.join("ublk_cmd.rs"))?;
     fd.write_all(data.as_bytes())?;
@@ -35,6 +43,8 @@ fn main() {
 #include "ublk_cmd.h"
 
 #ifdef UBLK_F_CMD_IOCTL_ENCODE
+// Bindgen does not emit constants for Linux _IO*() function-like macros.
+// Force them through C consts, then strip this prefix in ParseCallbacks.
 #define MARK_FIX_753(req_name) const unsigned int Fix753_##req_name = req_name;
 #else
 #define MARK_FIX_753(req_name)
@@ -55,6 +65,9 @@ MARK_FIX_753(UBLK_U_IO_FETCH_REQ);
 MARK_FIX_753(UBLK_U_IO_COMMIT_AND_FETCH_REQ);
 MARK_FIX_753(UBLK_U_IO_NEED_GET_DATA);
 MARK_FIX_753(UBLK_U_CMD_DEL_DEV_ASYNC);
+#ifdef UBLK_U_CMD_QUIESCE_DEV
+MARK_FIX_753(UBLK_U_CMD_QUIESCE_DEV);
+#endif
 MARK_FIX_753(UBLK_U_IO_REGISTER_IO_BUF);
 MARK_FIX_753(UBLK_U_IO_UNREGISTER_IO_BUF);
 const int Fix753_UBLK_IO_RES_ABORT = UBLK_IO_RES_ABORT;

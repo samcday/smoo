@@ -44,8 +44,10 @@ sudo ./target/debug/smoo-host --file random.img
 
 ## Status
 
-This is an early prototype. It requires a recent Linux kernel with [FunctionFS][ffs], and [ublk][] support enabled. It
-should work on any device with a UDC, and is tested primarily on SDM670/SDM845 pocket computers.
+This is an early prototype. The gadget side requires Linux 6.16 or newer with [FunctionFS][ffs], and [ublk][] support
+enabled.
+
+It should work on any device with a UDC, and is tested primarily on SDM670/SDM845 pocket computers.
 
 ## Development
 

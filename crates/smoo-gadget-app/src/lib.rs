@@ -97,6 +97,9 @@ pub struct Args {
     /// Adopt existing ublk devices via user recovery.
     #[arg(long)]
     pub adopt: bool,
+    /// Maximum time to wait for the previous owner during --adopt.
+    #[arg(long, value_name = "TIMEOUT", value_parser = parse_duration)]
+    pub adopt_deadline: Option<Duration>,
     /// Expose Prometheus metrics on this TCP port (0 disables).
     #[arg(long, default_value_t = 0)]
     pub metrics_port: u16,
@@ -137,6 +140,7 @@ impl Default for Args {
             dma_heap: DmaHeapSelection::System,
             state_file: None,
             adopt: false,
+            adopt_deadline: None,
             metrics_port: 0,
             ffs_dir: None,
             mimic_fastboot: false,
@@ -158,17 +162,35 @@ pub async fn run_with_args(args: Args) -> Result<()> {
 }
 
 async fn run_impl(args: Args) -> Result<()> {
+    ensure!(
+        !args.adopt || args.state_file.is_some(),
+        "--adopt requires --state-file"
+    );
+    ensure!(
+        args.adopt || args.adopt_deadline.is_none(),
+        "--adopt-deadline requires --adopt"
+    );
     let metrics_shutdown = CancellationToken::new();
     let metrics_task = spawn_metrics_listener(args.metrics_port, metrics_shutdown.clone())?;
     let mut ublk = SmooUblk::new().context("init ublk")?;
     let mut state_store = if let Some(path) = args.state_file.as_ref() {
         info!(path = ?path, "state file configured");
-        match StateStore::load(path.clone()) {
-            Ok(store) => store,
-            Err(err) => {
-                warn!(path = ?path, error = ?err, "failed to load state file; starting new session");
-                StateStore::new_with_path(path.clone())
+        let exists = path
+            .try_exists()
+            .with_context(|| format!("check state file {}", path.display()))?;
+        if exists && !args.adopt {
+            anyhow::bail!(
+                "state file {} already exists; pass --adopt to recover it or remove it before starting a new session",
+                path.display()
+            );
+        }
+        if exists {
+            StateStore::load(path.clone()).context("load state file")?
+        } else {
+            if args.adopt {
+                warn!(path = ?path, "--adopt requested but state file does not exist; starting empty session");
             }
+            StateStore::new_with_path(path.clone())
         }
     } else {
         debug!("state file disabled; crash recovery off");
@@ -177,7 +199,7 @@ async fn run_impl(args: Args) -> Result<()> {
 
     initialize_session(&mut ublk, &mut state_store).await?;
     if args.adopt {
-        adopt_prepare(&mut ublk, &mut state_store).await?;
+        adopt_prepare(&mut ublk, &mut state_store, args.adopt_deadline).await?;
     }
 
     let (custom, endpoints, _gadget_guard, _ffs_dir) =
@@ -674,12 +696,21 @@ async fn drain_queue_batch(
     outstanding: &mut HashMap<u32, HashMap<(u16, u16), OutstandingRequest>>,
     data_plane_tx: &mpsc::UnboundedSender<DataPlaneEvent>,
     queue_rx: &mut mpsc::Receiver<QueueEvent>,
+    expected_queue_abort: bool,
 ) -> Result<()> {
     let mut processed = 0;
     while processed < QUEUE_BATCH_MAX.saturating_sub(1) {
         match queue_rx.try_recv() {
             Ok(evt) => {
-                handle_queue_event(runtime, link, outstanding, data_plane_tx, evt).await?;
+                handle_queue_event(
+                    runtime,
+                    link,
+                    outstanding,
+                    data_plane_tx,
+                    evt,
+                    expected_queue_abort,
+                )
+                .await?;
                 processed += 1;
             }
             Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
@@ -935,6 +966,12 @@ enum ShutdownAction {
     ForceNow,
 }
 
+struct HandoverState {
+    dev_ids: Vec<u32>,
+    quiesce_task: Option<std::thread::JoinHandle<Result<()>>>,
+    quiesce_complete: bool,
+}
+
 fn advance_shutdown_state(
     signal_name: &str,
     shutdown_state: &mut ShutdownState,
@@ -1019,6 +1056,7 @@ async fn run_event_loop(
     let mut exit_reason: Option<String> = None;
     let mut recovery_exit = false;
     let mut shutdown_state = ShutdownState::Running;
+    let mut handover: Option<HandoverState> = None;
     let mut last_status_seq = ep0_signals.status_seq();
     let mut last_lifecycle_seq = ep0_signals.lifecycle_seq();
 
@@ -1056,6 +1094,61 @@ async fn run_event_loop(
             );
         }
 
+        if let Some(handover_state) = handover.as_mut() {
+            if handover_state.quiesce_task.is_none()
+                && !handover_state.quiesce_complete
+                && runtime.inflight_io == 0
+            {
+                info!("handover in-flight IO drained; quiescing ublk devices");
+                handover_state.quiesce_task = Some(
+                    ublk.spawn_quiesce_devices(handover_state.dev_ids.clone(), Duration::ZERO)
+                        .context("spawn handover quiesce")?,
+                );
+            }
+
+            if handover_state
+                .quiesce_task
+                .as_ref()
+                .is_some_and(|task| task.is_finished())
+            {
+                let quiesce_task = handover_state
+                    .quiesce_task
+                    .take()
+                    .expect("handover quiesce task missing");
+                match quiesce_task.join() {
+                    Ok(Ok(())) => {
+                        handover_state.quiesce_complete = true;
+                        info!("handover quiesce complete");
+                    }
+                    Ok(Err(err)) => {
+                        warn!(error = ?err, "handover quiesce failed");
+                        note_exit_reason(
+                            &mut exit_reason,
+                            format!("handover quiesce failed: {err:#}"),
+                        );
+                        io_error = Some(err);
+                        break;
+                    }
+                    Err(err) => {
+                        let err = anyhow!("handover quiesce thread panicked: {err:?}");
+                        warn!(error = ?err, "handover quiesce panicked");
+                        note_exit_reason(&mut exit_reason, err.to_string());
+                        io_error = Some(err);
+                        break;
+                    }
+                }
+            }
+
+            if handover_state.quiesce_complete && runtime.inflight_io == 0 {
+                note_exit_reason(&mut exit_reason, "handover in-flight IO drained");
+                info!("handover in-flight IO drained; releasing ublk devices for adoption");
+                let _ = control_stop.send(true);
+                release_devices_for_user_recovery(&mut runtime, &mut queue_tx).await?;
+                recovery_exit = true;
+                break;
+            }
+        }
+
         if let ShutdownState::Graceful { deadline } = shutdown_state {
             if Instant::now() >= deadline {
                 warn!("graceful shutdown timed out; forcing shutdown");
@@ -1091,13 +1184,11 @@ async fn run_event_loop(
                     ShutdownAction::ForceNow => break,
                 }
             }
-            Some(_) = hup.recv() => {
-                info!("SIGHUP received; initiating user recovery");
-                note_exit_reason(&mut exit_reason, "SIGHUP received; entering user recovery");
-                let _ = control_stop.send(true);
-                begin_user_recovery(ublk, &mut runtime).await?;
-                recovery_exit = true;
-                break;
+            Some(_) = hup.recv(), if handover.is_none() => {
+                info!("SIGHUP received; preparing user-recovery handover");
+                note_exit_reason(&mut exit_reason, "SIGHUP received; preparing user-recovery handover");
+                handover = Some(begin_user_recovery_handover(ublk, &runtime)?);
+                stop_accepting_new_io(&mut runtime, &mut queue_tx).await;
             }
             event = data_plane_rx.recv() => {
                 if let Some(event) = event {
@@ -1119,7 +1210,7 @@ async fn run_event_loop(
                     }
                 }
             }
-            Some(config) = control_rx.recv(), if matches!(shutdown_state, ShutdownState::Running) => {
+            Some(config) = control_rx.recv(), if matches!(shutdown_state, ShutdownState::Running) && handover.is_none() => {
                 if let Err(err) = handle_config_message(
                     ublk,
                     &mut runtime,
@@ -1135,7 +1226,7 @@ async fn run_event_loop(
             _ = ep0_notified.as_mut() => {
                 continue;
             }
-            maybe_evt = queue_rx.recv(), if !matches!(shutdown_state, ShutdownState::Forceful) && runtime.io_pump.is_some() => {
+            maybe_evt = queue_rx.recv(), if handover.is_none() && !matches!(shutdown_state, ShutdownState::Forceful) && runtime.io_pump.is_some() => {
                 if let Some(evt) = maybe_evt {
                     if let Err(err) = handle_queue_event(
                         &mut runtime,
@@ -1143,6 +1234,7 @@ async fn run_event_loop(
                         &mut outstanding,
                         &data_plane_tx,
                         evt,
+                        handover.is_some(),
                     )
                     .await
                     {
@@ -1160,6 +1252,7 @@ async fn run_event_loop(
                         &mut outstanding,
                         &data_plane_tx,
                         &mut queue_rx,
+                        handover.is_some(),
                     )
                     .await
                     {
@@ -1190,40 +1283,44 @@ async fn run_event_loop(
                 }
             }
             _ = liveness_tick.tick() => {
-                if let Err(err) = drive_runtime(
-                    ublk,
-                    &mut runtime,
-                    &mut link,
-                    &mut outstanding,
-                    queue_tx.as_ref(),
-                    false,
-                ).await {
-                    warn!(error = ?err, "run_event_loop: drive_runtime failed on liveness tick");
-                    note_exit_reason(
-                        &mut exit_reason,
-                        format!("drive_runtime on liveness tick failed: {err:#}"),
-                    );
-                    io_error = Some(err);
-                    break;
+                if handover.is_none() {
+                    if let Err(err) = drive_runtime(
+                        ublk,
+                        &mut runtime,
+                        &mut link,
+                        &mut outstanding,
+                        queue_tx.as_ref(),
+                        false,
+                    ).await {
+                        warn!(error = ?err, "run_event_loop: drive_runtime failed on liveness tick");
+                        note_exit_reason(
+                            &mut exit_reason,
+                            format!("drive_runtime on liveness tick failed: {err:#}"),
+                        );
+                        io_error = Some(err);
+                        break;
+                    }
                 }
             }
             _ = &mut idle_sleep => {
-                let allow_reconcile = matches!(shutdown_state, ShutdownState::Running);
-                if let Err(err) = drive_runtime(
-                    ublk,
-                    &mut runtime,
-                    &mut link,
-                    &mut outstanding,
-                    queue_tx.as_ref(),
-                    allow_reconcile,
-                ).await {
-                    warn!(error = ?err, "run_event_loop: drive_runtime failed on idle maintenance");
-                    note_exit_reason(
-                        &mut exit_reason,
-                        format!("drive_runtime on idle maintenance failed: {err:#}"),
-                    );
-                    io_error = Some(err);
-                    break;
+                if handover.is_none() {
+                    let allow_reconcile = matches!(shutdown_state, ShutdownState::Running);
+                    if let Err(err) = drive_runtime(
+                        ublk,
+                        &mut runtime,
+                        &mut link,
+                        &mut outstanding,
+                        queue_tx.as_ref(),
+                        allow_reconcile,
+                    ).await {
+                        warn!(error = ?err, "run_event_loop: drive_runtime failed on idle maintenance");
+                        note_exit_reason(
+                            &mut exit_reason,
+                            format!("drive_runtime on idle maintenance failed: {err:#}"),
+                        );
+                        io_error = Some(err);
+                        break;
+                    }
                 }
             }
         }
@@ -1660,7 +1757,11 @@ async fn initialize_session(_ublk: &mut SmooUblk, state_store: &mut StateStore) 
     Ok(())
 }
 
-async fn adopt_prepare(ublk: &mut SmooUblk, state_store: &mut StateStore) -> Result<()> {
+async fn adopt_prepare(
+    ublk: &mut SmooUblk,
+    state_store: &mut StateStore,
+    deadline: Option<Duration>,
+) -> Result<()> {
     let mut dev_ids = Vec::new();
     let mut owner_pids = HashSet::new();
     let mut stale_devices = false;
@@ -1715,43 +1816,53 @@ async fn adopt_prepare(ublk: &mut SmooUblk, state_store: &mut StateStore) -> Res
             libc::kill(pid, libc::SIGHUP);
         }
         info!(pid, "waiting for prior owner to exit before adopting");
-        wait_for_owner_exit(ublk, &dev_ids, pid, Duration::from_secs(3)).await?;
+        wait_for_user_recovery_start(ublk, &dev_ids, pid, deadline).await?;
     }
 
     Ok(())
 }
 
-async fn wait_for_owner_exit(
+async fn wait_for_user_recovery_start(
     ublk: &mut SmooUblk,
     dev_ids: &[u32],
     target_pid: i32,
-    timeout: Duration,
+    timeout: Option<Duration>,
 ) -> Result<()> {
-    let deadline = Instant::now() + timeout;
+    let deadline = timeout.map(|timeout| Instant::now() + timeout);
+    let mut remaining: HashSet<u32> = dev_ids.iter().copied().collect();
     loop {
-        let mut still_owned = false;
-        for dev_id in dev_ids {
-            match ublk.owner_pid(*dev_id).await {
-                Ok(pid) => {
-                    debug!(dev_id, pid, target_pid, "owner check during adopt wait");
-                    if pid == target_pid {
-                        still_owned = true;
-                    } else if pid > 0 && pid != target_pid {
-                        anyhow::bail!(
-                            "device {dev_id} now owned by unexpected pid {pid} during adopt"
-                        );
-                    }
+        for dev_id in dev_ids.iter().copied() {
+            if !remaining.contains(&dev_id) {
+                continue;
+            }
+            match ublk.start_user_recovery(dev_id).await {
+                Ok(()) => {
+                    remaining.remove(&dev_id);
+                    debug!(dev_id, target_pid, "device entered user recovery");
+                }
+                Err(err) if error_is_errno(&err, libc::EBUSY) => {
+                    debug!(dev_id, target_pid, "device not ready for user recovery yet");
                 }
                 Err(err) => {
-                    warn!(dev_id, error = ?err, "owner pid query failed during adopt wait");
+                    return Err(err).with_context(|| {
+                        format!("start user recovery for device {dev_id} during adopt")
+                    });
                 }
             }
         }
-        if !still_owned {
+        if remaining.is_empty() {
             return Ok(());
         }
-        if Instant::now() >= deadline {
-            anyhow::bail!("owner pid {target_pid} still active after adopt wait");
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            warn!(
+                target_pid,
+                remaining_dev_ids = ?remaining,
+                "adopt deadline elapsed; sending SIGINT to prior owner"
+            );
+            unsafe {
+                libc::kill(target_pid, libc::SIGINT);
+            }
+            anyhow::bail!("owner pid {target_pid} still active after adopt deadline");
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -2038,23 +2149,46 @@ async fn force_remove_with_retry(ublk: &mut SmooUblk, dev_id: u32) -> Result<()>
     Ok(())
 }
 
-async fn begin_user_recovery(ublk: &mut SmooUblk, runtime: &mut RuntimeState) -> Result<()> {
-    ublk.preserve_devices_on_drop();
-    for (_, tasks) in runtime.queue_tasks.drain() {
-        tasks.shutdown().await;
-    }
+fn begin_user_recovery_handover(
+    ublk: &mut SmooUblk,
+    runtime: &RuntimeState,
+) -> Result<HandoverState> {
+    ensure!(
+        runtime.state_store.path().is_some(),
+        "SIGHUP handover requires --state-file"
+    );
     let mut dev_ids = Vec::new();
-    for ctrl in runtime.exports.values_mut() {
-        if let Some((ctrl, queues)) = ctrl.take_device_handles() {
-            dev_ids.push(ctrl.dev_id());
-            drop(SmooUblkDevice::from_parts(ctrl, queues));
-        } else if let Some(dev_id) = ctrl.dev_id() {
-            dev_ids.push(dev_id);
+    for controller in runtime.exports.values() {
+        if let Some(dev_id) = controller.dev_id() {
+            if !dev_ids.contains(&dev_id) {
+                dev_ids.push(dev_id);
+            }
         }
     }
-    for dev_id in dev_ids {
-        if let Err(err) = ublk.start_user_recovery(dev_id).await {
-            warn!(dev_id, error = ?err, "start user recovery failed");
+    ensure!(
+        !dev_ids.is_empty(),
+        "SIGHUP handover requested but no ublk devices are active"
+    );
+    ublk.preserve_devices_on_drop();
+    Ok(HandoverState {
+        dev_ids,
+        quiesce_task: None,
+        quiesce_complete: false,
+    })
+}
+
+async fn release_devices_for_user_recovery(
+    runtime: &mut RuntimeState,
+    queue_tx: &mut Option<QueueSender>,
+) -> Result<()> {
+    stop_accepting_new_io(runtime, queue_tx).await;
+    for controller in runtime.exports.values_mut() {
+        if let Some((ctrl, queues)) = controller.take_device_handles() {
+            let dev_id = ctrl.dev_id();
+            info!(dev_id, "releasing ublk device for user recovery");
+            drop(SmooUblkDevice::from_parts(ctrl, queues));
+        } else if let Some(dev_id) = controller.dev_id() {
+            info!(dev_id, "leaving ublk device for user recovery");
         }
     }
     Ok(())
@@ -2177,6 +2311,7 @@ async fn handle_queue_event(
     outstanding: &mut HashMap<u32, HashMap<(u16, u16), OutstandingRequest>>,
     data_plane_tx: &mpsc::UnboundedSender<DataPlaneEvent>,
     event: QueueEvent,
+    expected_queue_abort: bool,
 ) -> Result<()> {
     match event {
         QueueEvent::Request {
@@ -2254,6 +2389,13 @@ async fn handle_queue_event(
             dev_id,
             error,
         } => {
+            if expected_queue_abort && error_is_errno(&error, libc::ENODEV) {
+                info!(
+                    export_id,
+                    dev_id, "queue fetch aborted during handover quiesce"
+                );
+                return Ok(());
+            }
             warn!(
                 export_id,
                 dev_id,
@@ -2393,6 +2535,40 @@ fn parse_byte_size(input: &str) -> Result<usize, String> {
         .ok_or_else(|| "byte size overflows usize".to_string())
 }
 
+fn parse_duration(input: &str) -> Result<Duration, String> {
+    let input = input.trim();
+    let digits = input
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(input.len());
+    if digits == 0 {
+        return Err("duration must start with a number".to_string());
+    }
+
+    let value = input[..digits]
+        .parse::<u64>()
+        .map_err(|err| err.to_string())?;
+    if value == 0 {
+        return Err("duration must be non-zero".to_string());
+    }
+
+    let suffix = input[digits..].trim().to_ascii_lowercase();
+    match suffix.as_str() {
+        "ms" => Ok(Duration::from_millis(value)),
+        "" | "s" => Ok(Duration::from_secs(value)),
+        "m" => value
+            .checked_mul(60)
+            .map(Duration::from_secs)
+            .ok_or_else(|| "duration overflows u64 seconds".to_string()),
+        "h" => value
+            .checked_mul(60 * 60)
+            .map(Duration::from_secs)
+            .ok_or_else(|| "duration overflows u64 seconds".to_string()),
+        _ => Err(format!(
+            "unsupported duration suffix {suffix:?}; use ms, s, m, or h"
+        )),
+    }
+}
+
 fn validate_persisted_record(record: &PersistedExportRecord) -> Result<()> {
     ensure!(
         record.export_id != 0,
@@ -2469,7 +2645,8 @@ fn build_spec_from_export(export: ConfigExport) -> Result<ExportSpec> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_byte_size;
+    use super::{parse_byte_size, parse_duration};
+    use std::time::Duration;
 
     #[test]
     fn parse_byte_size_accepts_raw_bytes() {
@@ -2489,5 +2666,21 @@ mod tests {
         assert!(parse_byte_size("0").is_err());
         assert!(parse_byte_size("MiB").is_err());
         assert!(parse_byte_size("1TiB").is_err());
+    }
+
+    #[test]
+    fn parse_duration_accepts_supported_suffixes() {
+        assert_eq!(parse_duration("5").unwrap(), Duration::from_secs(5));
+        assert_eq!(parse_duration("250ms").unwrap(), Duration::from_millis(250));
+        assert_eq!(parse_duration("2s").unwrap(), Duration::from_secs(2));
+        assert_eq!(parse_duration("3m").unwrap(), Duration::from_secs(180));
+        assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn parse_duration_rejects_invalid_values() {
+        assert!(parse_duration("0").is_err());
+        assert!(parse_duration("ms").is_err());
+        assert!(parse_duration("1d").is_err());
     }
 }
