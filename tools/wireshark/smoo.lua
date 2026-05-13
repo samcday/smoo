@@ -41,6 +41,10 @@ pf.cfg_export_id = ProtoField.uint32("smoo.config.export_id", "SMOO Export ID", 
 pf.cfg_block_size = ProtoField.uint32("smoo.config.block_size", "SMOO Block Size", base.DEC)
 pf.cfg_size_bytes = ProtoField.uint64("smoo.config.size_bytes", "SMOO Size Bytes", base.DEC)
 
+pf.ctrl_name = ProtoField.string("smoo.control.name", "SMOO Control Request")
+pf.ctrl_request = ProtoField.uint8("smoo.control.request", "SMOO Control bRequest", base.HEX)
+pf.ctrl_request_type = ProtoField.uint8("smoo.control.request_type", "SMOO Control bmRequestType", base.HEX)
+
 pf.note = ProtoField.string("smoo.note", "SMOO Note")
 
 -- The dissector identifies endpoints by transfer type + direction (the high
@@ -52,9 +56,21 @@ pf.note = ProtoField.string("smoo.note", "SMOO Note")
 -- parse as a 28-byte SMOO Request/Response.
 local CONFIG = {
     default_block_size = 4096,
+    ident_req_type = 0xC1,
+    ident_request = 0x01,
     config_exports_req_type = 0x41,
     config_exports_request = 0x02,
+    smoo_status_req_type = 0xA1,
+    smoo_status_request = 0x03,
 }
+
+local function optional_field(name)
+    local ok, field = pcall(Field.new, name)
+    if ok then
+        return field
+    end
+    return nil
+end
 
 local f_endpoint = Field.new("usb.endpoint_address")
 local f_transfer = Field.new("usb.transfer_type")
@@ -62,7 +78,7 @@ local f_capdata = Field.new("usb.capdata")
 local f_bus = Field.new("usb.bus_id")
 local f_dev = Field.new("usb.device_address")
 local f_ctrl_req = Field.new("usb.setup.bRequest")
-local f_ctrl_type = Field.new("usb.bmRequestType")
+local f_ctrl_type = optional_field("usb.setup.bmRequestType") or optional_field("usb.bmRequestType")
 local f_len = Field.new("usb.data_len")
 local f_urb_type = Field.new("usb.urb_type")
 
@@ -97,7 +113,26 @@ local function to_number(fieldinfo)
     if not s then
         return nil
     end
-    return tonumber(s)
+    local n = tonumber(s)
+    if n then
+        return n
+    end
+    local hex = s:match("0x([0-9A-Fa-f]+)")
+    if hex then
+        return tonumber(hex, 16)
+    end
+    local dec = s:match("(%d+)")
+    if dec then
+        return tonumber(dec)
+    end
+    return nil
+end
+
+local function field_number(field)
+    if not field then
+        return nil
+    end
+    return to_number(field())
 end
 
 local function hex_to_bytes(s)
@@ -127,6 +162,19 @@ local function op_name(op)
     if op == 2 then return "Flush" end
     if op == 3 then return "Discard" end
     return "Unknown"
+end
+
+local function control_name(ctrl_type, ctrl_req)
+    if ctrl_type == CONFIG.ident_req_type and ctrl_req == CONFIG.ident_request then
+        return "IDENT"
+    end
+    if ctrl_type == CONFIG.config_exports_req_type and ctrl_req == CONFIG.config_exports_request then
+        return "CONFIG_EXPORTS"
+    end
+    if ctrl_type == CONFIG.smoo_status_req_type and ctrl_req == CONFIG.smoo_status_request then
+        return "SMOO_STATUS"
+    end
+    return nil
 end
 
 local function queue_new()
@@ -297,18 +345,49 @@ local function add_config_tree(tree, entries)
     end
 end
 
+local function add_control_tree(tree, name, ctrl_type, ctrl_req)
+    local subtree = tree:add(smoo, "SMOO Control " .. name)
+    subtree:add(pf.ctrl_name, name)
+    subtree:add(pf.ctrl_request_type, ctrl_type)
+    subtree:add(pf.ctrl_request, ctrl_req)
+end
+
 function smoo.dissector(buffer, pinfo, tree)
     local transfer_type = to_number(f_transfer())
     local endpoint = to_number(f_endpoint())
     local capdata = f_capdata()
     local capbytes = hex_to_bytes(capdata and tostring(capdata) or nil)
     local st = state_for_device()
+    local urb = urb_type_char()
+
+    -- EP0 setup packets are the handshake source of truth. Decode them before
+    -- data-bearing filtering; control-IN completion frames carry payload but no
+    -- setup tuple, while control-OUT setup frames may or may not expose payload
+    -- bytes depending on usbmon/Wireshark version and snaplen.
+    local ctrl_req = field_number(f_ctrl_req)
+    local ctrl_type = field_number(f_ctrl_type)
+    local ctrl_name = control_name(ctrl_type, ctrl_req)
+    if ctrl_name and (urb == "S" or urb == nil) then
+        add_control_tree(tree, ctrl_name, ctrl_type, ctrl_req)
+        if ctrl_name == "CONFIG_EXPORTS" then
+            local entries = parse_config_exports(capbytes)
+            if entries then
+                for _, entry in ipairs(entries) do
+                    st.exports[entry.export_id] = {
+                        block_size = entry.block_size,
+                        size_bytes = entry.size_bytes,
+                    }
+                end
+                add_config_tree(tree, entries)
+            end
+        end
+        return
+    end
 
     -- Direction: high bit of endpoint address. 1 = IN (device→host),
     -- 0 = OUT (host→device). FunctionFS assigns endpoint *numbers*, not
     -- roles, so we anchor on direction + transfer type instead.
     local dir_in = endpoint and (endpoint % 256) >= 0x80 or false
-    local urb = urb_type_char()
     -- Skip the empty half of every URB pair: IN-direction submits and
     -- OUT-direction completions carry no payload and would double-count or
     -- pop the queue twice.
@@ -361,20 +440,6 @@ function smoo.dissector(buffer, pinfo, tree)
         return
     end
 
-    local ctrl_req = to_number(f_ctrl_req())
-    local ctrl_type = to_number(f_ctrl_type())
-    if ctrl_req == CONFIG.config_exports_request and ctrl_type == CONFIG.config_exports_req_type then
-        local entries = parse_config_exports(capbytes)
-        if entries then
-            for _, entry in ipairs(entries) do
-                st.exports[entry.export_id] = {
-                    block_size = entry.block_size,
-                    size_bytes = entry.size_bytes,
-                }
-            end
-            add_config_tree(tree, entries)
-        end
-    end
 end
 
 register_postdissector(smoo)

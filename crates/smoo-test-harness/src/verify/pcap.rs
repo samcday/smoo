@@ -8,7 +8,7 @@
 //!   -e smoo.request.op -e smoo.request.export_id -e smoo.request.request_id \
 //!   -e smoo.response.op -e smoo.response.export_id -e smoo.response.request_id \
 //!   -e smoo.bulk.dir -e smoo.bulk.len_mismatch -e smoo.bulk.orphan \
-//!   -e smoo.config.export_id -Y smoo
+//!   -e smoo.config.export_id -e smoo.control.name -Y smoo
 //! ```
 //!
 //! The dissector only emits `smoo.bulk.len_mismatch` and `smoo.bulk.orphan`
@@ -57,6 +57,9 @@ struct Summary {
     smoo_frame_count: u64,
     peak_inflight: u32,
     repeated_request_keys: u64,
+    ident_setup_count: u64,
+    config_exports_setup_count: u64,
+    smoo_status_setup_count: u64,
 }
 
 pub struct PcapAssertions {
@@ -100,6 +103,9 @@ const TSHARK_COLUMNS: &[&str] = &[
     "smoo.bulk.num_blocks",
     "smoo.bulk.expected_len",
     "smoo.bulk.actual_len",
+    "smoo.control.name",
+    "smoo.control.request",
+    "smoo.control.request_type",
 ];
 
 const COL_FRAME_NO: usize = 0;
@@ -127,6 +133,7 @@ const COL_RESP_STATUS: usize = 21;
 const COL_RESP_LBA: usize = 22;
 const COL_RESP_BLOCKS: usize = 23;
 const COL_RESP_FLAGS: usize = 24;
+const COL_CONTROL_NAME: usize = 31;
 
 impl PcapAssertions {
     pub async fn from_pcap(pcap: &Path, lua: &Path) -> Result<Self> {
@@ -175,6 +182,18 @@ impl PcapAssertions {
         self.summary.config_exports_count
     }
 
+    pub fn ident_setup_count(&self) -> u64 {
+        self.summary.ident_setup_count
+    }
+
+    pub fn config_exports_setup_count(&self) -> u64 {
+        self.summary.config_exports_setup_count
+    }
+
+    pub fn smoo_status_setup_count(&self) -> u64 {
+        self.summary.smoo_status_setup_count
+    }
+
     /// Maximum number of `(export_id, request_id)` pairs observed in flight at
     /// any point during the capture. Computed by walking smoo frames in
     /// capture order, inserting on request frames and removing on response
@@ -215,6 +234,24 @@ impl PcapAssertions {
                 self.summary.orphan_frames.len(),
                 self.pcap_path.display(),
                 self.summary.orphan_frames
+            );
+        }
+        Ok(())
+    }
+
+    pub fn assert_control_handshakes(&self, min_sessions: u64) -> Result<()> {
+        let s = &self.summary;
+        if s.ident_setup_count < min_sessions
+            || s.config_exports_setup_count < min_sessions
+            || s.smoo_status_setup_count < min_sessions
+        {
+            bail!(
+                "expected at least {min_sessions} EP0 handshakes in {}, got IDENT={} CONFIG_EXPORTS={} SMOO_STATUS={} (diagnostics: {})",
+                self.pcap_path.display(),
+                s.ident_setup_count,
+                s.config_exports_setup_count,
+                s.smoo_status_setup_count,
+                diagnostics_path(&self.pcap_path).display()
             );
         }
         Ok(())
@@ -381,13 +418,16 @@ fn build_diagnostic_report(tsv: &str) -> DiagnosticReport {
     let mut report = String::new();
     writeln!(
         report,
-        "counts: smoo_frames={} requests={} responses={} bulk_in={} bulk_out={} config_exports={} peak_inflight={} repeated_request_keys={}",
+        "counts: smoo_frames={} requests={} responses={} bulk_in={} bulk_out={} config_exports={} ep0_ident={} ep0_config_exports={} ep0_smoo_status={} peak_inflight={} repeated_request_keys={}",
         summary.smoo_frame_count,
         summary.requests,
         summary.responses,
         summary.bulk_in,
         summary.bulk_out,
         summary.config_exports_count,
+        summary.ident_setup_count,
+        summary.config_exports_setup_count,
+        summary.smoo_status_setup_count,
         summary.peak_inflight,
         summary.repeated_request_keys,
     )
@@ -608,7 +648,7 @@ fn parse_u64(value: &str) -> Option<u64> {
 /// smoo.request.op, smoo.request.export_id, smoo.request.request_id,
 /// smoo.response.op, smoo.response.export_id, smoo.response.request_id,
 /// smoo.bulk.dir, smoo.bulk.len_mismatch, smoo.bulk.orphan,
-/// smoo.config.export_id.
+/// smoo.config.export_id, with diagnostic/control columns appended after that.
 /// Empty cells indicate the field was absent on that frame.
 fn summarize(tsv: &str) -> Summary {
     let mut s = Summary::default();
@@ -631,6 +671,7 @@ fn summarize(tsv: &str) -> Summary {
         let len_mismatch = col(&cols, COL_LEN_MISMATCH);
         let orphan = col(&cols, COL_ORPHAN);
         let export_id = col(&cols, COL_CONFIG_EXPORT_ID);
+        let control_name = col(&cols, COL_CONTROL_NAME);
 
         s.smoo_frame_count += 1;
         if !req.is_empty() {
@@ -666,6 +707,12 @@ fn summarize(tsv: &str) -> Summary {
         if !export_id.is_empty() {
             s.config_exports_count += 1;
         }
+        match control_name {
+            "IDENT" => s.ident_setup_count += 1,
+            "CONFIG_EXPORTS" => s.config_exports_setup_count += 1,
+            "SMOO_STATUS" => s.smoo_status_setup_count += 1,
+            _ => {}
+        }
     }
     s
 }
@@ -687,6 +734,9 @@ mod tests {
     fn summarize_empty_returns_zero() {
         let s = summarize("");
         assert_eq!(s.smoo_frame_count, 0);
+        assert_eq!(s.ident_setup_count, 0);
+        assert_eq!(s.config_exports_setup_count, 0);
+        assert_eq!(s.smoo_status_setup_count, 0);
         assert!(s.length_mismatch_frames.is_empty());
     }
 
@@ -756,12 +806,35 @@ mod tests {
         assert_eq!(s.repeated_request_keys, 1);
     }
 
+    #[test]
+    fn summarize_counts_control_setup_packets() {
+        let tsv = format!(
+            "{}{}{}{}{}",
+            control_line(1, "IDENT"),
+            control_line(2, "CONFIG_EXPORTS"),
+            control_line(3, "SMOO_STATUS"),
+            control_line(4, "CONFIG_EXPORTS"),
+            control_line(5, "SMOO_STATUS"),
+        );
+        let s = summarize(&tsv);
+        assert_eq!(s.ident_setup_count, 1);
+        assert_eq!(s.config_exports_setup_count, 2);
+        assert_eq!(s.smoo_status_setup_count, 2);
+    }
+
     fn request_line(frame_no: u64, export_id: u64, request_id: u64) -> String {
         format!("{frame_no}\t0\t{export_id}\t{request_id}\t\t\t\t\t\t\t\n")
     }
 
     fn response_line(frame_no: u64, export_id: u64, request_id: u64) -> String {
         format!("{frame_no}\t\t\t\t0\t{export_id}\t{request_id}\t\t\t\t\n")
+    }
+
+    fn control_line(frame_no: u64, name: &str) -> String {
+        let mut cols = vec![String::new(); TSHARK_COLUMNS.len()];
+        cols[COL_FRAME_NO] = frame_no.to_string();
+        cols[COL_CONTROL_NAME] = name.to_string();
+        format!("{}\n", cols.join("\t"))
     }
 
     #[test]

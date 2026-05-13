@@ -111,6 +111,7 @@ async fn link_replay() -> Result<()> {
     if let Some(pcap) = result.pcap_assertions().await? {
         pcap.assert_no_length_mismatch()?;
         pcap.assert_no_orphan_bulk()?;
+        pcap.assert_control_handshakes(2)?;
         ensure!(
             pcap.repeated_request_keys() >= 1,
             "link_replay expected at least one repeated request key in {}, got {}",
