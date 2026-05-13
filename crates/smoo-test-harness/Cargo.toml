@@ -28,4 +28,5 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", 
 tracing = "0.1.41"
 
 [dev-dependencies]
+hyper = { workspace = true, features = ["server", "http1", "tcp"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

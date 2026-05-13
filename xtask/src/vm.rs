@@ -642,7 +642,7 @@ modprobe libcomposite
 modprobe usb_f_fs
 modprobe ublk_drv
 modprobe usbmon
-modprobe dummy_hcd num_instances=4
+modprobe dummy_hcd num=4
 mountpoint -q /sys/kernel/config || mount -t configfs configfs /sys/kernel/config
 mountpoint -q /sys/kernel/debug || mount -t debugfs debugfs /sys/kernel/debug
 '
@@ -1369,7 +1369,7 @@ sudo modprobe libcomposite
 sudo modprobe usb_f_fs
 sudo modprobe ublk_drv
 sudo modprobe usbmon
-sudo modprobe dummy_hcd num_instances=4
+sudo modprobe dummy_hcd num=4
 
 sudo mountpoint -q /sys/kernel/config || sudo mount -t configfs configfs /sys/kernel/config
 sudo mountpoint -q /sys/kernel/debug || sudo mount -t debugfs debugfs /sys/kernel/debug

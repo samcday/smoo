@@ -12,7 +12,13 @@ mod vm;
 // Privileged harness scenarios that are expected to pass in a configured
 // dummy_hcd/ublk environment. `shutdown_host_loss` is intentionally omitted:
 // it documents a known shutdown bug and is kept as a manual reproducer.
-const STABLE_HARNESS_TESTS: &[&str] = &["smoke", "rw_modest", "pipelined_io", "max_io_read"];
+const STABLE_HARNESS_TESTS: &[&str] = &[
+    "smoke",
+    "rw_modest",
+    "pipelined_io",
+    "max_io_read",
+    "link_replay",
+];
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
@@ -166,7 +172,7 @@ fn test_infra_setup(_extra: &[String]) -> Result<()> {
     // Required: must succeed.
     sudo_modprobe("ublk_drv", &[])?;
     sudo_modprobe("usbmon", &[])?;
-    sudo_modprobe("dummy_hcd", &["num_instances=4"])?;
+    sudo_modprobe("dummy_hcd", &["num=4"])?;
     println!("kernel modules loaded.");
     Ok(())
 }

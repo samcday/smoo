@@ -74,6 +74,7 @@ pub struct IoWork {
 pub struct IoPumpHandle {
     submit: mpsc::Sender<SubmitMsg>,
     permits: Arc<Semaphore>,
+    state: PumpStateHandle,
 }
 
 impl Clone for IoPumpHandle {
@@ -81,6 +82,7 @@ impl Clone for IoPumpHandle {
         Self {
             submit: self.submit.clone(),
             permits: self.permits.clone(),
+            state: self.state.clone(),
         }
     }
 }
@@ -94,12 +96,26 @@ impl IoPumpHandle {
         let capacity = capacity.max(1);
         let permits = Arc::new(Semaphore::new(capacity));
         let (submit_tx, submit_rx) = mpsc::channel(capacity);
+        let (state_handle, state_rx) = PumpStateHandle::new();
         let handle = Self {
             submit: submit_tx,
             permits: permits.clone(),
+            state: state_handle.clone(),
         };
-        let task = tokio::spawn(supervise(gadget, submit_rx, capacity));
+        let task = tokio::spawn(supervise(
+            gadget,
+            submit_rx,
+            capacity,
+            state_handle,
+            state_rx,
+        ));
         (handle, task)
+    }
+
+    /// Fault the pump from outside its workers when the transport is known to
+    /// be offline before an endpoint operation itself returns an error.
+    pub fn fault(&self) {
+        self.state.fault();
     }
 
     /// Submit a work item and await its completion.
@@ -164,9 +180,14 @@ struct BulkOutPending {
     read_len: usize,
 }
 
-async fn supervise(gadget: Arc<SmooGadget>, submit_rx: mpsc::Receiver<SubmitMsg>, capacity: usize) {
+async fn supervise(
+    gadget: Arc<SmooGadget>,
+    submit_rx: mpsc::Receiver<SubmitMsg>,
+    capacity: usize,
+    state_handle: PumpStateHandle,
+    state_rx: watch::Receiver<PumpState>,
+) {
     let registry = Arc::new(InFlightRegistry::<InFlightEntry>::new());
-    let (state_handle, state_rx) = PumpStateHandle::new();
     let (bulk_in_tx, bulk_in_rx) = mpsc::channel::<BulkInPending>(capacity);
     let (bulk_out_tx, bulk_out_rx) = mpsc::channel::<BulkOutPending>(capacity);
 
