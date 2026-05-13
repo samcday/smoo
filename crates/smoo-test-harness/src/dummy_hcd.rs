@@ -1,6 +1,6 @@
 //! Slot allocator + sysfs probing for `dummy_hcd` instances.
 //!
-//! `dummy_hcd` (loaded with `num_instances=N`) creates N pairs of
+//! `dummy_hcd` (loaded with `num=N`) creates N pairs of
 //! `dummy_hcd.<i>` / `dummy_udc.<i>`. Binding a gadget to `dummy_udc.<i>`
 //! makes the device visible on the bus owned by `dummy_hcd.<i>`. Each test
 //! reserves one index via the [`SlotPool`].
@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, bail};
 
 /// Default number of `dummy_hcd` instances expected. Matches `cargo xtask
-/// test-infra-setup` (`modprobe dummy_hcd num_instances=4`).
+/// test-infra-setup` (`modprobe dummy_hcd num=4`).
 pub const DEFAULT_NUM_INSTANCES: u32 = 4;
 
 /// VID handed to every gadget the harness creates. The PID varies by slot so
@@ -69,20 +69,28 @@ impl Drop for Slot {
 #[derive(Debug)]
 pub struct SlotPool {
     in_use: Vec<bool>,
+    next: usize,
 }
 
 impl SlotPool {
     pub fn new(size: u32) -> Self {
         Self {
             in_use: vec![false; size as usize],
+            next: 0,
         }
     }
 
     pub fn try_take(&mut self) -> Option<u32> {
-        for (i, slot) in self.in_use.iter_mut().enumerate() {
-            if !*slot {
-                *slot = true;
-                return Some(i as u32);
+        if self.in_use.is_empty() {
+            return None;
+        }
+
+        for _ in 0..self.in_use.len() {
+            let idx = self.next;
+            self.next = (self.next + 1) % self.in_use.len();
+            if !self.in_use[idx] {
+                self.in_use[idx] = true;
+                return Some(idx as u32);
             }
         }
         None
@@ -104,7 +112,7 @@ fn lock_pool(pool: &Mutex<SlotPool>) -> std::sync::MutexGuard<'_, SlotPool> {
 pub fn allocate_slot(pool: &Arc<Mutex<SlotPool>>) -> Result<Slot> {
     let idx = lock_pool(pool)
         .try_take()
-        .ok_or_else(|| anyhow::anyhow!("no free dummy_hcd slot — increase num_instances?"))?;
+        .ok_or_else(|| anyhow::anyhow!("no free dummy_hcd slot — increase dummy_hcd num?"))?;
 
     if !udc_present(idx) {
         lock_pool(pool).release(idx);
@@ -155,9 +163,9 @@ pub fn bus_for_hcd(idx: u32) -> Result<u32> {
     bail!("no usb<bus> child under {dir}; gadget may not be bound yet");
 }
 
-/// Probe of the kernel state required by the harness. `Ok(())` means the
-/// modules-or-equivalent capabilities are in place.
-pub fn probe_kernel() -> Result<()> {
+/// Probe of the kernel state required by the harness. Returns the number of
+/// available `dummy_hcd` controller pairs usable by the slot pool.
+pub fn probe_kernel() -> Result<u32> {
     let need_dirs: &[&str] = &["/sys/kernel/config/usb_gadget", "/sys/class/udc"];
     for dir in need_dirs {
         if !Path::new(dir).is_dir() {
@@ -167,9 +175,7 @@ pub fn probe_kernel() -> Result<()> {
         }
     }
     if !udc_present(0) {
-        bail!(
-            "dummy_udc.0 not present — `modprobe dummy_hcd num_instances={DEFAULT_NUM_INSTANCES}` first"
-        );
+        bail!("dummy_udc.0 not present — `modprobe dummy_hcd num={DEFAULT_NUM_INSTANCES}` first");
     }
     if !Path::new("/dev/ublk-control").exists() {
         bail!("/dev/ublk-control missing — `modprobe ublk_drv`");
@@ -181,7 +187,13 @@ pub fn probe_kernel() -> Result<()> {
             "no usbmon interface — mount debugfs (sudo mount -t debugfs none /sys/kernel/debug) and `modprobe usbmon`"
         );
     }
-    Ok(())
+    Ok(available_slot_count())
+}
+
+fn available_slot_count() -> u32 {
+    (0..DEFAULT_NUM_INSTANCES)
+        .take_while(|idx| udc_present(*idx))
+        .count() as u32
 }
 
 #[cfg(test)]
@@ -195,6 +207,18 @@ mod tests {
         assert_eq!(pool.try_take(), Some(1));
         assert_eq!(pool.try_take(), None);
         pool.release(0);
+        assert_eq!(pool.try_take(), Some(0));
+    }
+
+    #[test]
+    fn pool_rotates_after_release() {
+        let mut pool = SlotPool::new(3);
+        assert_eq!(pool.try_take(), Some(0));
+        pool.release(0);
+        assert_eq!(pool.try_take(), Some(1));
+        pool.release(1);
+        assert_eq!(pool.try_take(), Some(2));
+        pool.release(2);
         assert_eq!(pool.try_take(), Some(0));
     }
 }

@@ -59,6 +59,7 @@ const IDLE_INTERVAL_MS: u64 = 10;
 const LIVENESS_INTERVAL_MS: u64 = 500;
 const MAINTENANCE_SLICE_MS: u64 = 200;
 const GRACEFUL_SHUTDOWN_TIMEOUT_MS: u64 = 5_000;
+const DATA_PLANE_FAULT_TIMEOUT_MS: u64 = 1_000;
 
 #[derive(Debug, Parser)]
 #[command(name = "smoo-gadget", version)]
@@ -2081,8 +2082,32 @@ async fn process_link_commands(
                 "link transport offline; preserving ublk runtime"
             );
         }
+        fault_data_plane(runtime).await;
     }
     Ok(())
+}
+
+async fn fault_data_plane(runtime: &mut RuntimeState) {
+    if let Some(pump) = runtime.io_pump.take() {
+        pump.fault();
+    }
+    if let Some(task) = runtime.io_pump_task.take() {
+        let mut task = task;
+        match tokio::time::timeout(
+            Duration::from_millis(DATA_PLANE_FAULT_TIMEOUT_MS),
+            &mut task,
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => warn!(error = ?err, "io pump task failed while faulting data plane"),
+            Err(_) => {
+                warn!("io pump task did not exit after link loss; aborting");
+                task.abort();
+                let _ = task.await;
+            }
+        }
+    }
 }
 
 async fn handle_data_plane_event(

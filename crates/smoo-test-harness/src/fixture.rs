@@ -16,9 +16,7 @@ use regex::Regex;
 use tokio::process::Command;
 
 use crate::configfs::GadgetConfigFs;
-use crate::dummy_hcd::{
-    DEFAULT_NUM_INSTANCES, Slot, SlotPool, allocate_slot as pool_allocate_slot, probe_kernel,
-};
+use crate::dummy_hcd::{Slot, SlotPool, allocate_slot as pool_allocate_slot, probe_kernel};
 use crate::process::ChildProcess;
 
 /// Process-wide fixture: probes kernel state and shares a single
@@ -32,8 +30,8 @@ impl KernelFixture {
     /// per-test; the slot pool is shared across calls.
     pub fn ensure() -> Result<Self> {
         static POOL: OnceLock<Arc<Mutex<SlotPool>>> = OnceLock::new();
-        probe_kernel().context("kernel pre-flight")?;
-        let pool = POOL.get_or_init(|| Arc::new(Mutex::new(SlotPool::new(DEFAULT_NUM_INSTANCES))));
+        let slot_count = probe_kernel().context("kernel pre-flight")?;
+        let pool = POOL.get_or_init(|| Arc::new(Mutex::new(SlotPool::new(slot_count))));
         Ok(Self {
             pool: Arc::clone(pool),
         })
@@ -236,6 +234,8 @@ pub enum HostSourceSpec {
     Random { blocks: u64, seed: u64 },
     /// `--file <path>`.
     File(PathBuf),
+    /// `--http <url>`.
+    Http(String),
 }
 
 pub struct HostFixture {
@@ -274,6 +274,9 @@ impl HostFixture {
                 }
                 HostSourceSpec::File(path) => {
                     cmd.arg("--file").arg(path);
+                }
+                HostSourceSpec::Http(url) => {
+                    cmd.arg("--http").arg(url);
                 }
             }
         }

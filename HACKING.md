@@ -290,8 +290,8 @@ Failure to service ep0 promptly leads to EP0 STALL + possible gadget reset.
   the repository prefix with `SMOO_VM_IMAGE_REPOSITORY` if needed.
 
   Each scenario is a `#[tokio::test]` in `crates/smoo-test-harness/tests/`.
-  v1 ships `smoke` (handshake + 1 R/W) and `rw_modest` (fio randwrite-
-  with-md5 against the resulting `/dev/ublkbN`). On failure the artifact
+  Stable scenarios include `smoke`, `rw_modest`, `pipelined_io`,
+  `max_io_read`, and `link_replay`. On failure the artifact
   bundle is the source of truth — open `capture.pcapng` with the
   dissector at `tools/wireshark/smoo.lua` to triage wire-level issues.
 

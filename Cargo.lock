@@ -2252,6 +2252,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "futures-util",
+ "hyper 0.14.32",
  "libc 0.2.185",
  "nix 0.30.1",
  "regex",

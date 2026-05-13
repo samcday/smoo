@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use tokio::process::Command;
 
 use crate::artifacts::{ArtifactBundle, ExitInfo, Metadata, OpMixSer, kernel_release};
@@ -191,9 +191,14 @@ impl ScenarioBuilder {
 
         // After the gadget is bound to UDC, it appears on the dummy_hcd bus.
         // The host can now claim it.
-        let host = HostFixture::spawn(&gadget.slot, &host_sources, host_opts, artifacts.log_dir())
-            .await
-            .context("spawn host fixture")?;
+        let host = HostFixture::spawn(
+            &gadget.slot,
+            &host_sources,
+            host_opts.clone(),
+            artifacts.log_dir(),
+        )
+        .await
+        .context("spawn host fixture")?;
 
         Ok(RunningScenario {
             name: self.name,
@@ -201,6 +206,8 @@ impl ScenarioBuilder {
             kernel,
             gadget: Some(gadget),
             host: Some(host),
+            host_sources,
+            host_opts,
             capture,
             exports: self.exports,
             queue_depth,
@@ -214,6 +221,8 @@ pub struct RunningScenario {
     pub kernel: KernelFixture,
     pub gadget: Option<GadgetFixture>,
     pub host: Option<HostFixture>,
+    host_sources: Vec<HostSourceSpec>,
+    host_opts: HostOpts,
     pub capture: Option<CaptureSession>,
     pub exports: Vec<ExportSpec>,
     pub queue_depth: u32,
@@ -231,6 +240,40 @@ impl RunningScenario {
 
     pub fn slot(&self) -> &Slot {
         &self.gadget().slot
+    }
+
+    /// Stop only the host process, leaving the gadget, ublk device, and packet
+    /// capture running. Tests use this to force transport loss while preserving
+    /// in-flight ublk I/O.
+    pub async fn stop_host(&mut self) -> Result<ExitStatus> {
+        let host = self.host.take().context("host already shut down")?;
+        host.shutdown().await.context("host shutdown")
+    }
+
+    /// Start a fresh host process against the existing gadget slot and the
+    /// same source/options used when the scenario was created.
+    pub async fn start_host(&mut self) -> Result<()> {
+        if self.host.is_some() {
+            bail!("host already running");
+        }
+        let gadget = self.gadget.as_ref().context("gadget already shut down")?;
+        let host = HostFixture::spawn(
+            &gadget.slot,
+            &self.host_sources,
+            self.host_opts.clone(),
+            self.artifacts.log_dir(),
+        )
+        .await
+        .context("spawn host fixture")?;
+        self.host = Some(host);
+        Ok(())
+    }
+
+    /// Restart the host process and return the old host's exit status.
+    pub async fn restart_host(&mut self) -> Result<ExitStatus> {
+        let status = self.stop_host().await?;
+        self.start_host().await?;
+        Ok(status)
     }
 
     /// Shut down gadget, host, then capture. Keeping the host alive while the

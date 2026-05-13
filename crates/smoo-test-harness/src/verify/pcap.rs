@@ -56,6 +56,7 @@ struct Summary {
     orphan_frames: Vec<u64>,
     smoo_frame_count: u64,
     peak_inflight: u32,
+    repeated_request_keys: u64,
 }
 
 pub struct PcapAssertions {
@@ -182,6 +183,13 @@ impl PcapAssertions {
     /// A peak ≥ 2 is direct wire-level evidence that pipelining occurred.
     pub fn peak_inflight(&self) -> u32 {
         self.summary.peak_inflight
+    }
+
+    /// Number of request frames whose `(export_id, request_id)` key was seen
+    /// earlier in the capture. In controlled link-loss scenarios this is
+    /// evidence that the gadget replayed a parked ublk request after reconnect.
+    pub fn repeated_request_keys(&self) -> u64 {
+        self.summary.repeated_request_keys
     }
 
     pub fn pcap_path(&self) -> &Path {
@@ -373,7 +381,7 @@ fn build_diagnostic_report(tsv: &str) -> DiagnosticReport {
     let mut report = String::new();
     writeln!(
         report,
-        "counts: smoo_frames={} requests={} responses={} bulk_in={} bulk_out={} config_exports={} peak_inflight={}",
+        "counts: smoo_frames={} requests={} responses={} bulk_in={} bulk_out={} config_exports={} peak_inflight={} repeated_request_keys={}",
         summary.smoo_frame_count,
         summary.requests,
         summary.responses,
@@ -381,6 +389,7 @@ fn build_diagnostic_report(tsv: &str) -> DiagnosticReport {
         summary.bulk_out,
         summary.config_exports_count,
         summary.peak_inflight,
+        summary.repeated_request_keys,
     )
     .ok();
     writeln!(report).ok();
@@ -604,6 +613,7 @@ fn parse_u64(value: &str) -> Option<u64> {
 fn summarize(tsv: &str) -> Summary {
     let mut s = Summary::default();
     let mut inflight: HashSet<(u64, u64)> = HashSet::new();
+    let mut seen_requests: HashSet<(u64, u64)> = HashSet::new();
 
     for line in tsv.lines() {
         if line.is_empty() {
@@ -626,6 +636,9 @@ fn summarize(tsv: &str) -> Summary {
         if !req.is_empty() {
             s.requests += 1;
             if let Some(key) = request_key(req_export_id, req_request_id) {
+                if !seen_requests.insert(key) {
+                    s.repeated_request_keys += 1;
+                }
                 inflight.insert(key);
                 s.peak_inflight = s.peak_inflight.max(inflight.len() as u32);
             }
@@ -729,6 +742,18 @@ mod tests {
         );
         let s = summarize(&tsv);
         assert_eq!(s.peak_inflight, 3);
+    }
+
+    #[test]
+    fn repeated_request_keys_counts_duplicate_requests() {
+        let tsv = format!(
+            "{}{}{}",
+            request_line(1, 0, 7),
+            request_line(2, 0, 7),
+            response_line(3, 0, 7)
+        );
+        let s = summarize(&tsv);
+        assert_eq!(s.repeated_request_keys, 1);
     }
 
     fn request_line(frame_no: u64, export_id: u64, request_id: u64) -> String {
