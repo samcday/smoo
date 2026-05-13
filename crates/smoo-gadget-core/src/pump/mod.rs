@@ -112,8 +112,8 @@ impl IoPumpHandle {
         (handle, task)
     }
 
-    /// Fault the pump from outside its workers. Used when liveness detects a
-    /// dead host before an endpoint operation itself returns an error.
+    /// Fault the pump from outside its workers when the transport is known to
+    /// be offline before an endpoint operation itself returns an error.
     pub fn fault(&self) {
         self.state.fault();
     }

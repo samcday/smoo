@@ -87,6 +87,8 @@ async fn link_replay() -> Result<()> {
         .wait_for_log(&offline_re, Duration::from_secs(10))
         .await?;
     tracing::info!("gadget observed link loss; verifying device read remains parked");
+    // The HTTP source still holds the backing read, so successful recovery must
+    // leave the kernel read pending here rather than completing or failing it.
     assert_device_read_pending(&mut read_task, Duration::from_secs(2)).await?;
 
     let before_restart_data_requests = server.target_request_count();
@@ -168,6 +170,12 @@ async fn expected_bytes(lba: u64, blocks: u64) -> Result<Vec<u8>> {
 }
 
 fn ensure_read_matches(actual: &[u8], expected: &[u8]) -> Result<()> {
+    ensure!(
+        actual.len() == expected.len(),
+        "replayed read length mismatch: got {}, expected {}",
+        actual.len(),
+        expected.len()
+    );
     if actual == expected {
         return Ok(());
     }
