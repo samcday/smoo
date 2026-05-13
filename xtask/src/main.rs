@@ -18,6 +18,7 @@ const STABLE_HARNESS_TESTS: &[&str] = &[
     "pipelined_io",
     "max_io_read",
     "link_replay",
+    "user_recovery_handover",
 ];
 
 fn main() -> ExitCode {

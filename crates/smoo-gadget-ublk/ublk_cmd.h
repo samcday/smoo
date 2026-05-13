@@ -51,6 +51,10 @@
 	_IOR('u', 0x13, struct ublksrv_ctrl_cmd)
 #define UBLK_U_CMD_DEL_DEV_ASYNC	\
 	_IOR('u', 0x14, struct ublksrv_ctrl_cmd)
+#define UBLK_U_CMD_UPDATE_SIZE		\
+	_IOWR('u', 0x15, struct ublksrv_ctrl_cmd)
+#define UBLK_U_CMD_QUIESCE_DEV		\
+	_IOWR('u', 0x16, struct ublksrv_ctrl_cmd)
 
 /*
  * 64bits are enough now, and it should be easy to extend in case of
@@ -171,8 +175,18 @@
  */
 #define UBLK_F_NEED_GET_DATA (1UL << 2)
 
+/*
+ * - Block devices are recoverable if ublk server exits and restarts
+ * - Outstanding I/O when ublk server exits is met with errors
+ * - I/O issued while there is no ublk server queues
+ */
 #define UBLK_F_USER_RECOVERY	(1UL << 3)
 
+/*
+ * - Block devices are recoverable if ublk server exits and restarts
+ * - Outstanding I/O when ublk server exits is reissued
+ * - I/O issued while there is no ublk server queues
+ */
 #define UBLK_F_USER_RECOVERY_REISSUE	(1UL << 4)
 
 /*
@@ -199,7 +213,13 @@
 /* use ioctl encoding for uring command */
 #define UBLK_F_CMD_IOCTL_ENCODE	(1UL << 6)
 
-/* Copy between request and user buffer by pread()/pwrite() */
+/*
+ *  Copy between request and user buffer by pread()/pwrite()
+ *
+ *  Not available for UBLK_F_UNPRIVILEGED_DEV, otherwise userspace may
+ *  deceive us by not filling request buffer, then kernel uninitialized
+ *  data may be leaked.
+ */
 #define UBLK_F_USER_COPY	(1UL << 7)
 
 /*
@@ -207,6 +227,19 @@
  * deny the request by returning an error.
  */
 #define UBLK_F_ZONED (1ULL << 8)
+
+/*
+ * - Block devices are recoverable if ublk server exits and restarts
+ * - Outstanding I/O when ublk server exits is met with errors
+ * - I/O issued while there is no ublk server is met with errors
+ */
+#define UBLK_F_USER_RECOVERY_FAIL_IO (1ULL << 9)
+
+/*
+ * Resizing a block device is possible with UBLK_U_CMD_UPDATE_SIZE
+ * New size is passed in cmd->data[0] and is in units of sectors
+ */
+#define UBLK_F_UPDATE_SIZE		 (1ULL << 10)
 
 /*
  * request buffer is registered automatically to uring_cmd's io_uring
@@ -242,10 +275,37 @@
  */
 #define UBLK_F_AUTO_BUF_REG 	(1ULL << 11)
 
+/*
+ * Control command `UBLK_U_CMD_QUIESCE_DEV` is added for quiescing device,
+ * which state can be transitioned to `UBLK_S_DEV_QUIESCED` or
+ * `UBLK_S_DEV_FAIL_IO` finally, and it needs ublk server cooperation for
+ * handling `UBLK_IO_RES_ABORT` correctly.
+ *
+ * Typical use case is for supporting to upgrade ublk server application,
+ * meantime keep ublk block device persistent during the period.
+ *
+ * This feature is only available when UBLK_F_USER_RECOVERY is enabled.
+ *
+ * Note, this command returns -EBUSY in case that all IO commands are being
+ * handled by ublk server and not completed in specified time period which
+ * is passed from the control command parameter.
+ */
+#define UBLK_F_QUIESCE		(1ULL << 12)
+
+/*
+ * If this feature is set, ublk_drv supports each (qid,tag) pair having
+ * its own independent daemon task that is responsible for handling it.
+ * If it is not set, daemons are per-queue instead, so for two pairs
+ * (qid1,tag1) and (qid2,tag2), if qid1 == qid2, then the same task must
+ * be responsible for handling (qid1,tag1) and (qid2,tag2).
+ */
+#define UBLK_F_PER_IO_DAEMON (1ULL << 13)
+
 /* device state */
 #define UBLK_S_DEV_DEAD	0
 #define UBLK_S_DEV_LIVE	1
 #define UBLK_S_DEV_QUIESCED	2
+#define UBLK_S_DEV_FAIL_IO 	3
 
 /* shipped via sqe->cmd of io_uring command */
 struct ublksrv_ctrl_cmd {
@@ -350,15 +410,10 @@ struct ublksrv_io_desc {
 	/* op: bit 0-7, flags: bit 8-31 */
 	__u32		op_flags;
 
-	/* bindgen can't handle union well */
-#if 0
 	union {
 		__u32		nr_sectors;
 		__u32		nr_zones; /* for UBLK_IO_OP_REPORT_ZONES */
 	};
-#else
-		__u32		nr_sectors;
-#endif
 
 	/* start sector for this io */
 	__u64		start_sector;
@@ -443,7 +498,6 @@ struct ublksrv_io_cmd {
 	/* io result, it is valid for COMMIT* command only */
 	__s32	result;
 
-#if 0
 	union {
 		/*
 		 * userspace buffer address in ublksrv daemon process, valid for
@@ -459,9 +513,6 @@ struct ublksrv_io_cmd {
 		__u64	addr;
 		__u64	zone_append_lba;
 	};
-#else
-		__u64	addr;
-#endif
 };
 
 struct ublk_param_basic {
@@ -559,6 +610,8 @@ struct ublk_params {
 	struct ublk_param_discard	discard;
 	struct ublk_param_devt		devt;
 	struct ublk_param_zoned	zoned;
+	struct ublk_param_dma_align	dma;
+	struct ublk_param_segment	seg;
 };
 
 #endif

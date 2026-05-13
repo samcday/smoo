@@ -5,11 +5,11 @@ use crate::buffers::{BufferGuard, QueueBuffers};
 use crate::sys::{
     UBLK_CMD_ADD_DEV, UBLK_CMD_DEL_DEV, UBLK_CMD_END_USER_RECOVERY, UBLK_CMD_GET_DEV_INFO,
     UBLK_CMD_GET_DEV_INFO2, UBLK_CMD_GET_PARAMS, UBLK_CMD_SET_PARAMS, UBLK_CMD_START_DEV,
-    UBLK_CMD_START_USER_RECOVERY, UBLK_CMD_STOP_DEV, UBLK_F_USER_RECOVERY,
+    UBLK_CMD_START_USER_RECOVERY, UBLK_CMD_STOP_DEV, UBLK_F_QUIESCE, UBLK_F_USER_RECOVERY,
     UBLK_F_USER_RECOVERY_REISSUE, UBLK_IO_OP_DISCARD, UBLK_IO_OP_FLUSH, UBLK_IO_OP_READ,
-    UBLK_IO_OP_WRITE, UBLK_PARAM_TYPE_BASIC, UBLK_U_IO_COMMIT_AND_FETCH_REQ, UBLK_U_IO_FETCH_REQ,
-    ublk_param_basic, ublk_params, ublksrv_ctrl_cmd, ublksrv_ctrl_dev_info, ublksrv_io_cmd,
-    ublksrv_io_desc,
+    UBLK_IO_OP_WRITE, UBLK_IO_RES_ABORT, UBLK_PARAM_TYPE_BASIC, UBLK_U_CMD_QUIESCE_DEV,
+    UBLK_U_IO_COMMIT_AND_FETCH_REQ, UBLK_U_IO_FETCH_REQ, ublk_param_basic, ublk_params,
+    ublksrv_ctrl_cmd, ublksrv_ctrl_dev_info, ublksrv_io_cmd, ublksrv_io_desc,
 };
 use anyhow::{Context, anyhow, ensure};
 use async_channel::{Receiver, RecvError, Sender};
@@ -301,6 +301,13 @@ async fn submit_ctrl_command_threaded(
     .await
 }
 
+fn quiesce_timeout_ms(timeout: Duration) -> anyhow::Result<u64> {
+    if timeout.is_zero() {
+        return Ok(0);
+    }
+    u64::try_from(timeout.as_millis()).context("quiesce timeout exceeds u64 milliseconds")
+}
+
 pub type UblkBuffer<'a> = BufferGuard<'a>;
 
 impl SmooUblk {
@@ -316,6 +323,42 @@ impl SmooUblk {
     pub async fn owner_pid(&self, dev_id: u32) -> anyhow::Result<i32> {
         let info = self.get_device_info(dev_id).await?;
         Ok(info.ublksrv_pid)
+    }
+
+    /// Start a blocking quiesce sequence on a helper thread.
+    ///
+    /// `timeout == Duration::ZERO` maps to the kernel's "wait forever" mode,
+    /// which is what graceful server handover needs while the async app loop
+    /// continues servicing in-flight I/O.
+    pub fn spawn_quiesce_devices(
+        &self,
+        dev_ids: Vec<u32>,
+        timeout: Duration,
+    ) -> anyhow::Result<JoinHandle<anyhow::Result<()>>> {
+        let sender = self.sender.clone();
+        let timeout_ms = quiesce_timeout_ms(timeout)?;
+        thread::Builder::new()
+            .name("smoo-gadget-ublk-quiesce".to_string())
+            .spawn(move || {
+                for dev_id in dev_ids {
+                    let mut cmd = ublksrv_ctrl_cmd {
+                        dev_id,
+                        queue_id: u16::MAX,
+                        ..Default::default()
+                    };
+                    cmd.data[0] = timeout_ms;
+                    info!(dev_id, timeout_ms, "issuing UBLK_CMD_QUIESCE_DEV");
+                    submit_ctrl_command_blocking(
+                        &sender,
+                        UBLK_U_CMD_QUIESCE_DEV,
+                        cmd,
+                        "quiesce device",
+                        None,
+                    )?;
+                }
+                Ok(())
+            })
+            .context("spawn ublk quiesce thread")
     }
 
     pub fn new() -> anyhow::Result<Self> {
@@ -567,7 +610,8 @@ impl SmooUblk {
                 ublksrv_pid: unsafe { libc::getpid() } as i32,
                 ..Default::default()
             };
-            info.flags |= (UBLK_F_USER_RECOVERY | UBLK_F_USER_RECOVERY_REISSUE) as u64;
+            info.flags |=
+                (UBLK_F_USER_RECOVERY | UBLK_F_USER_RECOVERY_REISSUE | UBLK_F_QUIESCE) as u64;
 
             // ublk_params is passed in ublksrv_ctrl_dev_info during UBLK_CMD_SET_PARAMS
             let mut params = ublk_params {
@@ -1352,6 +1396,7 @@ impl UblkQueueRuntime {
         let req = receiver
             .recv()
             .await
+            .map_err(|_| io::Error::from_raw_os_error(libc::ENODEV))
             .context("smoo-gadget-ublk device channel closed")?;
         trace!(
             dev_id = req.dev_id,
@@ -1511,9 +1556,35 @@ fn queue_worker_main(cfg: QueueWorkerConfig) -> anyhow::Result<()> {
 
     let timeout = types::Timespec::from(Duration::from_millis(5));
     let submit_args = types::SubmitArgs::new().timespec(&timeout);
+    // Quiesce aborts idle FETCH commands, but already-fetched requests still
+    // need their completions committed before the old owner can exit cleanly.
+    let mut tag_active = vec![false; queue_depth as usize];
+    let mut tag_open = vec![true; queue_depth as usize];
+    let mut open_tags = queue_depth as usize;
 
-    while !stop.load(Ordering::SeqCst) {
+    while !stop.load(Ordering::SeqCst) && (open_tags > 0 || tag_active.iter().any(|active| *active))
+    {
         while let Ok(comp) = completion_rx.try_recv() {
+            let tag_index = comp.tag as usize;
+            if tag_index >= tag_open.len() {
+                warn!(
+                    dev_id = dev_id,
+                    queue_id = queue_id,
+                    tag = comp.tag,
+                    "dropping completion for invalid ublk tag"
+                );
+                continue;
+            }
+            if !tag_open[tag_index] {
+                debug!(
+                    dev_id = dev_id,
+                    queue_id = queue_id,
+                    tag = comp.tag,
+                    "dropping completion for aborted ublk tag"
+                );
+                continue;
+            }
+            tag_active[tag_index] = false;
             let cmd_addr = buf_ptrs[comp.tag as usize];
             trace!(
                 dev_id = dev_id,
@@ -1550,17 +1621,69 @@ fn queue_worker_main(cfg: QueueWorkerConfig) -> anyhow::Result<()> {
         }
 
         while let Some(cqe) = ring.completion().next() {
+            let tag = cqe.user_data() as u16;
+            let tag_index = tag as usize;
             let result = cqe.result();
             if result < 0 {
+                if result == UBLK_IO_RES_ABORT {
+                    let active = tag_active.get(tag_index).copied().unwrap_or(false);
+                    if active {
+                        debug!(
+                            dev = dev_id,
+                            queue = queue_id,
+                            tag,
+                            open_tags,
+                            "active queue tag aborted by ublk; awaiting completion or release"
+                        );
+                        continue;
+                    }
+                    if let Some(open) = tag_open.get_mut(tag_index) {
+                        if *open {
+                            *open = false;
+                            open_tags = open_tags.saturating_sub(1);
+                        }
+                    }
+                    debug!(
+                        dev = dev_id,
+                        queue = queue_id,
+                        tag,
+                        active,
+                        open_tags,
+                        "queue fetch aborted by ublk"
+                    );
+                    if open_tags == 0 && !tag_active.iter().any(|active| *active) {
+                        return Ok(());
+                    }
+                    continue;
+                }
                 warn!(
                     dev = dev_id,
                     queue = queue_id,
+                    tag,
                     "queue cqe error: {}",
                     result
                 );
                 return Err(io::Error::from_raw_os_error(-result).into());
             }
-            let tag = cqe.user_data() as u16;
+            if tag_index >= tag_open.len() {
+                warn!(
+                    dev_id = dev_id,
+                    queue_id = queue_id,
+                    tag,
+                    "queue cqe used invalid tag"
+                );
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid ublk tag").into());
+            }
+            if !tag_open[tag_index] {
+                debug!(
+                    dev_id = dev_id,
+                    queue_id = queue_id,
+                    tag,
+                    "ignoring request for aborted ublk tag"
+                );
+                continue;
+            }
+            tag_active[tag_index] = true;
             let desc = unsafe { ptr::read(iod_base.add(tag as usize)) };
             let request = UblkIoRequest {
                 dev_id,
@@ -1568,7 +1691,7 @@ fn queue_worker_main(cfg: QueueWorkerConfig) -> anyhow::Result<()> {
                 tag,
                 op: decode_op(desc.op_flags),
                 sector: desc.start_sector,
-                num_sectors: desc.nr_sectors,
+                num_sectors: io_desc_nr_sectors(&desc),
             };
             trace!(
                 dev_id = dev_id,
@@ -1612,12 +1735,7 @@ fn queue_cmd(
         fd,
         ioctl_encode,
     } = ctx;
-    let io_cmd = ublksrv_io_cmd {
-        q_id: queue_id,
-        tag,
-        result,
-        addr: desc_addr,
-    };
+    let io_cmd = io_cmd_with_addr(queue_id, tag, result, desc_addr);
     trace!(
         queue_id = queue_id,
         tag = tag,
@@ -1684,6 +1802,21 @@ fn queue_cmd_buf_size(depth: u32) -> usize {
         return page_sz;
     }
     desc_bytes.div_ceil(page_sz) * page_sz
+}
+
+fn io_desc_nr_sectors(desc: &ublksrv_io_desc) -> u32 {
+    // Linux exposes nr_sectors/nr_zones as an anonymous C union.
+    unsafe { desc.__bindgen_anon_1.nr_sectors }
+}
+
+fn io_cmd_with_addr(q_id: u16, tag: u16, result: i32, addr: u64) -> ublksrv_io_cmd {
+    // Linux exposes addr/zone_append_lba as an anonymous C union.
+    ublksrv_io_cmd {
+        q_id,
+        tag,
+        result,
+        __bindgen_anon_1: sys::ublksrv_io_cmd__bindgen_ty_1 { addr },
+    }
 }
 
 fn encode_cmd_op(cmd: u32, ioctl_encode: bool) -> u32 {

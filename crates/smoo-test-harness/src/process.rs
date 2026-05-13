@@ -218,6 +218,13 @@ impl ChildProcess {
         Ok(status)
     }
 
+    pub async fn wait(mut self) -> Result<ExitStatus> {
+        let status = self.child.wait().await.context("waiting for child exit")?;
+        self.stdout_buf.close();
+        self.stderr_buf.close();
+        Ok(status)
+    }
+
     /// Try-wait without consuming. Returns Some(status) if the process has
     /// exited, None otherwise.
     pub fn try_wait(&mut self) -> Result<Option<ExitStatus>> {

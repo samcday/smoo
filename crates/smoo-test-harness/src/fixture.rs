@@ -83,41 +83,7 @@ impl GadgetFixture {
     /// on the dummy_hcd bus.
     pub async fn spawn(slot: Slot, opts: GadgetOpts, log_dir: &Path) -> Result<Self> {
         let configfs = GadgetConfigFs::create(&slot).context("configfs setup")?;
-
-        let bin = smoo_gadget_path()?;
-        let mut cmd = Command::new(&bin);
-        cmd.arg("--vendor-id")
-            .arg(format!("0x{:04x}", slot.vid))
-            .arg("--product-id")
-            .arg(format!("0x{:04x}", slot.pid))
-            .arg("--queue-count")
-            .arg(opts.queue_count.to_string())
-            .arg("--queue-depth")
-            .arg(opts.queue_depth.to_string())
-            .arg("--ffs-dir")
-            .arg(&configfs.ffs_mount_dir);
-        if let Some(max_io) = opts.max_io_bytes {
-            cmd.arg("--max-io").arg(max_io.to_string());
-        }
-        for arg in &opts.extra_args {
-            cmd.arg(arg);
-        }
-        apply_rust_log(&mut cmd, &opts.rust_log);
-
-        let child = ChildProcess::spawn("smoo-gadget", cmd, log_dir)
-            .await
-            .context("spawn smoo-gadget")?;
-
-        // Wait for the gadget to log readiness — fires from
-        // crates/smoo-gadget-app/src/lib.rs:193 after FunctionFS descriptors
-        // have been written and ep1-4 opened. The CLI's tracing-subscriber
-        // writes to stdout by default; use either stream so this works
-        // regardless of how a future caller configures it.
-        let re = Regex::new(r"smoo gadget initialized").unwrap();
-        child
-            .wait_for_either(&re, opts.readiness_timeout)
-            .await
-            .context("waiting for 'smoo gadget initialized'")?;
+        let child = spawn_gadget_child("smoo-gadget", &slot, &configfs, &opts, log_dir).await?;
 
         configfs.bind_udc().context("bind UDC")?;
 
@@ -127,6 +93,22 @@ impl GadgetFixture {
             observed_ublk_dev_ids: Mutex::new(Vec::new()),
             slot,
         })
+    }
+
+    pub async fn adopt_restart(&mut self, opts: GadgetOpts, log_dir: &Path) -> Result<ExitStatus> {
+        let successor = spawn_gadget_child(
+            "smoo-gadget-adopt",
+            &self.slot,
+            &self.configfs,
+            &opts,
+            log_dir,
+        )
+        .await
+        .context("spawn adopting smoo-gadget")?;
+        self.configfs.unbind_udc();
+        self.configfs.bind_udc().context("rebind UDC after adopt")?;
+        let old = std::mem::replace(&mut self.child, successor);
+        old.wait().await.context("wait for prior smoo-gadget")
     }
 
     /// Wait for the gadget to log a regex-matching line on either stream.
@@ -147,7 +129,8 @@ impl GadgetFixture {
     /// the gadget (one per export). Returns the dev_ids in the order they
     /// appeared. Each kernel-assigned id corresponds to `/dev/ublkb<id>`.
     pub async fn wait_for_ublk_dev_ids(&self, count: usize, timeout: Duration) -> Result<Vec<u32>> {
-        let id_re = Regex::new(r"start_dev completed.*dev_id=(\d+)").unwrap();
+        let id_re =
+            Regex::new(r"(?:start_dev completed|ublk target online).*dev_id=(\d+)").unwrap();
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let mut ids: Vec<u32> = Vec::with_capacity(count);
@@ -207,6 +190,48 @@ impl GadgetFixture {
         drop(slot);
         Ok(status)
     }
+}
+
+async fn spawn_gadget_child(
+    name: &str,
+    slot: &Slot,
+    configfs: &GadgetConfigFs,
+    opts: &GadgetOpts,
+    log_dir: &Path,
+) -> Result<ChildProcess> {
+    let bin = smoo_gadget_path()?;
+    let mut cmd = Command::new(&bin);
+    cmd.arg("--vendor-id")
+        .arg(format!("0x{:04x}", slot.vid))
+        .arg("--product-id")
+        .arg(format!("0x{:04x}", slot.pid))
+        .arg("--queue-count")
+        .arg(opts.queue_count.to_string())
+        .arg("--queue-depth")
+        .arg(opts.queue_depth.to_string())
+        .arg("--ffs-dir")
+        .arg(&configfs.ffs_mount_dir);
+    if let Some(max_io) = opts.max_io_bytes {
+        cmd.arg("--max-io").arg(max_io.to_string());
+    }
+    for arg in &opts.extra_args {
+        cmd.arg(arg);
+    }
+    apply_rust_log(&mut cmd, &opts.rust_log);
+
+    let child = ChildProcess::spawn(name, cmd, log_dir)
+        .await
+        .with_context(|| format!("spawn {name}"))?;
+
+    // Wait for descriptors/endpoints to be opened before the caller binds or
+    // relies on an existing UDC binding.
+    let re = Regex::new(r"smoo gadget initialized").unwrap();
+    child
+        .wait_for_either(&re, opts.readiness_timeout)
+        .await
+        .context("waiting for 'smoo gadget initialized'")?;
+
+    Ok(child)
 }
 
 #[derive(Debug, Clone)]
