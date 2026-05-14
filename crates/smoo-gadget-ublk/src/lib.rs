@@ -610,8 +610,7 @@ impl SmooUblk {
                 ublksrv_pid: unsafe { libc::getpid() } as i32,
                 ..Default::default()
             };
-            info.flags |=
-                (UBLK_F_USER_RECOVERY | UBLK_F_USER_RECOVERY_REISSUE | UBLK_F_QUIESCE) as u64;
+            info.flags |= UBLK_F_USER_RECOVERY | UBLK_F_USER_RECOVERY_REISSUE | UBLK_F_QUIESCE;
 
             // ublk_params is passed in ublksrv_ctrl_dev_info during UBLK_CMD_SET_PARAMS
             let mut params = ublk_params {
@@ -654,7 +653,7 @@ impl SmooUblk {
             cmd.addr = &raw mut params as _;
             submit_ctrl_command_blocking(&sender, UBLK_CMD_SET_PARAMS, cmd, "set params", None)?;
 
-            let ioctl_encode = (info.flags & (sys::UBLK_F_CMD_IOCTL_ENCODE as u64)) != 0;
+            let ioctl_encode = (info.flags & sys::UBLK_F_CMD_IOCTL_ENCODE) != 0;
             let max_io_bytes =
                 usize::try_from(info.max_io_buf_bytes).context("max_io_buf_bytes overflow")?;
             let cdev_path = format!("/dev/ublkc{dev_id}");
@@ -782,7 +781,7 @@ impl SmooUblk {
             .context("query ublk device params")?;
         let queue_count = info.nr_hw_queues;
         let queue_depth = info.queue_depth;
-        let ioctl_encode = (info.flags & (sys::UBLK_F_CMD_IOCTL_ENCODE as u64)) != 0;
+        let ioctl_encode = (info.flags & sys::UBLK_F_CMD_IOCTL_ENCODE) != 0;
         let block_size_shift = params.basic.logical_bs_shift;
         ensure!(block_size_shift >= 9, "invalid logical block size shift");
         let block_size = 1usize << block_size_shift;
@@ -1805,17 +1804,15 @@ fn queue_cmd_buf_size(depth: u32) -> usize {
 }
 
 fn io_desc_nr_sectors(desc: &ublksrv_io_desc) -> u32 {
-    // Linux exposes nr_sectors/nr_zones as an anonymous C union.
-    unsafe { desc.__bindgen_anon_1.nr_sectors }
+    desc.nr_sectors
 }
 
 fn io_cmd_with_addr(q_id: u16, tag: u16, result: i32, addr: u64) -> ublksrv_io_cmd {
-    // Linux exposes addr/zone_append_lba as an anonymous C union.
     ublksrv_io_cmd {
         q_id,
         tag,
         result,
-        __bindgen_anon_1: sys::ublksrv_io_cmd__bindgen_ty_1 { addr },
+        addr,
     }
 }
 
