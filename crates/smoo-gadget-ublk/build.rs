@@ -18,14 +18,12 @@ fn add_serialize(outdir: &std::path::Path) -> anyhow::Result<i32> {
         regex::Regex::new(r"#\s*\[\s*derive\s*\((?P<d>[^)]+)\)\s*\]\s*pub\s*(?P<s>struct|enum)")?
             .replace_all(&res, "#[derive($d, Serialize, Deserialize)] pub $s")
     )
-    .replace(
-        "#[derive(Copy, Clone, Serialize, Deserialize)] pub struct ublksrv_io_desc",
-        "#[derive(Copy, Clone)] pub struct ublksrv_io_desc",
-    )
-    .replace(
-        "#[derive(Copy, Clone, Serialize, Deserialize)] pub struct ublksrv_io_cmd",
-        "#[derive(Copy, Clone)] pub struct ublksrv_io_cmd",
-    );
+    .to_string();
+    let data = regex::Regex::new(
+        r"#\s*\[\s*derive\s*\(\s*Copy\s*,\s*Clone\s*,\s*Serialize\s*,\s*Deserialize\s*\)\s*\]\s*pub\s+struct\s+(?P<name>ublksrv_io_desc|ublksrv_io_cmd)",
+    )?
+    .replace_all(&data, "#[derive(Copy, Clone)] pub struct $name")
+    .to_string();
     let mut fd = File::create(outdir.join("ublk_cmd.rs"))?;
     fd.write_all(data.as_bytes())?;
 
