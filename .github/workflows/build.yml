@@ -56,7 +56,6 @@ jobs:
             build_args: "--bins"
             extra_packages: ""
             rustflags: ""
-            bindgen_extra_clang_args: ""
             upload_host: true
           - name: aarch64
             runner: ubuntu-24.04-arm
@@ -64,15 +63,13 @@ jobs:
             build_args: "--bins"
             extra_packages: ""
             rustflags: ""
-            bindgen_extra_clang_args: ""
             upload_host: true
           - name: armv7
             runner: ubuntu-24.04
             target: armv7-unknown-linux-musleabihf
             build_args: "-p smoo-gadget-cli"
-            extra_packages: "libc6-dev-armhf-cross"
+            extra_packages: ""
             rustflags: "--cfg=io_uring_skip_arch_check"
-            bindgen_extra_clang_args: "--sysroot=/usr/arm-linux-gnueabihf"
             upload_host: false
 
     steps:
@@ -106,7 +103,6 @@ jobs:
       - name: Build (static musl)
         env:
           RUSTFLAGS: "-D warnings ${{ matrix.rustflags }}"
-          BINDGEN_EXTRA_CLANG_ARGS: ${{ matrix.bindgen_extra_clang_args }}
         run: |
           cargo build \
             ${{ matrix.build_args }} \

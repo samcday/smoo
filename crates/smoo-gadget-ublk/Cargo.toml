@@ -9,21 +9,15 @@ description = { workspace = true }
 
 [features]
 default = []
-apkbuild = ["io-uring/bindgen"]
+apkbuild = []
 
 [dependencies]
 anyhow = { workspace = true }
 async-channel = "2.5.0"
 io-uring = "0.7.11"
 libc = { workspace = true }
-serde = { workspace = true, features = ["derive"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
-
-[build-dependencies]
-regex = "1.12.2"
-bindgen = "0.72.1"
-anyhow = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread"] }
