@@ -20,7 +20,7 @@ libc = "0.2.177"
 hyper = "0.14"
 metrics-exporter-prometheus = { version = "0.13", default-features = false }
 serde = "1.0.228"
-gadgetry-most-foul = "0.1.0"
+gadgetry-most-foul = "0.1.1"
 js-sys = "0.3.82"
 wasm-bindgen = "0.2.105"
 wasm-bindgen-futures = "0.4.55"
