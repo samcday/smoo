@@ -174,6 +174,11 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
+          name: smoo-gadget-armv7
+          path: release-artifacts/smoo-gadget-armv7
+
+      - uses: actions/download-artifact@v4
+        with:
           name: smoo-host-aarch64
           path: release-artifacts/smoo-host-aarch64
 
@@ -195,11 +200,13 @@ jobs:
           cp release-artifacts/smoo-gadget-x86_64/smoo-gadget release-assets/smoo-gadget-x86_64
           cp release-artifacts/smoo-host-x86_64/smoo-host release-assets/smoo-host-x86_64
           cp release-artifacts/smoo-gadget-aarch64/smoo-gadget release-assets/smoo-gadget-aarch64
+          cp release-artifacts/smoo-gadget-armv7/smoo-gadget release-assets/smoo-gadget-armv7
           cp release-artifacts/smoo-host-aarch64/smoo-host release-assets/smoo-host-aarch64
 
           tar -C release-artifacts/smoo-gadget-x86_64 -czf release-assets/smoo-gadget-cli-x86_64-unknown-linux-musl.tar.gz smoo-gadget
           tar -C release-artifacts/smoo-host-x86_64 -czf release-assets/smoo-host-cli-x86_64-unknown-linux-musl.tar.gz smoo-host
           tar -C release-artifacts/smoo-gadget-aarch64 -czf release-assets/smoo-gadget-cli-aarch64-unknown-linux-musl.tar.gz smoo-gadget
+          tar -C release-artifacts/smoo-gadget-armv7 -czf release-assets/smoo-gadget-cli-armv7-unknown-linux-musleabihf.tar.gz smoo-gadget
           tar -C release-artifacts/smoo-host-aarch64 -czf release-assets/smoo-host-cli-aarch64-unknown-linux-musl.tar.gz smoo-host
 
           cp release-artifacts/APKBUILD/APKBUILD release-assets/APKBUILD
@@ -212,10 +219,12 @@ jobs:
           test -f release-assets/smoo-gadget-x86_64
           test -f release-assets/smoo-host-x86_64
           test -f release-assets/smoo-gadget-aarch64
+          test -f release-assets/smoo-gadget-armv7
           test -f release-assets/smoo-host-aarch64
           test -f release-assets/smoo-gadget-cli-x86_64-unknown-linux-musl.tar.gz
           test -f release-assets/smoo-host-cli-x86_64-unknown-linux-musl.tar.gz
           test -f release-assets/smoo-gadget-cli-aarch64-unknown-linux-musl.tar.gz
+          test -f release-assets/smoo-gadget-cli-armv7-unknown-linux-musleabihf.tar.gz
           test -f release-assets/smoo-host-cli-aarch64-unknown-linux-musl.tar.gz
           test -f release-assets/APKBUILD
           compgen -G 'release-assets/*.apk' >/dev/null
@@ -230,10 +239,12 @@ jobs:
             release-assets/smoo-gadget-x86_64
             release-assets/smoo-host-x86_64
             release-assets/smoo-gadget-aarch64
+            release-assets/smoo-gadget-armv7
             release-assets/smoo-host-aarch64
             release-assets/smoo-gadget-cli-x86_64-unknown-linux-musl.tar.gz
             release-assets/smoo-host-cli-x86_64-unknown-linux-musl.tar.gz
             release-assets/smoo-gadget-cli-aarch64-unknown-linux-musl.tar.gz
+            release-assets/smoo-gadget-cli-armv7-unknown-linux-musleabihf.tar.gz
             release-assets/smoo-host-cli-aarch64-unknown-linux-musl.tar.gz
             release-assets/APKBUILD
             release-assets/*.apk

@@ -53,9 +53,18 @@ jobs:
           - name: x86_64
             runner: ubuntu-24.04
             target: x86_64-unknown-linux-musl
+            build_args: "--bins"
+            upload_host: true
           - name: aarch64
             runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
+            build_args: "--bins"
+            upload_host: true
+          - name: armv7
+            runner: ubuntu-24.04
+            target: armv7-unknown-linux-musleabihf
+            build_args: "-p smoo-gadget-cli --features smoo-gadget-cli/apkbuild"
+            upload_host: false
 
     steps:
       - uses: actions/checkout@v4
@@ -85,7 +94,8 @@ jobs:
       - name: Build (static musl)
         run: |
           cargo build \
-            --bins \
+            ${{ matrix.build_args }} \
+            --locked \
             --release \
             --target ${{ matrix.target }}
 
@@ -96,22 +106,34 @@ jobs:
           path: target/${{ matrix.target }}/release/smoo-gadget
 
       - name: Upload smoo-host artifact
+        if: matrix.upload_host
         uses: actions/upload-artifact@v4
         with:
           name: smoo-host-${{ matrix.name }}
           path: target/${{ matrix.target }}/release/smoo-host
 
-      - name: Prepare release binaries
+      - name: Prepare smoo-gadget release binary
         if: github.event_name == 'release'
         run: |
           cp target/${{ matrix.target }}/release/smoo-gadget smoo-gadget-${{ matrix.name }}
+
+      - name: Prepare smoo-host release binary
+        if: github.event_name == 'release' && matrix.upload_host
+        run: |
           cp target/${{ matrix.target }}/release/smoo-host smoo-host-${{ matrix.name }}
 
-      - name: Upload binaries to release
+      - name: Upload smoo-gadget binary to release
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
           name: ${{ github.event.release.name }}
           files: |
             smoo-gadget-${{ matrix.name }}
+
+      - name: Upload smoo-host binary to release
+        if: github.event_name == 'release' && matrix.upload_host
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.event.release.name }}
+          files: |
             smoo-host-${{ matrix.name }}
