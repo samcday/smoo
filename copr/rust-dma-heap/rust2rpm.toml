@@ -1,0 +1,4 @@
+[package]
+cargo-toml-patch-comments = [
+    "add SPDX license metadata; upstream crate only ships license-file",
+]

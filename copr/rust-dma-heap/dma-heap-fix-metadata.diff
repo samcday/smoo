@@ -1,0 +1,10 @@
+--- dma-heap-0.4.1/Cargo.toml
++++ dma-heap-0.4.1/Cargo.toml
+@@ -11,6 +11,7 @@
+ 
+ [package]
+ edition = "2021"
++license = "MIT"
+ name = "dma-heap"
+ version = "0.4.1"
+ authors = ["Maxime Ripard <maxime@cerno.tech>"]
