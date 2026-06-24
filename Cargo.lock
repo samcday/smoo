@@ -110,17 +110,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "async-lock"
-version = "3.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "290f7f2596bd5b78a9fec8088ccd89180d7f9f55b94b0576823bbbdc72ee8311"
-dependencies = [
- "event-listener",
- "event-listener-strategy",
- "pin-project-lite",
-]
-
-[[package]]
 name = "async-trait"
 version = "0.1.89"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -683,50 +672,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "gibblox-blockreader-messageport"
-version = "0.0.2-rc.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "13e243eaadbdd4ab4e4bde0bcf76f7677c6256baa2aa9f2a0002c2179cf9288d"
-dependencies = [
- "async-trait",
- "futures-channel",
- "gibblox-core",
- "js-sys",
- "tracing",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
-]
-
-[[package]]
-name = "gibblox-core"
-version = "0.0.2-rc.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca4aa5c25c9e041c77b76df03e9c7102f779973db81f6cd76e4d52f2f129ab3f"
-dependencies = [
- "async-lock",
- "async-trait",
- "futures-channel",
- "tracing",
-]
-
-[[package]]
 name = "glob"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
-
-[[package]]
-name = "gloo-timers"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbb143cf96099802033e0d4f4963b19fd2e0b728bcf076cd9cf7f6634f092994"
-dependencies = [
- "futures-channel",
- "futures-core",
- "js-sys",
- "wasm-bindgen",
-]
 
 [[package]]
 name = "h2"
@@ -2100,15 +2049,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "smoo-host-blocksource-gibblox"
-version = "0.0.2-rc.6"
-dependencies = [
- "async-trait",
- "gibblox-core",
- "smoo-host-core",
-]
-
-[[package]]
 name = "smoo-host-blocksource-http"
 version = "0.0.2-rc.6"
 dependencies = [
@@ -2202,26 +2142,6 @@ dependencies = [
  "smoo-host-core",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "smoo-host-web-worker"
-version = "0.0.2-rc.6"
-dependencies = [
- "futures-channel",
- "futures-util",
- "gibblox-blockreader-messageport",
- "gibblox-core",
- "gloo-timers",
- "js-sys",
- "smoo-host-blocksource-gibblox",
- "smoo-host-core",
- "smoo-host-session",
- "smoo-host-webusb",
- "tracing",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
 ]
 
 [[package]]

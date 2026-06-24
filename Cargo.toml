@@ -29,7 +29,6 @@ web-sys = "0.3.82"
 smoo-gadget-app = { path = "crates/smoo-gadget-app", version = "0.0.2-rc.6" }
 smoo-gadget-core = { path = "crates/smoo-gadget-core", version = "0.0.2-rc.6" }
 smoo-gadget-ublk = { path = "crates/smoo-gadget-ublk", version = "0.0.2-rc.6" }
-smoo-host-blocksource-gibblox = { path = "crates/smoo-host-blocksource-gibblox", version = "0.0.2-rc.6" }
 smoo-host-blocksource-http = { path = "crates/smoo-host-blocksource-http", version = "0.0.2-rc.6" }
 smoo-host-blocksources = { path = "crates/smoo-host-blocksources", version = "0.0.2-rc.6" }
 smoo-host-core = { path = "crates/smoo-host-core", version = "0.0.2-rc.6" }
