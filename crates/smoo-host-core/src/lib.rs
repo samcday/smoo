@@ -17,10 +17,12 @@ pub use block::{
     BlockSource, BlockSourceError, BlockSourceErrorKind, BlockSourceHandle, BlockSourceResult,
 };
 pub use export_id::{
-    ExportHasher32, ExportIdentity, derive_export_id, derive_export_id_from_source,
-    derive_export_id_with,
+    derive_export_id, derive_export_id_from_source, derive_export_id_with, ExportHasher32,
+    ExportIdentity,
 };
-pub use exports::{ExportConfigError, ExportConfigErrorKind, register_export};
+pub use exports::{
+    register_export, register_export_with_id, ExportConfigError, ExportConfigErrorKind,
+};
 pub use heartbeat::heartbeat_once;
 pub use host::{HostError, HostErrorKind, HostResult, SmooHost};
 #[cfg(feature = "metrics")]

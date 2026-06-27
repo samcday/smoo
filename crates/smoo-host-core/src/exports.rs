@@ -1,4 +1,4 @@
-use crate::{BlockSource, ExportIdentity, derive_export_id_from_source};
+use crate::{derive_export_id_from_source, BlockSource, ExportIdentity};
 use alloc::{collections::BTreeMap, format, string::String, vec::Vec};
 use core::fmt;
 use smoo_proto::ConfigExport;
@@ -72,6 +72,47 @@ where
     S: BlockSource + ExportIdentity + Clone,
 {
     let identity = identity.into();
+    validate_export_geometry(&source, &identity, block_size, size_bytes)?;
+    let block_count = size_bytes / block_size as u64;
+    let export_id = derive_export_id_from_source(&source, block_count);
+    insert_export_with_id(
+        sources, entries, source, identity, export_id, block_size, size_bytes,
+    )
+}
+
+/// Validate and register a backing source using a caller-specified `export_id`.
+///
+/// This is intended for higher-level boot planners that need semantic, stable
+/// export roles (for example `rootfs` and `modules`) instead of content-derived
+/// identities.
+pub fn register_export_with_id<S>(
+    sources: &mut BTreeMap<u32, S>,
+    entries: &mut Vec<ConfigExport>,
+    source: S,
+    identity: impl Into<String>,
+    export_id: u32,
+    block_size: u32,
+    size_bytes: u64,
+) -> Result<(), ExportConfigError>
+where
+    S: BlockSource + Clone,
+{
+    let identity = identity.into();
+    validate_export_geometry(&source, &identity, block_size, size_bytes)?;
+    insert_export_with_id(
+        sources, entries, source, identity, export_id, block_size, size_bytes,
+    )
+}
+
+fn validate_export_geometry<S>(
+    source: &S,
+    identity: &str,
+    block_size: u32,
+    size_bytes: u64,
+) -> Result<(), ExportConfigError>
+where
+    S: BlockSource + ?Sized,
+{
     let source_block_size = source.block_size();
     if source_block_size != block_size {
         return Err(ExportConfigError::with_message(
@@ -87,13 +128,26 @@ where
             format!("backing size for {identity} must align to block size"),
         ));
     }
-    let block_count = size_bytes / block_size as u64;
-    let export_id = derive_export_id_from_source(&source, block_count);
+    Ok(())
+}
+
+fn insert_export_with_id<S>(
+    sources: &mut BTreeMap<u32, S>,
+    entries: &mut Vec<ConfigExport>,
+    source: S,
+    identity: String,
+    export_id: u32,
+    block_size: u32,
+    size_bytes: u64,
+) -> Result<(), ExportConfigError>
+where
+    S: BlockSource + Clone,
+{
     if sources.contains_key(&export_id) {
         return Err(ExportConfigError::with_message(
             ExportConfigErrorKind::DuplicateExportId,
             format!(
-                "derived duplicate export_id {export_id} for backing {identity}; check for repeated inputs or adjust backing parameters to avoid collisions"
+                "duplicate export_id {export_id} for backing {identity}; check for repeated inputs or choose a different export id"
             ),
         ));
     }
