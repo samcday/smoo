@@ -38,12 +38,29 @@ struct PersistedState {
     exports: Vec<PersistedExportRecord>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportMapRecord {
+    pub export_id: u32,
+    pub block_size: u32,
+    pub size_bytes: u64,
+    pub assigned_dev_id: Option<u32>,
+    pub devnode: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportMap {
+    pub version: u32,
+    pub session_id: u64,
+    pub exports: Vec<ExportMapRecord>,
+}
+
 /// In-memory view of the persisted gadget state.
 ///
 /// When `path` is `None`, persistence is disabled and `persist()` becomes a no-op.
 #[derive(Clone, Debug)]
 pub struct StateStore {
     path: Option<PathBuf>,
+    export_map_path: Option<PathBuf>,
     session_id: u64,
     records: Vec<PersistedExportRecord>,
 }
@@ -59,6 +76,7 @@ impl StateStore {
     pub fn new() -> Self {
         Self {
             path: None,
+            export_map_path: None,
             session_id: generate_session_id(),
             records: Vec::new(),
         }
@@ -68,6 +86,7 @@ impl StateStore {
     pub fn new_with_path(path: PathBuf) -> Self {
         Self {
             path: Some(path),
+            export_map_path: None,
             session_id: generate_session_id(),
             records: Vec::new(),
         }
@@ -87,12 +106,14 @@ impl StateStore {
                 );
                 Ok(Self {
                     path: Some(path),
+                    export_map_path: None,
                     session_id: state.session_id,
                     records: state.exports,
                 })
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Self {
                 path: Some(path),
+                export_map_path: None,
                 session_id: generate_session_id(),
                 records: Vec::new(),
             }),
@@ -114,6 +135,34 @@ impl StateStore {
 
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
+    }
+
+    pub fn export_map_path(&self) -> Option<&Path> {
+        self.export_map_path.as_deref()
+    }
+
+    pub fn set_export_map_path(&mut self, path: impl Into<PathBuf>) {
+        self.export_map_path = Some(path.into());
+    }
+
+    pub fn export_map(&self) -> ExportMap {
+        ExportMap {
+            version: STATE_VERSION,
+            session_id: self.session_id,
+            exports: self
+                .records
+                .iter()
+                .map(|record| ExportMapRecord {
+                    export_id: record.export_id,
+                    block_size: record.spec.block_size,
+                    size_bytes: record.spec.size_bytes,
+                    assigned_dev_id: record.assigned_dev_id,
+                    devnode: record
+                        .assigned_dev_id
+                        .map(|dev_id| format!("/dev/ublkb{dev_id}")),
+                })
+                .collect(),
+        }
     }
 
     pub fn replace_all(&mut self, records: Vec<PersistedExportRecord>) {
@@ -154,65 +203,83 @@ impl StateStore {
         }
     }
 
-    /// Persist the current snapshot to disk. No-op when persistence is disabled.
+    /// Persist the current snapshot to disk. No-op when persistence and export map publishing are disabled.
     pub fn persist(&self) -> Result<()> {
-        let Some(path) = &self.path else {
-            return Ok(());
-        };
-
-        let state = PersistedState {
-            version: STATE_VERSION,
-            session_id: self.session_id,
-            exports: self.records.clone(),
-        };
-        let payload = serde_json::to_vec(&state).context("encode state snapshot")?;
-        let dir = path.parent().unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(dir).context("create state directory")?;
-        let dir_file = File::open(dir).context("open state directory for sync")?;
-
-        let tmp_path = path.with_extension("tmp");
-        {
-            let mut file = OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .open(&tmp_path)
-                .with_context(|| format!("open temporary state file {}", tmp_path.display()))?;
-            file.write_all(&payload)
-                .with_context(|| format!("write {}", tmp_path.display()))?;
-            file.sync_all()
-                .with_context(|| format!("flush {}", tmp_path.display()))?;
+        if let Some(path) = &self.path {
+            let state = PersistedState {
+                version: STATE_VERSION,
+                session_id: self.session_id,
+                exports: self.records.clone(),
+            };
+            write_json_atomic(path, &state, "state file")?;
         }
 
-        fs::rename(&tmp_path, path)
-            .with_context(|| format!("commit state file to {}", path.display()))?;
-        dir_file
-            .sync_all()
-            .context("sync state directory after rename")?;
+        if let Some(path) = &self.export_map_path {
+            write_json_atomic(path, &self.export_map(), "export map")?;
+        }
+
         Ok(())
     }
 
     /// Remove the state file from disk, if persistence is enabled.
     pub fn remove_file(&self) -> Result<()> {
-        let Some(path) = &self.path else {
-            return Ok(());
-        };
-
-        match fs::remove_file(path) {
-            Ok(()) => {}
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(err).with_context(|| format!("remove state file {}", path.display()));
-            }
+        if let Some(path) = &self.path {
+            remove_optional_file(path, "state file")?;
         }
-
-        if let Some(dir) = path.parent() {
-            if let Ok(dir_file) = File::open(dir) {
-                let _ = dir_file.sync_all();
-            }
+        if let Some(path) = &self.export_map_path {
+            remove_optional_file(path, "export map")?;
         }
         Ok(())
     }
+}
+
+fn write_json_atomic<T>(path: &Path, value: &T, description: &str) -> Result<()>
+where
+    T: Serialize,
+{
+    let payload = serde_json::to_vec(value).with_context(|| format!("encode {description}"))?;
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(dir).with_context(|| format!("create {description} directory"))?;
+    let dir_file =
+        File::open(dir).with_context(|| format!("open {description} directory for sync"))?;
+
+    let tmp_path = path.with_extension("tmp");
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp_path)
+            .with_context(|| format!("open temporary {description} {}", tmp_path.display()))?;
+        file.write_all(&payload)
+            .with_context(|| format!("write {}", tmp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("flush {}", tmp_path.display()))?;
+    }
+
+    fs::rename(&tmp_path, path)
+        .with_context(|| format!("commit {description} to {}", path.display()))?;
+    dir_file
+        .sync_all()
+        .with_context(|| format!("sync {description} directory after rename"))?;
+    Ok(())
+}
+
+fn remove_optional_file(path: &Path, description: &str) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(err).with_context(|| format!("remove {description} {}", path.display()));
+        }
+    }
+
+    if let Some(dir) = path.parent()
+        && let Ok(dir_file) = File::open(dir)
+    {
+        let _ = dir_file.sync_all();
+    }
+    Ok(())
 }
 
 fn generate_session_id() -> u64 {

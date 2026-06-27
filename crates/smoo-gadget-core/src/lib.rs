@@ -37,7 +37,9 @@ pub use smoo_gadget_ublk::{
     SmooUblk, SmooUblkDevice, UblkBuffer, UblkIoRequest, UblkOp, UblkQueueRuntime,
 };
 pub use smoo_proto::{ConfigExport, ConfigExportsV0};
-pub use state_store::{ExportFlags, ExportSpec, PersistedExportRecord, StateStore};
+pub use state_store::{
+    ExportFlags, ExportMap, ExportMapRecord, ExportSpec, PersistedExportRecord, StateStore,
+};
 
 const USB_DIR_IN: u8 = 0x80;
 const USB_TYPE_VENDOR: u8 = 0x40;

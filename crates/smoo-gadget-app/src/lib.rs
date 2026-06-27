@@ -94,6 +94,9 @@ pub struct Args {
     /// Path to the recovery state file. When unset, crash recovery is disabled.
     #[arg(long, value_name = "PATH")]
     pub state_file: Option<PathBuf>,
+    /// Path to publish the current export_id -> ublk device map.
+    #[arg(long, value_name = "PATH")]
+    pub export_map_file: Option<PathBuf>,
     /// Adopt existing ublk devices via user recovery.
     #[arg(long)]
     pub adopt: bool,
@@ -139,6 +142,7 @@ impl Default for Args {
             experimental_dma_buf: false,
             dma_heap: DmaHeapSelection::System,
             state_file: None,
+            export_map_file: None,
             adopt: false,
             adopt_deadline: None,
             metrics_port: 0,
@@ -196,6 +200,11 @@ async fn run_impl(args: Args) -> Result<()> {
         debug!("state file disabled; crash recovery off");
         StateStore::new()
     };
+    if let Some(path) = args.export_map_file.as_ref() {
+        info!(path = ?path, "export map file configured");
+        state_store.set_export_map_path(path.clone());
+        state_store.persist().context("write initial export map")?;
+    }
 
     initialize_session(&mut ublk, &mut state_store).await?;
     if args.adopt {
