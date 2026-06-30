@@ -23,6 +23,7 @@ use std::os::fd::RawFd;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     convert::Infallible,
+    ffi::OsStr,
     io,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -60,6 +61,7 @@ const LIVENESS_INTERVAL_MS: u64 = 500;
 const MAINTENANCE_SLICE_MS: u64 = 200;
 const GRACEFUL_SHUTDOWN_TIMEOUT_MS: u64 = 5_000;
 const DATA_PLANE_FAULT_TIMEOUT_MS: u64 = 1_000;
+const CONFIGFS_GADGET_NAME: &str = "smoo";
 
 #[derive(Debug, Parser)]
 #[command(name = "smoo-gadget", version)]
@@ -1987,7 +1989,7 @@ fn setup_configfs(
         return Ok((custom, endpoints, None, ffs_dir.clone()));
     }
 
-    gadgetry_most_foul::remove_all().context("remove existing USB gadgets")?;
+    remove_existing_smoo_gadget().context("remove existing smoo USB gadget")?;
     let (mut custom, handle) = builder.build();
 
     let (subclass, protocol) = interface_identity(args);
@@ -1995,8 +1997,9 @@ fn setup_configfs(
     let id = Id::new(args.vendor_id, args.product_id);
     let strings = Strings::new("smoo", "smoo gadget", "0001");
     let udc = gadgetry_most_foul::default_udc().context("locate UDC")?;
-    let gadget =
-        Gadget::new(klass, id, strings).with_config(Config::new("config").with_function(handle));
+    let mut gadget = Gadget::new(klass, id, strings);
+    gadget.name = Some(CONFIGFS_GADGET_NAME.to_string());
+    let gadget = gadget.with_config(Config::new("config").with_function(handle));
     let reg = gadget.register().context("register gadget")?;
 
     let ffs_dir = custom.ffs_dir().context("resolve FunctionFS dir")?;
@@ -2008,6 +2011,19 @@ fn setup_configfs(
         Some(GadgetGuard { _registration: reg }),
         ffs_dir,
     ))
+}
+
+fn remove_existing_smoo_gadget() -> Result<()> {
+    for gadget in gadgetry_most_foul::registered().context("list USB gadgets")? {
+        if gadget.name() == OsStr::new(CONFIGFS_GADGET_NAME) {
+            info!(
+                name = CONFIGFS_GADGET_NAME,
+                "removing existing smoo USB gadget"
+            );
+            gadget.remove().context("remove existing smoo USB gadget")?;
+        }
+    }
+    Ok(())
 }
 
 fn configfs_builder(args: &Args) -> (CustomBuilder, FunctionfsEndpoints) {
