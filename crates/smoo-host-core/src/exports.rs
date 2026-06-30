@@ -105,3 +105,47 @@ where
     });
     Ok(())
 }
+
+/// Validate and register a backing source with a caller-provided `export_id`.
+pub fn register_export_with_id<S>(
+    sources: &mut BTreeMap<u32, S>,
+    entries: &mut Vec<ConfigExport>,
+    source: S,
+    identity: impl Into<String>,
+    export_id: u32,
+    block_size: u32,
+    size_bytes: u64,
+) -> Result<(), ExportConfigError>
+where
+    S: BlockSource + ExportIdentity + Clone,
+{
+    let identity = identity.into();
+    let source_block_size = source.block_size();
+    if source_block_size != block_size {
+        return Err(ExportConfigError::with_message(
+            ExportConfigErrorKind::BlockSizeMismatch,
+            format!(
+                "backing {identity} block size {source_block_size} disagrees with configuration {block_size}"
+            ),
+        ));
+    }
+    if !size_bytes.is_multiple_of(block_size as u64) {
+        return Err(ExportConfigError::with_message(
+            ExportConfigErrorKind::MisalignedSize,
+            format!("backing size for {identity} must align to block size"),
+        ));
+    }
+    if sources.contains_key(&export_id) {
+        return Err(ExportConfigError::with_message(
+            ExportConfigErrorKind::DuplicateExportId,
+            format!("duplicate export_id {export_id} for backing {identity}"),
+        ));
+    }
+    sources.insert(export_id, source);
+    entries.push(ConfigExport {
+        export_id,
+        block_size,
+        size_bytes,
+    });
+    Ok(())
+}
