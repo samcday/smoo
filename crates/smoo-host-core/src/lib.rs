@@ -20,7 +20,9 @@ pub use export_id::{
     ExportHasher32, ExportIdentity, derive_export_id, derive_export_id_from_source,
     derive_export_id_with,
 };
-pub use exports::{ExportConfigError, ExportConfigErrorKind, register_export};
+pub use exports::{
+    ExportConfigError, ExportConfigErrorKind, register_export, register_export_with_id,
+};
 pub use heartbeat::heartbeat_once;
 pub use host::{HostError, HostErrorKind, HostResult, SmooHost};
 #[cfg(feature = "metrics")]
