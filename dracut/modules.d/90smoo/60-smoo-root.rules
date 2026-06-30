@@ -1,0 +1,1 @@
+SUBSYSTEM=="block", KERNEL=="ublkb*", ENV{DEVTYPE}=="disk", SYMLINK+="smoo-root"

@@ -1,0 +1,19 @@
+[Unit]
+Description=smoo initrd root storage gadget
+Documentation=https://github.com/samcday/smoo
+DefaultDependencies=no
+ConditionPathExists=/etc/initrd-release
+ConditionKernelCommandLine=rd.smoo
+Before=initrd-root-device.target
+IgnoreOnIsolate=yes
+RefuseManualStop=yes
+SurviveFinalKillSignal=yes
+
+[Service]
+Type=simple
+ExecStart=/usr/libexec/smoo/smoo-gadget-initrd-start
+Restart=on-failure
+RestartSec=1s
+StandardInput=null
+StandardOutput=journal+console
+StandardError=journal+console
