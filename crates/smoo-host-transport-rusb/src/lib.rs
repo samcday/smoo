@@ -179,13 +179,14 @@ impl RusbTransport {
     pub async fn open_matching(
         vendor_id: Option<u16>,
         product_id: Option<u16>,
+        serial: Option<String>,
         class: u8,
         subclass: u8,
         protocol: u8,
         transfer_timeout: Duration,
     ) -> TransportResult<(Self, RusbControl)> {
         let discovery = task::spawn_blocking(move || {
-            find_matching_device(vendor_id, product_id, class, subclass, protocol)
+            find_matching_device(vendor_id, product_id, serial, class, subclass, protocol)
         })
         .await
         .map_err(|err| join_error("device discovery", err))??;
@@ -851,6 +852,7 @@ struct EndpointAddresses {
 fn find_matching_device(
     vendor_id: Option<u16>,
     product_id: Option<u16>,
+    serial: Option<String>,
     class: u8,
     subclass: u8,
     protocol: u8,
@@ -879,6 +881,16 @@ fn find_matching_device(
             let handle = device
                 .open()
                 .map_err(|err| map_rusb_error("open device", err))?;
+            if let Some(expected) = &serial {
+                let actual = desc
+                    .serial_number_string_index()
+                    .filter(|index| *index != 0)
+                    .and_then(|index| handle.read_string_descriptor_ascii(index).ok());
+                if !serial_filter_matches(Some(expected.as_str()), actual.as_deref()) {
+                    debug!(expected = %expected, "skipping smoo gadget with different serial");
+                    continue;
+                }
+            }
             return Ok(DiscoveredDevice {
                 handle,
                 interface: endpoints.interface,
@@ -891,6 +903,10 @@ fn find_matching_device(
     }
 
     Err(TransportError::new(TransportErrorKind::NotReady))
+}
+
+fn serial_filter_matches(expected: Option<&str>, actual: Option<&str>) -> bool {
+    expected.is_none_or(|expected| actual == Some(expected))
 }
 
 fn select_endpoints(
@@ -996,4 +1012,22 @@ fn worker_spawn_error(op: &str, err: std::io::Error) -> TransportError {
         TransportErrorKind::Other,
         format!("{op} worker spawn failed: {err}"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::serial_filter_matches;
+
+    #[test]
+    fn unset_serial_filter_accepts_any_identity() {
+        assert!(serial_filter_matches(None, None));
+        assert!(serial_filter_matches(None, Some("pf-TEST")));
+    }
+
+    #[test]
+    fn set_serial_filter_requires_the_exact_descriptor() {
+        assert!(serial_filter_matches(Some("pf-TEST"), Some("pf-TEST")));
+        assert!(!serial_filter_matches(Some("pf-TEST"), Some("pf-OTHER")));
+        assert!(!serial_filter_matches(Some("pf-TEST"), None));
+    }
 }

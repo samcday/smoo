@@ -196,6 +196,7 @@ async fn run_session(
         match RusbTransport::open_matching(
             args.vendor_id,
             args.product_id,
+            None,
             SMOO_INTERFACE_CLASS,
             SMOO_INTERFACE_SUBCLASS,
             SMOO_INTERFACE_PROTOCOL,
