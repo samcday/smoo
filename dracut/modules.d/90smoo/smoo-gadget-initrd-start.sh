@@ -1,6 +1,7 @@
 #!/bin/sh
 
 command -v getarg > /dev/null || . /lib/dracut-lib.sh
+. /usr/libexec/smoo/smoo-lib
 
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
@@ -32,39 +33,6 @@ while :; do
     udc_waited=$((udc_waited + 1))
 done
 
-state_file=$(getarg rd.smoo.state_file=)
-state_file=${state_file:-/run/smoo/state.json}
-set -- --state-file "$state_file"
-
-vendor_id=$(getarg rd.smoo.vendor=)
-[ -n "$vendor_id" ] || vendor_id=$(getarg rd.smoo.vendor_id=)
-[ -n "$vendor_id" ] && set -- "$@" --vendor-id "$vendor_id"
-
-product_id=$(getarg rd.smoo.product=)
-[ -n "$product_id" ] || product_id=$(getarg rd.smoo.product_id=)
-[ -n "$product_id" ] && set -- "$@" --product-id "$product_id"
-
-queue_count=$(getarg rd.smoo.queue_count=)
-[ -n "$queue_count" ] && set -- "$@" --queue-count "$queue_count"
-
-queue_depth=$(getarg rd.smoo.queue_depth=)
-[ -n "$queue_depth" ] || queue_depth=$(getarg rd.smoo.queue_size=)
-[ -n "$queue_depth" ] && set -- "$@" --queue-depth "$queue_depth"
-
-max_io=$(getarg rd.smoo.max_io_bytes=)
-[ -n "$max_io" ] || max_io=$(getarg rd.smoo.max_io=)
-[ -n "$max_io" ] && set -- "$@" --max-io "$max_io"
-
-metrics_port=$(getarg rd.smoo.metrics_port=)
-[ -n "$metrics_port" ] && set -- "$@" --metrics-port "$metrics_port"
-
-getargbool 0 rd.smoo.experimental_dma_buf && set -- "$@" --experimental-dma-buf
-
-dma_heap=$(getarg rd.smoo.dma_heap=)
-[ -n "$dma_heap" ] && set -- "$@" --dma-heap "$dma_heap"
-
-getargbool 0 rd.smoo.mimic_fastboot && set -- "$@" --mimic-fastboot
-
 log_level=$(getarg rd.smoo.log=)
 if [ -n "$log_level" ]; then
     RUST_LOG=$log_level
@@ -73,6 +41,17 @@ fi
 
 ln -sf /usr/bin/smoo-gadget /run/@smoo-gadget
 printf '%s\n' "$$" > /run/smoo/smoo-gadget.pid
+
+# Arguments come from smoo_gadget_args so tests can assert on them without a
+# device. They go through a file rather than a pipe: a pipe would put the
+# "set --" loop in a subshell, where the arguments would be lost. The file
+# also shows exactly what the gadget was started with when a run is debugged.
+smoo_gadget_args > /run/smoo/gadget-args
+set --
+while IFS= read -r arg; do
+    [ -n "$arg" ] || continue
+    set -- "$@" "$arg"
+done < /run/smoo/gadget-args
 
 info "smoo: starting initrd root storage daemon"
 PATH=/run:$PATH
