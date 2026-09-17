@@ -36,6 +36,16 @@ Requires:       %{name}%{?_isa}
 %description host
 Host-side CLI that speaks the smoo USB protocol over rusb.
 
+%package dracut
+Summary:        dracut module for smoo gadget root storage
+BuildArch:      noarch
+Requires:       dracut
+Requires:       %{name}-gadget = %{version}-%{release}
+
+%description dracut
+dracut module that starts smoo-gadget in the initrd so a USB host can
+serve the root filesystem as a ublk block device.
+
 %prep
 %autosetup -n %{name}-%{version} -p1
 %if %{with vendor}
@@ -58,6 +68,20 @@ install -Dpm0755 target/rpm/smoo-gadget \
     %{buildroot}%{_bindir}/smoo-gadget
 install -Dpm0755 target/rpm/smoo-host \
     %{buildroot}%{_bindir}/smoo-host
+install -Dpm0755 dracut/modules.d/90smoo/module-setup.sh \
+    %{buildroot}%{_prefix}/lib/dracut/modules.d/90smoo/module-setup.sh
+install -Dpm0755 dracut/modules.d/90smoo/parse-smoo.sh \
+    %{buildroot}%{_prefix}/lib/dracut/modules.d/90smoo/parse-smoo.sh
+install -Dpm0755 dracut/modules.d/90smoo/smoo-gadget-initrd-start.sh \
+    %{buildroot}%{_prefix}/lib/dracut/modules.d/90smoo/smoo-gadget-initrd-start.sh
+install -Dpm0755 dracut/modules.d/90smoo/smoo-gadget-initrd-stop.sh \
+    %{buildroot}%{_prefix}/lib/dracut/modules.d/90smoo/smoo-gadget-initrd-stop.sh
+install -Dpm0644 dracut/modules.d/90smoo/60-smoo-root.rules \
+    %{buildroot}%{_prefix}/lib/dracut/modules.d/90smoo/60-smoo-root.rules
+install -Dpm0644 dracut/modules.d/90smoo/smoo-root-storage.service \
+    %{buildroot}%{_prefix}/lib/dracut/modules.d/90smoo/smoo-root-storage.service
+install -Dpm0644 dracut/modules.d/90smoo/smoo-root-storage.service \
+    %{buildroot}%{_prefix}/lib/systemd/system/smoo-root-storage.service
 
 %if %{with check}
 %check
@@ -76,6 +100,12 @@ install -Dpm0755 target/rpm/smoo-host \
 
 %files host
 %{_bindir}/smoo-host
+
+%files dracut
+%doc docs/DRACUT.md
+%{_prefix}/lib/systemd/system/smoo-root-storage.service
+%dir %{_prefix}/lib/dracut/modules.d/90smoo
+%{_prefix}/lib/dracut/modules.d/90smoo/*
 
 %changelog
 %autochangelog
