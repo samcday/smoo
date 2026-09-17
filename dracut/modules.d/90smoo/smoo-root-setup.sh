@@ -11,6 +11,7 @@ export PATH
 getargbool 0 rd.smoo || exit 0
 
 requested=$(getarg rd.smoo.root=) || requested=
+reason=
 case "$requested" in
     0x* | 0X*) requested=$(printf '%d' "$requested" 2> /dev/null) || requested= ;;
 esac
@@ -23,20 +24,23 @@ devnode=
 while :; do
     if [ -r "$SMOO_EXPORT_MAP" ]; then
         records=$(smoo_export_records < "$SMOO_EXPORT_MAP")
-        SMOO_SELECT_ERROR=
-        devnode=$(smoo_select_export "$requested" "$records")
-        case $? in
+        selected=$(smoo_select_export "$requested" "$records")
+        status=$?
+        case "$status" in
             0)
+                devnode=$selected
                 [ -b "$devnode" ] && break
                 devnode=
+                reason="${selected} is not a block device yet"
                 ;;
-            2)
-                die "smoo: ${SMOO_SELECT_ERROR}"
-                ;;
+            2) die "smoo: ${selected#error: }" ;;
+            *) reason=${selected#error: } ;;
         esac
+    else
+        reason="$SMOO_EXPORT_MAP has not appeared"
     fi
     if [ "$waited" -ge "$timeout" ]; then
-        die "smoo: no usable export after ${timeout}s: ${SMOO_SELECT_ERROR:-export map never appeared}"
+        die "smoo: no usable export after ${timeout}s: ${reason:-unknown}"
     fi
     sleep 1
     waited=$((waited + 1))

@@ -169,6 +169,20 @@ assert_status 1 $? "a requested export that is absent means keep waiting for it"
 smoo_select_export "" "" > /dev/null 2>&1
 assert_status 1 $? "an empty map means keep waiting"
 
+# The reason a boot failed has to survive the caller's command substitution,
+# which is a subshell, so it travels on stdout rather than in a variable.
+out=$(smoo_select_export "" "$three_records" 2>/dev/null) || true
+case "$out" in
+    "error: rd.smoo.root= is required: 2 exports are ready:"*) ok ;;
+    *) fail "ambiguous selection did not explain itself: $out" ;;
+esac
+
+out=$(smoo_select_export 99 "$three_records" 2>/dev/null) || true
+case "$out" in
+    "error: requested export 99 is not in the map;"*) ok ;;
+    *) fail "absent export did not explain itself: $out" ;;
+esac
+
 # --- smoo_parse_size --------------------------------------------------------
 
 assert_eq "1073741824" "$(smoo_parse_size 1G)" "1G in bytes"
