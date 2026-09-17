@@ -73,9 +73,14 @@ smoo_export_records() {
 # $1: requested export id, empty for "there should be exactly one".
 # $2: records as produced by smoo_export_records.
 #
-# Prints the devnode and returns 0; returns 1 when nothing is ready yet (the
-# caller should keep waiting) and 2 when the request can never be satisfied
-# (ambiguous, or an id that is not in the map at all).
+# Prints the devnode and returns 0. On failure it prints "error: <reason>"
+# instead and returns 1 when nothing is ready yet (the caller should keep
+# waiting) or 2 when the request can never be satisfied (ambiguous).
+#
+# The reason goes to stdout rather than a variable because the caller reads this
+# through a command substitution, which is a subshell: a variable set here would
+# never reach it, and the explanation for a failed boot is exactly what must not
+# get lost.
 smoo_select_export() {
     _requested=$1
     _records=$2
@@ -114,7 +119,8 @@ smoo_select_export() {
         # map is rewritten as exports appear, so only the caller's timeout can
         # decide that. Report "keep waiting" either way and let it give up.
         [ "$_requested_present" = 1 ] && return 1
-        SMOO_SELECT_ERROR="requested export $_requested is not in the map; saw:${_seen:- none}"
+        printf 'error: requested export %s is not in the map; saw:%s\n' \
+            "$_requested" "${_seen:- none}"
         return 1
     fi
 
@@ -123,10 +129,11 @@ smoo_select_export() {
         return 0
     fi
     if [ "$_ready_count" -eq 0 ]; then
-        SMOO_SELECT_ERROR="no export is ready yet; saw:${_seen:- none}"
+        printf 'error: no export is ready yet; saw:%s\n' "${_seen:- none}"
         return 1
     fi
-    SMOO_SELECT_ERROR="rd.smoo.root= is required: $_ready_count exports are ready:${_seen}"
+    printf 'error: rd.smoo.root= is required: %s exports are ready:%s\n' \
+        "$_ready_count" "$_seen"
     return 2
 }
 
