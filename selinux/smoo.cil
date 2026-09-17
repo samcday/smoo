@@ -1,0 +1,19 @@
+; SELinux policy for the smoo gadget datapath.
+;
+; The ublk server runs its I/O through io_uring against a character device the
+; kernel owns, and the initrd relabels the block device and console it sets up
+; before the real policy is loaded. Enforcing without these leaves the gadget
+; unable to serve a root filesystem.
+;
+; Carried here rather than in the consuming image so every distribution that
+; ships the dracut module gets the same policy.
+
+; ublk's io_uring commands against /dev/ublkc*.
+(allow kernel_t device_t (io_uring (cmd)))
+
+; The initrd sets a file creation context while preparing the served root.
+(allow kernel_t self (process (setfscreate)))
+
+; Relabel the served block device and the console the initrd opens.
+(allow kernel_t removable_device_t (blk_file (relabelto)))
+(allow kernel_t tty_device_t (chr_file (relabelto)))
