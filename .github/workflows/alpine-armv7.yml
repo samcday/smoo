@@ -29,7 +29,15 @@ jobs:
       - name: configure abuild key + deps
         run: |
           abuild-keygen -a -n
-          cp ~/.abuild/*.pub /etc/apk/keys/
+          # abuild-keygen honours XDG and now writes to ~/.config/abuild; older
+          # versions used ~/.abuild. Copy from wherever the key actually landed,
+          # and fail loudly rather than building unsigned if neither exists.
+          keys=$(ls ~/.config/abuild/*.pub ~/.abuild/*.pub 2>/dev/null) || true
+          if [ -z "$keys" ]; then
+              echo "abuild-keygen produced no public key" >&2
+              exit 1
+          fi
+          cp $keys /etc/apk/keys/
           abuild -F deps
         shell: alpine.sh --root {0}
 
