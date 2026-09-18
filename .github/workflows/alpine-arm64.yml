@@ -42,8 +42,6 @@ jobs:
               exit 1
           fi
           cp $keys /etc/apk/keys/
-          ls -la ~/.config/abuild ~/.abuild 2>/dev/null || true
-          cat ~/.config/abuild/abuild.conf ~/.abuild/abuild.conf 2>/dev/null || true
           abuild -F deps
         shell: alpine.sh --root {0}
 
