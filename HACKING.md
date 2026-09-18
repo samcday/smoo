@@ -283,8 +283,12 @@ Failure to service ep0 promptly leads to EP0 STALL + possible gadget reset.
   `vm-image build` starts from the pinned Fedora cloud base image, applies
   `tools/vm-image/guest-setup.sh`, validates the required kernel modules and
   userspace tools, then writes the baked image and SHA256 metadata under
-  `target/vm-images/`. The GHCR tag is the SHA256 of the base image identity
-  (URL + expected checksum) and the guest setup script contents, so the default
+  `target/vm-images/`. The setup script pins the guest kernel (the Fedora 43 GA
+  kernel's `dummy_hcd` has a use-after-free on its interrupt-IN FIFO fast path
+  that smoo's 28-byte Requests trigger under pipelined load, panicking the
+  guest); bump the pin deliberately, since it is part of the image identity.
+  The GHCR tag is the SHA256 of the base image identity (URL + expected
+  checksum) and the guest setup script contents, so the default
   `vm-image download` target is deterministic and can be inspected with
   `cargo xtask vm-image ref`. Override the full ref with `SMOO_VM_IMAGE_REF` or
   the repository prefix with `SMOO_VM_IMAGE_REPOSITORY` if needed.
@@ -297,8 +301,9 @@ Failure to service ep0 promptly leads to EP0 STALL + possible gadget reset.
 
   CI runs the same VM flow (`.github/workflows/integration-tests.yml`) on
   GitHub-hosted `ubuntu-24.04` runners: it downloads the baked qcow2 with
-  `cargo xtask vm-image download`, then runs `cargo xtask vm-integration` to
-  execute the harness inside the guest.
+  `cargo xtask vm-image download` (falling back to `vm-image build` when the
+  ref for the PR's inputs is not published yet), then runs
+  `cargo xtask vm-integration` to execute the harness inside the guest.
   `.github/workflows/vm-image.yml` rebuilds and pushes the GHCR image when the
   VM image setup changes. During the VM substrate spike it publishes from both
   `main` and the `test-infra` WIP branch.
