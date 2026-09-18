@@ -299,6 +299,13 @@ Failure to service ep0 promptly leads to EP0 STALL + possible gadget reset.
   bundle is the source of truth — open `capture.pcapng` with the
   dissector at `tools/wireshark/smoo.lua` to triage wire-level issues.
 
+  `vm-integration` tails the guest serial console while the harness runs. A
+  kernel crash marker (`Kernel panic`, `BUG: unable to handle`, `Oops:`) aborts
+  the SSH session immediately, prints the oops excerpt, and records it as
+  `guest_kernel_crash` in the run's `vm-run.json`, instead of waiting for the
+  SSH keepalive to notice the dead guest. `SMOO_VM_KEEP=1` retains the run dir
+  on success; failures always keep it.
+
   CI runs the same VM flow (`.github/workflows/integration-tests.yml`) on
   GitHub-hosted `ubuntu-24.04` runners: it downloads the baked qcow2 with
   `cargo xtask vm-image download` (falling back to `vm-image build` when the
