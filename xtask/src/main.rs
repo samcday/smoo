@@ -106,7 +106,12 @@ fn check_test_infra(_extra: &[String]) -> Result<()> {
 
     println!();
     println!("Userspace tools:");
-    let tools = [("tshark", "tshark"), ("dumpcap", "dumpcap"), ("fio", "fio")];
+    let tools = [
+        ("tshark", "tshark"),
+        ("dumpcap", "dumpcap"),
+        ("editcap", "editcap"),
+        ("fio", "fio"),
+    ];
     for (label, bin) in tools {
         report(&format!("{label} on PATH"), which(bin).is_some(), &mut fail);
     }

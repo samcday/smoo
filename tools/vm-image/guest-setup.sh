@@ -51,7 +51,7 @@ if ! test -d /sys/kernel/debug/usb/usbmon && ! test -e /dev/usbmon0; then
     exit 1
 fi
 
-for tool in fio dumpcap tshark; do
+for tool in fio dumpcap tshark editcap; do
     command -v "$tool"
 done
 fio --enghelp=libaio >/dev/null

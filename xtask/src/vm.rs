@@ -1596,7 +1596,7 @@ fi
 
 missing_packages=()
 command -v fio >/dev/null || missing_packages+=(fio)
-if ! command -v dumpcap >/dev/null || ! command -v tshark >/dev/null; then
+if ! command -v dumpcap >/dev/null || ! command -v tshark >/dev/null || ! command -v editcap >/dev/null; then
     missing_packages+=(wireshark-cli)
 fi
 if ! fio --enghelp=libaio >/dev/null 2>&1; then
@@ -1608,7 +1608,7 @@ if test "${#missing_packages[@]}" -gt 0; then
     exit 1
 fi
 
-for tool in fio dumpcap tshark; do
+for tool in fio dumpcap tshark editcap; do
     command -v "$tool"
 done
 
