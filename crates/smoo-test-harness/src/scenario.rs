@@ -55,7 +55,8 @@ pub struct ScenarioBuilder {
     artifact_root: PathBuf,
 }
 
-/// Default snaplen passed to `dumpcap -s` when `capture_full_payload` is off.
+/// Default snaplen applied to the capture when `capture_full_payload` is off
+/// (post-capture, via `editcap`; see [`crate::capture`] for why).
 /// Big enough to cover the usbmon URB header (~64 B) plus a 28-byte smoo
 /// Request/Response with comfortable slack; small enough to keep typical pcaps
 /// in single-digit megabytes and to keep the lua dissector running near
