@@ -21,8 +21,13 @@ case "$requested" in
         ;;
 esac
 
+# The host only attaches the USB gadget after fastboot boot, gadget
+# enumeration and a host-side scan; on the DB410c that took ~31 s and the old
+# 30 s default left no margin (43-liveboot-v2-db410c-trial/evidence/
+# 40-uart-liveboot-fixed.log failed with "no usable export after 30s" before
+# the export appeared). 120 s keeps the service alive while the host attaches.
 timeout=$(getarg rd.smoo.root_timeout=) || timeout=
-timeout=$(smoo_parse_seconds "$timeout" 30) \
+timeout=$(smoo_parse_seconds "$timeout" 120) \
     || die "smoo: rd.smoo.root_timeout=$timeout is not a number of seconds"
 
 waited=0
