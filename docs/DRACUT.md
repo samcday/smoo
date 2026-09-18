@@ -55,6 +55,22 @@ A typical liveboot command line:
 rd.smoo=1 rd.smoo.root=2863311530 rd.smoo.cow.size=2G console=ttyMSM0,115200n8 earlycon
 ```
 
+## When root setup fails
+
+`smoo-root-setup.service` calls dracut's `die`, so a failure to find or
+publish the export follows dracut's normal failure path: the unit fails and
+the initrd enters emergency mode. The generic `rd.shell` and `rd.emergency`
+arguments decide what that looks like (`rd.emergency=reboot` asks dracut to
+reboot instead of showing a shell).
+
+On the DB410c trial `rd.emergency=reboot` did not reboot; the boot fell
+through to `sulogin`, which refused because the initrd's root account is
+locked ("Cannot open access to console, the root account is locked",
+43-liveboot-v2-db410c-trial/evidence/42-enter.log). If a usable emergency
+console is wanted, give the initrd's root a password when building it (the
+lane-45 build does this for the UART) or set `rd.shell=0` to suppress the
+shell; the served root is not affected either way.
+
 ## SELinux
 
 `selinux/smoo.cil` carries the allows the datapath needs: io_uring commands
