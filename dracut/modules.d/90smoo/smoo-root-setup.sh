@@ -13,11 +13,17 @@ getargbool 0 rd.smoo || exit 0
 requested=$(getarg rd.smoo.root=) || requested=
 reason=
 case "$requested" in
-    0x* | 0X*) requested=$(printf '%d' "$requested" 2> /dev/null) || requested= ;;
+    0x* | 0X*)
+        # An unparseable explicit request must not silently fall back to
+        # "whichever export is ready".
+        requested=$(printf '%d' "$requested" 2> /dev/null) \
+            || die "smoo: rd.smoo.root=$requested is not a hexadecimal export id"
+        ;;
 esac
 
 timeout=$(getarg rd.smoo.root_timeout=) || timeout=
-timeout=${timeout:-30}
+timeout=$(smoo_parse_seconds "$timeout" 30) \
+    || die "smoo: rd.smoo.root_timeout=$timeout is not a number of seconds"
 
 waited=0
 devnode=

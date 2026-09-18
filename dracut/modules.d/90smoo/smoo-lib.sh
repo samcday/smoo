@@ -139,22 +139,52 @@ smoo_select_export() {
     return 2
 }
 
+# Whether $1 is an unsigned decimal the shell can do arithmetic on: digits
+# only, and small enough that a 64-bit signed comparison does not wrap. Values
+# outside that range would make every -ge test fail and turn a bounded wait
+# into an unbounded one.
+smoo_is_count() {
+    case "$1" in
+        '' | *[!0-9]*) return 1 ;;
+    esac
+    [ "${#1}" -le 18 ]
+}
+
 # Convert a byte count with an optional K/M/G suffix to plain bytes.
+#
+# The number is bounded per suffix so the multiplication cannot wrap a 64-bit
+# shell integer; the largest accepted value is a little under 2^63 bytes, which
+# also keeps the +1023 in smoo_cow_kib safe.
 smoo_parse_size() {
     _value=$1
     [ -n "$_value" ] || return 1
     _number=${_value%[KkMmGg]}
     _suffix=${_value#"$_number"}
-    case "$_number" in
-        '' | *[!0-9]*) return 1 ;;
+    smoo_is_count "$_number" || return 1
+    case "$_suffix" in
+        K | k) _max=9007199254740991 ;;
+        M | m) _max=8796093022207 ;;
+        G | g) _max=8589934591 ;;
+        '') _max=9223372036854775807 ;;
+        *) return 1 ;;
     esac
+    # Compare as strings first: a 19-digit number would itself wrap.
+    [ "${#_number}" -le "${#_max}" ] || return 1
+    [ "$_number" -le "$_max" ] || return 1
     case "$_suffix" in
         K | k) printf '%s\n' $((_number * 1024)) ;;
         M | m) printf '%s\n' $((_number * 1024 * 1024)) ;;
         G | g) printf '%s\n' $((_number * 1024 * 1024 * 1024)) ;;
         '') printf '%s\n' "$_number" ;;
-        *) return 1 ;;
     esac
+}
+
+# A timeout in seconds from the command line: $1 the value (may be empty),
+# $2 the default. Fails when the value is not a count the shell can compare.
+smoo_parse_seconds() {
+    _seconds=${1:-$2}
+    smoo_is_count "$_seconds" || return 1
+    printf '%s\n' "$_seconds"
 }
 
 # Size of a block device in 512-byte sectors, read from sysfs: blockdev(8) is
