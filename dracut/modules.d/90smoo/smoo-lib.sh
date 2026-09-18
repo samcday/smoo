@@ -10,6 +10,8 @@ SMOO_EXPORT_MAP=${SMOO_EXPORT_MAP:-/run/smoo/export-map.json}
 SMOO_STATE_FILE=${SMOO_STATE_FILE:-/run/smoo/state.json}
 SMOO_COW_IMAGE=${SMOO_COW_IMAGE:-/run/smoo/cow.img}
 SMOO_DM_NAME=${SMOO_DM_NAME:-smoo-root}
+SMOO_SYS_BLOCK=${SMOO_SYS_BLOCK:-/sys/class/block}
+SMOO_UDEV_RULE=${SMOO_UDEV_RULE:-/run/udev/rules.d/60-smoo-root.rules}
 
 # Build the smoo-gadget argument list from the kernel command line.
 #
@@ -153,6 +155,44 @@ smoo_parse_size() {
         '') printf '%s\n' "$_number" ;;
         *) return 1 ;;
     esac
+}
+
+# Size of a block device in 512-byte sectors, read from sysfs: blockdev(8) is
+# not in every initrd.
+smoo_device_sectors() {
+    _name=${1##*/}
+    read -r _sectors < "$SMOO_SYS_BLOCK/$_name/size" 2> /dev/null || return 1
+    case "$_sectors" in
+        '' | *[!0-9]*) return 1 ;;
+    esac
+    printf '%s\n' "$_sectors"
+}
+
+# The udev rule that names the served root.
+#
+# systemd only treats /dev/smoo-root as present once udev has reported a device
+# carrying that link, so a symlink made with ln would leave the root device job
+# waiting forever. The link has to come from a rule.
+smoo_root_udev_rule() {
+    printf 'SUBSYSTEM=="block", KERNEL=="%s", SYMLINK+="smoo-root"\n' "${1##*/}"
+}
+
+# Kernel name (dm-N) of the device-mapper device called $1, if it exists.
+smoo_dm_kname() {
+    for _dm in "$SMOO_SYS_BLOCK"/dm-*; do
+        [ -e "$_dm/dm/name" ] || continue
+        read -r _dmname < "$_dm/dm/name" || continue
+        if [ "$_dmname" = "$1" ]; then
+            printf '%s\n' "${_dm##*/}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# brd's rd_size is in KiB; round a byte count up to it.
+smoo_cow_kib() {
+    printf '%s\n' $((($1 + 1023) / 1024))
 }
 
 # The dm-snapshot table mapping the whole origin device through a COW device.
