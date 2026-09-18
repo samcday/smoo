@@ -191,6 +191,29 @@ assert_eq "2048" "$(smoo_parse_size 2K)" "2K in bytes"
 assert_eq "4096" "$(smoo_parse_size 4096)" "a plain byte count"
 assert_eq "1073741824" "$(smoo_parse_size 1g)" "a lowercase suffix"
 
+assert_eq "9223372035781033984" "$(smoo_parse_size 8589934591G)" "largest G that fits"
+smoo_parse_size 8589934592G > /dev/null 2>&1
+assert_status 1 $? "a G value that would wrap is rejected"
+assert_eq "9223372036854774784" "$(smoo_parse_size 9007199254740991K)" "largest K that fits"
+smoo_parse_size 9007199254740992K > /dev/null 2>&1
+assert_status 1 $? "a K value that would wrap is rejected"
+smoo_parse_size 8796093022208M > /dev/null 2>&1
+assert_status 1 $? "an M value that would wrap is rejected"
+smoo_parse_size 9223372036854775808 > /dev/null 2>&1
+assert_status 1 $? "a plain count beyond 63 bits is rejected"
+assert_eq "9007199254740991" "$(smoo_cow_kib 9223372036854774784)" "the largest COW converts without wrapping"
+
+# --- smoo_parse_seconds -----------------------------------------------------
+
+assert_eq "30" "$(smoo_parse_seconds "" 30)" "empty falls back to the default"
+assert_eq "5" "$(smoo_parse_seconds 5 30)" "a plain count is kept"
+smoo_parse_seconds banana 30 > /dev/null 2>&1
+assert_status 1 $? "a word is not a number of seconds"
+smoo_parse_seconds -1 30 > /dev/null 2>&1
+assert_status 1 $? "a negative timeout is rejected"
+smoo_parse_seconds 9999999999999999999 30 > /dev/null 2>&1
+assert_status 1 $? "a timeout beyond the shell's integers is rejected"
+
 smoo_parse_size "1T" > /dev/null 2>&1
 assert_status 1 $? "an unsupported suffix is rejected"
 smoo_parse_size "banana" > /dev/null 2>&1

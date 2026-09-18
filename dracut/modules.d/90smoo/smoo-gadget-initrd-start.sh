@@ -27,8 +27,9 @@ fi
 state_file=$(getarg rd.smoo.state_file=) || state_file=$SMOO_STATE_FILE
 rm -f "$state_file"
 
-udc_timeout=$(getarg rd.smoo.udc_timeout=)
-udc_timeout=${udc_timeout:-15}
+udc_timeout=$(getarg rd.smoo.udc_timeout=) || udc_timeout=
+udc_timeout=$(smoo_parse_seconds "$udc_timeout" 15) \
+    || die "smoo: rd.smoo.udc_timeout=$udc_timeout is not a number of seconds"
 udc_waited=0
 while :; do
     for udc in /sys/class/udc/*; do
