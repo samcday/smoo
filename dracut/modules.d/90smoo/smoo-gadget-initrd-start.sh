@@ -14,10 +14,18 @@ for mod in configfs libcomposite usb_f_fs ublk_drv; do
     modprobe -q "$mod" 2> /dev/null || :
 done
 
+# Checked via /proc/mounts rather than mountpoint(1), which the initrd need
+# not carry.
 mkdir -p /sys/kernel/config
-if ! mountpoint -q /sys/kernel/config; then
+if ! grep -qs ' /sys/kernel/config ' /proc/mounts; then
     mount -t configfs configfs /sys/kernel/config
 fi
+
+# A state file here belongs to an earlier instance that died: its ublk
+# devices went with it, so there is nothing to adopt and a fresh start is
+# the only useful restart. (The initrd has no other starter for the gadget.)
+state_file=$(getarg rd.smoo.state_file=) || state_file=$SMOO_STATE_FILE
+rm -f "$state_file"
 
 udc_timeout=$(getarg rd.smoo.udc_timeout=)
 udc_timeout=${udc_timeout:-15}
