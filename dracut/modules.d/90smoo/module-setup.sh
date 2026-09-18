@@ -31,6 +31,7 @@ install() {
     inst /usr/bin/smoo-gadget /usr/bin/smoo-gadget
 
     inst_hook cmdline 20 "$moddir/parse-smoo.sh"
+    inst_hook pre-pivot 50 "$moddir/smoo-pre-pivot.sh"
     inst_hook shutdown 90 "$moddir/smoo-gadget-initrd-stop.sh"
 
     inst_script "$moddir/smoo-lib.sh" "/usr/libexec/smoo/smoo-lib"

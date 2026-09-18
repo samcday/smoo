@@ -12,7 +12,10 @@ dracut --add smoo --force
 
 1. `smoo-root-storage.service` starts `smoo-gadget` from the initrd. It survives
    switch-root (`SurviveFinalKillSignal=yes`, an `@smoo-gadget` argv0) because it
-   is still serving the root filesystem long after the real root is mounted.
+   is still serving the root filesystem long after the real root is mounted. A
+   pre-pivot hook copies the unit files into the served root's
+   `/etc/systemd/system`: the systemd that takes over would otherwise stop a
+   running unit it cannot load, taking the root device down with it.
 2. The gadget writes `/run/smoo/export-map.json`, naming each export it serves
    and the `/dev/ublkb*` node it landed on.
 3. `smoo-root-setup.service` waits for that map, picks the export named by
