@@ -114,14 +114,26 @@ impl SerialWatcher {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
     }
-}
 
-impl Drop for SerialWatcher {
-    fn drop(&mut self) {
+    /// Stop tailing, wait for the thread to drain what QEMU wrote last, and
+    /// return the final crash state. Call this after QEMU has exited so a
+    /// crash during shutdown is not missed.
+    fn finish(mut self) -> Option<GuestKernelCrash> {
+        self.stop_and_join();
+        self.crash()
+    }
+
+    fn stop_and_join(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+impl Drop for SerialWatcher {
+    fn drop(&mut self) {
+        self.stop_and_join();
     }
 }
 
@@ -317,26 +329,26 @@ fn vm_image_build(extra: &[String]) -> Result<()> {
         failure = Some(format!("{err:#}"));
     }
 
-    // The watcher may record a crash after the SSH child's last successful
-    // poll; never finalize an image whose guest kernel crashed.
-    let guest_crash = serial.as_ref().and_then(SerialWatcher::crash);
-    if failure.is_none()
-        && let Some(crash) = &guest_crash
-    {
-        failure = Some(crash.describe("guest image setup"));
-    }
+    let guest_dead = serial.as_ref().and_then(SerialWatcher::crash).is_some();
     if failure.is_some()
-        && guest_crash.is_none()
+        && !guest_dead
         && let (Some(port), ssh_key) = (ssh_port, run_dir.join("id_ed25519"))
         && ssh_key.exists()
     {
         collect_guest_logs(port, &ssh_key, BAKE_SSH_USER, &run_dir);
     }
 
-    let shutdown_result =
-        shutdown_qemu(qmp.as_mut(), qemu.as_mut(), &run_dir, guest_crash.is_some());
-    drop(serial);
+    let shutdown_result = shutdown_qemu(qmp.as_mut(), qemu.as_mut(), &run_dir, guest_dead);
     let _ = fs::remove_file(&qmp_path);
+    // Final crash state, read only once QEMU has exited and the watcher has
+    // drained the serial log: a crash during setup's last moments or during
+    // shutdown must never be baked into an image.
+    let guest_crash = serial.take().and_then(SerialWatcher::finish);
+    if failure.is_none()
+        && let Some(crash) = &guest_crash
+    {
+        failure = Some(crash.describe("guest image setup"));
+    }
     if failure.is_none()
         && let Err(err) = &shutdown_result
     {
@@ -539,17 +551,9 @@ pub fn vm_integration(extra: &[String]) -> Result<()> {
     // After a kernel crash the guest is usually gone, but a non-fatal oops
     // leaves it answering SSH; try anyway, each attempt is bounded by the SSH
     // connect timeout.
-    let guest_crash = serial.as_ref().and_then(SerialWatcher::crash);
-    if let Some(crash) = &guest_crash {
-        eprintln!(
-            "vm-integration: guest kernel crashed ({}); attempting artifact collection anyway",
-            crash.first_line
-        );
-        // The watcher may record a crash after the SSH child's last
-        // successful poll; a crashed guest is never a passing run.
-        if failure.is_none() {
-            failure = Some(crash.describe("guest harness tests"));
-        }
+    let guest_dead = serial.as_ref().and_then(SerialWatcher::crash).is_some();
+    if guest_dead {
+        eprintln!("vm-integration: guest kernel crashed; attempting artifact collection anyway");
     }
     if let (Some(port), ssh_key) = (ssh_port, run_dir.join("id_ed25519"))
         && ssh_key.exists()
@@ -558,15 +562,22 @@ pub fn vm_integration(extra: &[String]) -> Result<()> {
         collect_guest_logs(port, &ssh_key, RUNTIME_SSH_USER, &run_dir);
     }
 
-    let shutdown_result =
-        shutdown_qemu(qmp.as_mut(), qemu.as_mut(), &run_dir, guest_crash.is_some());
+    let shutdown_result = shutdown_qemu(qmp.as_mut(), qemu.as_mut(), &run_dir, guest_dead);
+    let _ = fs::remove_file(&qmp_path);
+    // Final crash state, read only once QEMU has exited and the watcher has
+    // drained the serial log. A crash recorded after the SSH child's last
+    // successful poll, or during shutdown, is still a failed run.
+    let guest_crash = serial.take().and_then(SerialWatcher::finish);
+    if failure.is_none()
+        && let Some(crash) = &guest_crash
+    {
+        failure = Some(crash.describe("guest harness tests"));
+    }
     if failure.is_none()
         && let Err(err) = &shutdown_result
     {
         failure = Some(format!("{err:#}"));
     }
-    drop(serial);
-    let _ = fs::remove_file(&qmp_path);
 
     let finished = unix_time_secs();
     write_run_metadata(
