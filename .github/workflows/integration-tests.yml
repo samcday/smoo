@@ -44,8 +44,18 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
 
-      - name: Download baked VM image
-        run: cargo xtask vm-image download
+      - name: Cache Fedora base image
+        uses: actions/cache@v4
+        with:
+          path: target/vm-images/Fedora-Cloud-Base-Generic-43-1.6.x86_64.qcow2
+          key: fedora-cloud-base-generic-43-1.6-x86_64-846574c8
+
+      - name: Download or bake VM image
+        # The GHCR ref is derived from the VM image inputs (base image +
+        # tools/vm-image/guest-setup.sh). A PR that changes those has no
+        # published image until it lands on main, so bake it here instead of
+        # failing the job.
+        run: cargo xtask vm-image download || cargo xtask vm-image build
 
       - name: Run VM integration harness
         run: cargo xtask vm-integration
