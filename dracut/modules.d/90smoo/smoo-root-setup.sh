@@ -71,7 +71,7 @@ ln -sf "$devnode" /dev/smoo-export
 # rule at all (43-liveboot-v2-db410c-trial/evidence/42-enter.log).
 publish_root() {
     mkdir -p "${SMOO_UDEV_RULE%/*}"
-    smoo_root_udev_rule > "$SMOO_UDEV_RULE" 2> /dev/null \
+    smoo_root_udev_rule "$1" > "$SMOO_UDEV_RULE" 2> /dev/null \
         || warn "smoo: could not write $SMOO_UDEV_RULE"
     udevadm control --reload 2> /dev/null \
         || warn "smoo: could not reload udev rules; relying on the rule installed in the initrd"
