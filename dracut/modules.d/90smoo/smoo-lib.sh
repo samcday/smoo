@@ -77,7 +77,9 @@ smoo_export_records() {
 #
 # Prints the devnode and returns 0. On failure it prints "error: <reason>"
 # instead and returns 1 when nothing is ready yet (the caller should keep
-# waiting) or 2 when the request can never be satisfied (ambiguous).
+# waiting) or 2 when the request can never be satisfied (ambiguous). Implicit
+# selection counts every export in the map, ready or not: a second export that
+# is merely late still makes "the only one" a guess.
 #
 # The reason goes to stdout rather than a variable because the caller reads this
 # through a command substitution, which is a subshell: a variable set here would
@@ -88,6 +90,7 @@ smoo_select_export() {
     _records=$2
     _ready_dev=
     _ready_count=0
+    _total=0
     _seen=
     _requested_present=0
 
@@ -99,6 +102,7 @@ smoo_select_export() {
         _dev=${_record#* }
         [ -n "$_id" ] || continue
         _seen="$_seen $_id"
+        _total=$((_total + 1))
         if [ -n "$_requested" ] && [ "$_id" = "$_requested" ]; then
             _requested_present=1
         fi
@@ -126,17 +130,17 @@ smoo_select_export() {
         return 1
     fi
 
+    if [ "$_total" -gt 1 ]; then
+        printf 'error: rd.smoo.root= is required: %s exports present:%s\n' \
+            "$_total" "$_seen"
+        return 2
+    fi
     if [ "$_ready_count" -eq 1 ]; then
         printf '%s\n' "$_ready_dev"
         return 0
     fi
-    if [ "$_ready_count" -eq 0 ]; then
-        printf 'error: no export is ready yet; saw:%s\n' "${_seen:- none}"
-        return 1
-    fi
-    printf 'error: rd.smoo.root= is required: %s exports are ready:%s\n' \
-        "$_ready_count" "$_seen"
-    return 2
+    printf 'error: no export is ready yet; saw:%s\n' "${_seen:- none}"
+    return 1
 }
 
 # Whether $1 is an unsigned decimal the shell can do arithmetic on: digits
