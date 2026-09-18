@@ -27,7 +27,7 @@ installkernel() {
 }
 
 install() {
-    inst_multiple modprobe mount mountpoint mkdir ln rm sleep sed tr \
+    inst_multiple modprobe mount grep mkdir ln rm sleep sed tr \
         dmsetup losetup blockdev truncate
     inst /usr/bin/smoo-gadget /usr/bin/smoo-gadget
 
