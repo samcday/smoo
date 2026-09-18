@@ -60,7 +60,14 @@ jobs:
 
       - name: build packages
         run: |
-          export PACKAGER_PRIVKEY=$HOME/.abuild/key.rsa
+          # The private key sits next to the public one abuild-keygen wrote,
+          # under ~/.config/abuild or ~/.abuild depending on the version.
+          key=$(ls ~/.config/abuild/*.rsa ~/.abuild/*.rsa 2>/dev/null | head -n 1)
+          if [ -z "$key" ]; then
+              echo "abuild-keygen produced no private key" >&2
+              exit 1
+          fi
+          export PACKAGER_PRIVKEY=$key
           abuild -F checksum
           abuild -F -P /packages
           mv APKBUILD /packages
