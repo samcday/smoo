@@ -169,11 +169,17 @@ assert_status 1 $? "a requested export that is absent means keep waiting for it"
 smoo_select_export "" "" > /dev/null 2>&1
 assert_status 1 $? "an empty map means keep waiting"
 
+mixed_records=$(printf '%s\n' "1 /dev/ublkb0" "2 -")
+smoo_select_export "" "$mixed_records" > /dev/null 2>&1
+assert_status 2 $? "one ready plus one pending export is still ambiguous without rd.smoo.root"
+assert_eq "/dev/ublkb0" "$(smoo_select_export 1 "$mixed_records")" \
+    "an explicit id picks the ready one of a mixed map"
+
 # The reason a boot failed has to survive the caller's command substitution,
 # which is a subshell, so it travels on stdout rather than in a variable.
 out=$(smoo_select_export "" "$three_records" 2>/dev/null) || true
 case "$out" in
-    "error: rd.smoo.root= is required: 2 exports are ready:"*) ok ;;
+    "error: rd.smoo.root= is required: 3 exports present:"*) ok ;;
     *) fail "ambiguous selection did not explain itself: $out" ;;
 esac
 
