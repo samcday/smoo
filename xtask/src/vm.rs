@@ -30,6 +30,9 @@ const DEFAULT_GUEST_PROBE_TIMEOUT: Duration = Duration::from_secs(900);
 const DEFAULT_GUEST_HARNESS_TIMEOUT: Duration = Duration::from_secs(1800);
 const DEFAULT_IMAGE_BUILD_TIMEOUT: Duration = Duration::from_secs(1800);
 const QMP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bound on the payload `scp`; `ConnectTimeout` only covers connection
+/// setup, not a transfer stalled by a dead guest.
+const PAYLOAD_COPY_TIMEOUT: Duration = Duration::from_secs(300);
 const GUEST_PAYLOAD_DIR: &str = "/tmp/smoo-vm-payload";
 const GUEST_TARGET_DIR: &str = "/tmp/smoo-vm-target";
 /// Serial-console lines that mean the guest kernel has crashed. Once one shows
@@ -314,7 +317,14 @@ fn vm_image_build(extra: &[String]) -> Result<()> {
         failure = Some(format!("{err:#}"));
     }
 
+    // The watcher may record a crash after the SSH child's last successful
+    // poll; never finalize an image whose guest kernel crashed.
     let guest_crash = serial.as_ref().and_then(SerialWatcher::crash);
+    if failure.is_none()
+        && let Some(crash) = &guest_crash
+    {
+        failure = Some(crash.describe("guest image setup"));
+    }
     if failure.is_some()
         && guest_crash.is_none()
         && let (Some(port), ssh_key) = (ssh_port, run_dir.join("id_ed25519"))
@@ -363,6 +373,9 @@ fn vm_image_build(extra: &[String]) -> Result<()> {
     result?;
     shutdown_result?;
     finalize_result?;
+    if let Some(failure) = failure {
+        bail!("{failure}");
+    }
     println!("vm-image ready: {}", output_image.display());
     Ok(())
 }
@@ -532,6 +545,11 @@ pub fn vm_integration(extra: &[String]) -> Result<()> {
             "vm-integration: guest kernel crashed ({}); attempting artifact collection anyway",
             crash.first_line
         );
+        // The watcher may record a crash after the SSH child's last
+        // successful poll; a crashed guest is never a passing run.
+        if failure.is_none() {
+            failure = Some(crash.describe("guest harness tests"));
+        }
     }
     if let (Some(port), ssh_key) = (ssh_port, run_dir.join("id_ed25519"))
         && ssh_key.exists()
@@ -576,6 +594,9 @@ pub fn vm_integration(extra: &[String]) -> Result<()> {
 
     result?;
     shutdown_result?;
+    if let Some(failure) = failure {
+        bail!("{failure}");
+    }
     println!("vm-integration harness passed");
     Ok(())
 }
@@ -741,13 +762,20 @@ mkdir -p {payload_dir} {target_dir}
     )?;
 
     println!("copying guest harness payload to {GUEST_PAYLOAD_DIR}");
-    run_checked(
-        scp_command(port, key)
-            .arg("-r")
-            .arg(payload.local_dir.join("."))
-            .arg(format!("{RUNTIME_SSH_USER}@127.0.0.1:{GUEST_PAYLOAD_DIR}/")),
-        "copy guest harness payload",
-    )
+    let label = "copy guest harness payload";
+    let mut child = scp_command(port, key)
+        .arg("-r")
+        .arg(payload.local_dir.join("."))
+        .arg(format!("{RUNTIME_SSH_USER}@127.0.0.1:{GUEST_PAYLOAD_DIR}/"))
+        .stdin(Stdio::null())
+        .spawn()
+        .with_context(|| format!("spawn {label}"))?;
+    let status = wait_child(&mut child, PAYLOAD_COPY_TIMEOUT, Some(serial), label)
+        .with_context(|| label.to_string())?;
+    if !status.success() {
+        bail!("{label} failed: {status:?}");
+    }
+    Ok(())
 }
 
 fn run_guest_harness(
