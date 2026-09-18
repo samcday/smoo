@@ -203,6 +203,26 @@ assert_status 1 $? "an empty size is rejected"
 assert_eq "0 8388608 snapshot /dev/ublkb0 /dev/loop0 N 8" \
     "$(smoo_dm_table 8388608 /dev/ublkb0 /dev/loop0)" "dm-snapshot table"
 
+# --- sysfs and udev helpers -------------------------------------------------
+
+SMOO_SYS_BLOCK=$(mktemp -d)
+mkdir -p "$SMOO_SYS_BLOCK/ublkb0" "$SMOO_SYS_BLOCK/dm-0/dm" "$SMOO_SYS_BLOCK/dm-1/dm"
+printf '16777216\n' > "$SMOO_SYS_BLOCK/ublkb0/size"
+printf 'other\n' > "$SMOO_SYS_BLOCK/dm-0/dm/name"
+printf 'smoo-root\n' > "$SMOO_SYS_BLOCK/dm-1/dm/name"
+
+assert_eq "16777216" "$(smoo_device_sectors /dev/ublkb0)" "device size comes from sysfs"
+smoo_device_sectors /dev/nope > /dev/null 2>&1
+assert_status 1 $? "a device without a sysfs entry has no size"
+assert_eq 'SUBSYSTEM=="block", KERNEL=="ublkb0", SYMLINK+="smoo-root"' \
+    "$(smoo_root_udev_rule /dev/ublkb0)" "udev rule names the kernel device"
+assert_eq "dm-1" "$(smoo_dm_kname smoo-root)" "dm kernel name is found by dm name"
+smoo_dm_kname missing > /dev/null
+assert_status 1 $? "an absent dm device has no kernel name"
+assert_eq "2097152" "$(smoo_cow_kib 2147483648)" "2G COW in KiB"
+assert_eq "1" "$(smoo_cow_kib 1)" "COW KiB rounds up"
+rm -rf "$SMOO_SYS_BLOCK"
+
 # --- shell syntax -----------------------------------------------------------
 
 for script in "$moddir"/*.sh; do

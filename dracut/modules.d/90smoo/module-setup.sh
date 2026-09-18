@@ -22,13 +22,12 @@ installkernel() {
         ublk_drv \
         dm_mod \
         dm_snapshot \
-        ext4 \
-        loop
+        brd \
+        ext4
 }
 
 install() {
-    inst_multiple modprobe mount grep mkdir ln rm sleep sed tr \
-        dmsetup losetup blockdev truncate
+    inst_multiple modprobe mount grep mkdir ln rm sleep sed tr udevadm dmsetup
     inst /usr/bin/smoo-gadget /usr/bin/smoo-gadget
 
     inst_hook cmdline 20 "$moddir/parse-smoo.sh"
