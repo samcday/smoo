@@ -23,9 +23,8 @@ esac
 
 # The host only attaches the USB gadget after fastboot boot, gadget
 # enumeration and a host-side scan; on the DB410c that took ~31 s and the old
-# 30 s default left no margin (43-liveboot-v2-db410c-trial/evidence/
-# 40-uart-liveboot-fixed.log failed with "no usable export after 30s" before
-# the export appeared). 120 s keeps the service alive while the host attaches.
+# 30 s default left no margin (the DB410c liveboot trial failed with "no
+# usable export after 30s" just before the export appeared). 120 s keeps the service alive while the host attaches.
 timeout=$(getarg rd.smoo.root_timeout=) || timeout=
 timeout=$(smoo_parse_seconds "$timeout" 120) \
     || die "smoo: rd.smoo.root_timeout=$timeout is not a number of seconds"
@@ -68,7 +67,7 @@ ln -sf "$devnode" /dev/smoo-export
 # That matters after a device timeout: dracut closes the udev control socket on
 # the way into emergency mode, so a late run's reload fails with "Failed to
 # connect to udev via varlink" and the change event would otherwise match no
-# rule at all (43-liveboot-v2-db410c-trial/evidence/42-enter.log).
+# rule at all (observed on the DB410c liveboot trial).
 publish_root() {
     mkdir -p "${SMOO_UDEV_RULE%/*}"
     smoo_root_udev_rule "$1" > "$SMOO_UDEV_RULE" 2> /dev/null \

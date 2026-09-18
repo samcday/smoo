@@ -53,8 +53,7 @@ install() {
     # inst_script/inst_hook copy the source mode verbatim. The scripts are
     # executable in git, but a checkout or packaging step that drops the mode
     # would make every smoo unit fail with status 203/EXEC ("Permission
-    # denied") in the initrd, as the DB410c lane-42 trial did
-    # (43-liveboot-v2-db410c-trial/evidence/20-uart-liveboot.log). Make the
+    # denied") in the initrd, as the DB410c liveboot trial did. Make the
     # installed copies executable defensively.
     for _script in \
         "$initdir/usr/libexec/smoo/smoo-lib" \

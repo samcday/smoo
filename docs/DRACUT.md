@@ -65,10 +65,8 @@ reboot instead of showing a shell).
 
 On the DB410c trial `rd.emergency=reboot` did not reboot; the boot fell
 through to `sulogin`, which refused because the initrd's root account is
-locked ("Cannot open access to console, the root account is locked",
-43-liveboot-v2-db410c-trial/evidence/42-enter.log). If a usable emergency
-console is wanted, give the initrd's root a password when building it (the
-lane-45 build does this for the UART) or set `rd.shell=0` to suppress the
+locked ("Cannot open access to console, the root account is locked"). If a usable emergency
+console is wanted, give the initrd's root a password when building it or set `rd.shell=0` to suppress the
 shell; the served root is not affected either way.
 
 ## SELinux
