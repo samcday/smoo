@@ -35,7 +35,7 @@ The dracut shutdown hook stops the gadget after the real root has gone away.
 |---|---|---|
 | `rd.smoo` | off | Enable the module. Everything below is ignored without it. |
 | `rd.smoo.root=<id>` | — | Export id to use as root, decimal or `0x` hex. Optional when exactly one export is served. |
-| `rd.smoo.root_timeout=<s>` | `30` | How long to wait for that export to appear. |
+| `rd.smoo.root_timeout=<s>` | `120` | How long to wait for that export to appear. The USB host only attaches after `fastboot boot`, gadget enumeration and a host-side scan (about 31 s on the DB410c), so the default leaves room for a slow host; raise it for a slower machine. |
 | `rd.smoo.cow` | on | Stack a disposable dm-snapshot over the export. `rd.smoo.cow=0` writes straight through to the served image. |
 | `rd.smoo.cow.size=<size>` | `1G` | Copy-on-write size, with an optional `K`/`M`/`G` suffix. It is sparse and RAM-backed, so this is a ceiling, not an allocation. |
 | `rd.smoo.rootfstype=<fs>` | `ext4` | Filesystem of the served image. |
@@ -54,6 +54,20 @@ A typical liveboot command line:
 ```text
 rd.smoo=1 rd.smoo.root=2863311530 rd.smoo.cow.size=2G console=ttyMSM0,115200n8 earlycon
 ```
+
+## When root setup fails
+
+`smoo-root-setup.service` calls dracut's `die`, so a failure to find or
+publish the export follows dracut's normal failure path: the unit fails and
+the initrd enters emergency mode. The generic `rd.shell` and `rd.emergency`
+arguments decide what that looks like (`rd.emergency=reboot` asks dracut to
+reboot instead of showing a shell).
+
+On the DB410c trial `rd.emergency=reboot` did not reboot; the boot fell
+through to `sulogin`, which refused because the initrd's root account is
+locked ("Cannot open access to console, the root account is locked"). If a usable emergency
+console is wanted, give the initrd's root a password when building it or set `rd.shell=0` to suppress the
+shell; the served root is not affected either way.
 
 ## SELinux
 

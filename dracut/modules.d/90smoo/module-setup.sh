@@ -40,10 +40,30 @@ install() {
     inst_script "$moddir/smoo-root-setup.sh" \
         "/usr/libexec/smoo/smoo-root-setup"
 
+    # Install the /dev/smoo-root naming rule up front so it is active before
+    # the dm device exists and does not depend on a runtime `udevadm control
+    # --reload` (which fails once dracut has closed the udev control socket).
+    inst_simple "$moddir/60-smoo-root.rules" "$udevdir/rules.d/60-smoo-root.rules"
+
     inst_simple "$moddir/smoo-root-storage.service" \
         "$systemdsystemunitdir/smoo-root-storage.service"
     inst_simple "$moddir/smoo-root-setup.service" \
         "$systemdsystemunitdir/smoo-root-setup.service"
+
+    # inst_script/inst_hook copy the source mode verbatim. The scripts are
+    # executable in git, but a checkout or packaging step that drops the mode
+    # would make every smoo unit fail with status 203/EXEC ("Permission
+    # denied") in the initrd, as the DB410c liveboot trial did. Make the
+    # installed copies executable defensively.
+    for _script in \
+        "$initdir/usr/libexec/smoo/smoo-lib" \
+        "$initdir/usr/libexec/smoo/smoo-gadget-initrd-start" \
+        "$initdir/usr/libexec/smoo/smoo-root-setup" \
+        "$initdir/usr/lib/dracut/hooks/cmdline/parse-smoo.sh" \
+        "$initdir/usr/lib/dracut/hooks/pre-pivot/smoo-pre-pivot.sh" \
+        "$initdir/usr/lib/dracut/hooks/shutdown/smoo-gadget-initrd-stop.sh"; do
+        [ -e "$_script" ] && chmod 0755 "$_script"
+    done
 
     $SYSTEMCTL -q --root "$initdir" add-wants \
         initrd-root-device.target smoo-root-storage.service

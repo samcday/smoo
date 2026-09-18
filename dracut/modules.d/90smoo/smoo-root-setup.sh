@@ -21,8 +21,12 @@ case "$requested" in
         ;;
 esac
 
+# The host only attaches the USB gadget after fastboot boot, gadget
+# enumeration and a host-side scan; on the DB410c that took ~31 s and the old
+# 30 s default left no margin (the DB410c liveboot trial failed with "no
+# usable export after 30s" just before the export appeared). 120 s keeps the service alive while the host attaches.
 timeout=$(getarg rd.smoo.root_timeout=) || timeout=
-timeout=$(smoo_parse_seconds "$timeout" 30) \
+timeout=$(smoo_parse_seconds "$timeout" 120) \
     || die "smoo: rd.smoo.root_timeout=$timeout is not a number of seconds"
 
 waited=0
@@ -57,10 +61,19 @@ ln -sf "$devnode" /dev/smoo-export
 
 # Expose $1 (a kernel block device name) as /dev/smoo-root through udev, which
 # is the only way systemd learns the root device has arrived.
+#
+# The rule is installed into the initrd by module-setup.sh, so it is already
+# active even if `udevadm control --reload` cannot load the copy written here.
+# That matters after a device timeout: dracut closes the udev control socket on
+# the way into emergency mode, so a late run's reload fails with "Failed to
+# connect to udev via varlink" and the change event would otherwise match no
+# rule at all (observed on the DB410c liveboot trial).
 publish_root() {
     mkdir -p "${SMOO_UDEV_RULE%/*}"
-    smoo_root_udev_rule "$1" > "$SMOO_UDEV_RULE"
-    udevadm control --reload
+    smoo_root_udev_rule "$1" > "$SMOO_UDEV_RULE" 2> /dev/null \
+        || warn "smoo: could not write $SMOO_UDEV_RULE"
+    udevadm control --reload 2> /dev/null \
+        || warn "smoo: could not reload udev rules; relying on the rule installed in the initrd"
     udevadm trigger --settle --action=change --sysname-match="$1"
     waited=0
     while [ ! -e /dev/smoo-root ]; do

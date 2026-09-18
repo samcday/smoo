@@ -1,0 +1,14 @@
+# Name the root served by smoo.
+#
+# This rule is installed into the initrd by module-setup.sh so it is already
+# active before smoo-root-setup creates the dm device. Writing the rule at
+# runtime and calling `udevadm control --reload` is not reliable: dracut
+# closes the udev control socket when the initrd falls back to emergency mode,
+# and a late run then fails with "Failed to connect to udev via varlink" and
+# never creates /dev/smoo-root (observed on the
+# DB410c liveboot trial).
+#
+# The match uses the sysfs dm name rather than the dm-N kernel name, which is
+# only known after the device exists, and reads it directly from sysfs, so it
+# works whether or not the image's 10-dm.rules are present.
+SUBSYSTEM=="block", KERNEL=="dm-*", ATTR{dm/name}=="smoo-root", SYMLINK+="smoo-root"

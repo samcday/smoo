@@ -202,13 +202,26 @@ smoo_device_sectors() {
     printf '%s\n' "$_sectors"
 }
 
-# The udev rule that names the served root.
+# The udev rules that name the served root.
 #
 # systemd only treats /dev/smoo-root as present once udev has reported a device
 # carrying that link, so a symlink made with ln would leave the root device job
 # waiting forever. The link has to come from a rule.
+#
+# The first rule is installed into the initrd by module-setup.sh
+# (60-smoo-root.rules) so it is loaded before the dm device is created. It
+# matches the dm device by its sysfs name, not by the dm-N kernel name, so it
+# is the same rule in both places and does not depend on when it is written.
+#
+# $1 is the kernel name to name as well, for the rd.smoo.cow=0 path where the
+# root is the export device itself rather than a dm device; the build-time
+# rule cannot know that name, so the runtime copy adds a second rule for it.
 smoo_root_udev_rule() {
-    printf 'SUBSYSTEM=="block", KERNEL=="%s", SYMLINK+="smoo-root"\n' "${1##*/}"
+    printf 'SUBSYSTEM=="block", KERNEL=="dm-*", ATTR{dm/name}=="%s", SYMLINK+="smoo-root"\n' "$SMOO_DM_NAME"
+    if [ -n "${1:-}" ]; then
+        printf 'SUBSYSTEM=="block", KERNEL=="%s", SYMLINK+="smoo-root"\n' "${1##*/}"
+    fi
+    return 0
 }
 
 # Kernel name (dm-N) of the device-mapper device called $1, if it exists.
