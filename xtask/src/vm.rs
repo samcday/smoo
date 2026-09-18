@@ -1,11 +1,13 @@
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -30,6 +32,29 @@ const DEFAULT_IMAGE_BUILD_TIMEOUT: Duration = Duration::from_secs(1800);
 const QMP_TIMEOUT: Duration = Duration::from_secs(30);
 const GUEST_PAYLOAD_DIR: &str = "/tmp/smoo-vm-payload";
 const GUEST_TARGET_DIR: &str = "/tmp/smoo-vm-target";
+/// Serial-console lines that mean the guest kernel has crashed. Once one shows
+/// up the guest will never answer SSH again, so waiting on the remote script
+/// only burns the harness timeout (a hung guest used to cost ~14 minutes
+/// before the SSH keepalive gave up). The watcher aborts the SSH session and
+/// surfaces the oops text instead.
+///
+/// Kernel GPFs are reported as `Oops: general protection fault ...`; the bare
+/// phrase is deliberately not matched because the kernel also logs it for
+/// userspace SIGSEGVs (`traps: smoo-host[123] general protection fault ...`),
+/// and those leave the guest alive with artifacts worth collecting.
+const GUEST_KERNEL_CRASH_MARKERS: &[&str] = &[
+    "Kernel panic - not syncing",
+    "BUG: unable to handle",
+    "BUG: kernel NULL pointer dereference",
+    "Oops:",
+];
+/// Serial lines kept after the first crash marker, enough for the register
+/// dump and call trace without dragging the whole console log into the error.
+const GUEST_KERNEL_CRASH_EXCERPT_LINES: usize = 60;
+const SERIAL_WATCH_INTERVAL: Duration = Duration::from_millis(200);
+/// Grace period after a crash marker appears before the excerpt is snapshotted,
+/// so the call trace that follows the first line is included.
+const GUEST_KERNEL_CRASH_SETTLE: Duration = Duration::from_secs(1);
 const DEFAULT_VM_RUST_LOG: &str = "info,smoo_test_harness=debug,smoo_host_core::pump=trace,smoo_host_session=trace,smoo_gadget_core::pump=trace";
 
 #[derive(Clone)]
@@ -37,6 +62,130 @@ struct BaseImage {
     path: PathBuf,
     url: String,
     sha256: String,
+}
+
+/// First crash marker line seen on the guest serial console plus the lines that
+/// followed it (register dump, call trace).
+#[derive(Clone, Debug)]
+struct GuestKernelCrash {
+    first_line: String,
+    excerpt: String,
+}
+
+impl GuestKernelCrash {
+    fn describe(&self, activity: &str) -> String {
+        format!(
+            "guest kernel crashed while running {activity}: {}\n--- guest serial excerpt ---\n{}\n--- end guest serial excerpt ---",
+            self.first_line, self.excerpt
+        )
+    }
+}
+
+/// Background tail of the QEMU serial log that records the first kernel crash
+/// it sees. Dropping it stops the thread.
+struct SerialWatcher {
+    crash: Arc<Mutex<Option<GuestKernelCrash>>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl SerialWatcher {
+    fn spawn(serial_log: PathBuf) -> Self {
+        let crash = Arc::new(Mutex::new(None));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let crash = Arc::clone(&crash);
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || watch_serial_log(&serial_log, &crash, &stop))
+        };
+        Self {
+            crash,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn crash(&self) -> Option<GuestKernelCrash> {
+        self.crash
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+impl Drop for SerialWatcher {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Line-by-line crash detector behind [`SerialWatcher`]: latches on the first
+/// crash marker and keeps a bounded excerpt of what follows.
+#[derive(Default)]
+struct CrashScanner {
+    excerpt: Vec<String>,
+}
+
+impl CrashScanner {
+    /// Feed one console line; returns true when the recorded crash changed.
+    fn feed(&mut self, line: &str) -> bool {
+        if self.excerpt.is_empty() {
+            if GUEST_KERNEL_CRASH_MARKERS
+                .iter()
+                .any(|marker| line.contains(marker))
+            {
+                self.excerpt.push(line.to_string());
+                return true;
+            }
+            return false;
+        }
+        if self.excerpt.len() < GUEST_KERNEL_CRASH_EXCERPT_LINES {
+            self.excerpt.push(line.to_string());
+            return true;
+        }
+        false
+    }
+
+    fn crash(&self) -> Option<GuestKernelCrash> {
+        let first_line = self.excerpt.first()?.clone();
+        Some(GuestKernelCrash {
+            first_line,
+            excerpt: self.excerpt.join("\n"),
+        })
+    }
+}
+
+fn watch_serial_log(path: &Path, crash: &Mutex<Option<GuestKernelCrash>>, stop: &AtomicBool) {
+    let mut offset = 0u64;
+    let mut pending: Vec<u8> = Vec::new();
+    let mut scanner = CrashScanner::default();
+    loop {
+        if let Ok(mut file) = File::open(path)
+            && file.seek(SeekFrom::Start(offset)).is_ok()
+        {
+            let mut buf = Vec::new();
+            if let Ok(n) = file.read_to_end(&mut buf) {
+                offset += n as u64;
+                pending.extend_from_slice(&buf);
+            }
+        }
+        while let Some(pos) = pending.iter().position(|b| *b == b'\n') {
+            let raw: Vec<u8> = pending.drain(..=pos).collect();
+            let line = String::from_utf8_lossy(&raw);
+            if scanner.feed(line.trim_end()) {
+                *crash
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = scanner.crash();
+            }
+        }
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        thread::sleep(SERIAL_WATCH_INTERVAL);
+    }
 }
 
 struct VmImageSpec {
@@ -87,6 +236,7 @@ fn vm_image_build(extra: &[String]) -> Result<()> {
     let started = unix_time_secs();
     let workspace = env::current_dir().context("resolve workspace directory")?;
     let run_dir = create_run_dir(&workspace, "vm-image-build", started)?;
+    let qmp_path = qmp_socket_path(&run_dir);
     let keep_requested = env_flag("SMOO_VM_KEEP", false);
     let accel = env::var("SMOO_VM_ACCEL").unwrap_or_else(|_| "kvm".to_string());
     let boot_timeout = env_duration("SMOO_VM_BOOT_TIMEOUT_SECS", DEFAULT_BOOT_TIMEOUT)?;
@@ -105,6 +255,7 @@ fn vm_image_build(extra: &[String]) -> Result<()> {
     let mut failure: Option<String> = None;
     let mut qemu: Option<Child> = None;
     let mut qmp: Option<QmpClient> = None;
+    let mut serial: Option<SerialWatcher> = None;
     let mut ssh_port: Option<u16> = None;
     let mut overlay_for_finalize: Option<PathBuf> = None;
     let mut base_for_finalize: Option<BaseImage> = None;
@@ -126,8 +277,10 @@ fn vm_image_build(extra: &[String]) -> Result<()> {
         let port = allocate_local_port()?;
         ssh_port = Some(port);
 
-        qemu = Some(spawn_qemu(&run_dir, &overlay, &seed, port, &accel)?);
-        let qmp_path = run_dir.join("qmp.sock");
+        qemu = Some(spawn_qemu(
+            &run_dir, &qmp_path, &overlay, &seed, port, &accel,
+        )?);
+        serial = Some(SerialWatcher::spawn(run_dir.join("serial.log")));
         let qemu_ref = qemu.as_mut().expect("qemu child just spawned");
         let mut qmp_client = QmpClient::connect(&qmp_path, &run_dir.join("qmp.log"), qemu_ref)?;
         qmp_client.negotiate()?;
@@ -140,6 +293,7 @@ fn vm_image_build(extra: &[String]) -> Result<()> {
             BAKE_SSH_USER,
             boot_timeout,
             qemu.as_mut().unwrap(),
+            serial.as_ref().expect("serial watcher just spawned"),
         )?;
         run_guest_script(
             "guest image setup",
@@ -151,6 +305,7 @@ fn vm_image_build(extra: &[String]) -> Result<()> {
             &run_dir,
             &spec.setup_script,
             image_build_timeout,
+            serial.as_ref(),
         )?;
         Ok(())
     })();
@@ -159,14 +314,19 @@ fn vm_image_build(extra: &[String]) -> Result<()> {
         failure = Some(format!("{err:#}"));
     }
 
+    let guest_crash = serial.as_ref().and_then(SerialWatcher::crash);
     if failure.is_some()
+        && guest_crash.is_none()
         && let (Some(port), ssh_key) = (ssh_port, run_dir.join("id_ed25519"))
         && ssh_key.exists()
     {
         collect_guest_logs(port, &ssh_key, BAKE_SSH_USER, &run_dir);
     }
 
-    let shutdown_result = shutdown_qemu(qmp.as_mut(), qemu.as_mut(), &run_dir);
+    let shutdown_result =
+        shutdown_qemu(qmp.as_mut(), qemu.as_mut(), &run_dir, guest_crash.is_some());
+    drop(serial);
+    let _ = fs::remove_file(&qmp_path);
     if failure.is_none()
         && let Err(err) = &shutdown_result
     {
@@ -288,6 +448,7 @@ pub fn vm_integration(extra: &[String]) -> Result<()> {
     let started = unix_time_secs();
     let workspace = env::current_dir().context("resolve workspace directory")?;
     let run_dir = create_run_dir(&workspace, "vm-integration", started)?;
+    let qmp_path = qmp_socket_path(&run_dir);
 
     let keep_requested = env_flag("SMOO_VM_KEEP", false);
     let accel = env::var("SMOO_VM_ACCEL").unwrap_or_else(|_| "kvm".to_string());
@@ -307,6 +468,7 @@ pub fn vm_integration(extra: &[String]) -> Result<()> {
     let mut failure: Option<String> = None;
     let mut qemu: Option<Child> = None;
     let mut qmp: Option<QmpClient> = None;
+    let mut serial: Option<SerialWatcher> = None;
     let mut ssh_port: Option<u16> = None;
     let mut image_for_metadata = String::new();
 
@@ -325,8 +487,11 @@ pub fn vm_integration(extra: &[String]) -> Result<()> {
         let port = allocate_local_port()?;
         ssh_port = Some(port);
 
-        qemu = Some(spawn_qemu(&run_dir, &overlay, &seed, port, &accel)?);
-        let qmp_path = run_dir.join("qmp.sock");
+        qemu = Some(spawn_qemu(
+            &run_dir, &qmp_path, &overlay, &seed, port, &accel,
+        )?);
+        serial = Some(SerialWatcher::spawn(run_dir.join("serial.log")));
+        let serial_ref = serial.as_ref().expect("serial watcher just spawned");
         let qemu_ref = qemu.as_mut().expect("qemu child just spawned");
         let mut qmp_client = QmpClient::connect(&qmp_path, &run_dir.join("qmp.log"), qemu_ref)?;
         qmp_client.negotiate()?;
@@ -339,15 +504,17 @@ pub fn vm_integration(extra: &[String]) -> Result<()> {
             RUNTIME_SSH_USER,
             boot_timeout,
             qemu.as_mut().unwrap(),
+            serial_ref,
         )?;
-        run_guest_probe(port, &ssh_key, &run_dir, guest_probe_timeout)?;
-        stage_harness_payload(port, &ssh_key, &run_dir, &payload)?;
+        run_guest_probe(port, &ssh_key, &run_dir, guest_probe_timeout, serial_ref)?;
+        stage_harness_payload(port, &ssh_key, &run_dir, &payload, serial_ref)?;
         run_guest_harness(
             port,
             &ssh_key,
             &run_dir,
             &payload.tests,
             guest_harness_timeout,
+            serial_ref,
         )?;
         Ok(())
     })();
@@ -356,6 +523,16 @@ pub fn vm_integration(extra: &[String]) -> Result<()> {
         failure = Some(format!("{err:#}"));
     }
 
+    // After a kernel crash the guest is usually gone, but a non-fatal oops
+    // leaves it answering SSH; try anyway, each attempt is bounded by the SSH
+    // connect timeout.
+    let guest_crash = serial.as_ref().and_then(SerialWatcher::crash);
+    if let Some(crash) = &guest_crash {
+        eprintln!(
+            "vm-integration: guest kernel crashed ({}); attempting artifact collection anyway",
+            crash.first_line
+        );
+    }
     if let (Some(port), ssh_key) = (ssh_port, run_dir.join("id_ed25519"))
         && ssh_key.exists()
     {
@@ -363,22 +540,28 @@ pub fn vm_integration(extra: &[String]) -> Result<()> {
         collect_guest_logs(port, &ssh_key, RUNTIME_SSH_USER, &run_dir);
     }
 
-    let shutdown_result = shutdown_qemu(qmp.as_mut(), qemu.as_mut(), &run_dir);
+    let shutdown_result =
+        shutdown_qemu(qmp.as_mut(), qemu.as_mut(), &run_dir, guest_crash.is_some());
     if failure.is_none()
         && let Err(err) = &shutdown_result
     {
         failure = Some(format!("{err:#}"));
     }
+    drop(serial);
+    let _ = fs::remove_file(&qmp_path);
 
     let finished = unix_time_secs();
     write_run_metadata(
         &run_dir,
-        &image_for_metadata,
-        &accel,
-        ssh_port,
-        started,
-        finished,
-        failure.as_deref(),
+        &RunMetadata {
+            image: &image_for_metadata,
+            accel: &accel,
+            ssh_port,
+            started,
+            finished,
+            failure: failure.as_deref(),
+            guest_kernel_crash: guest_crash.as_ref().map(|crash| crash.first_line.as_str()),
+        },
     )?;
 
     let keep_run_dir = keep_requested || failure.is_some();
@@ -534,6 +717,7 @@ fn stage_harness_payload(
     key: &Path,
     run_dir: &Path,
     payload: &HarnessPayload,
+    serial: &SerialWatcher,
 ) -> Result<()> {
     let prep_script = format!(
         r#"set -euxo pipefail
@@ -553,6 +737,7 @@ mkdir -p {payload_dir} {target_dir}
         run_dir,
         &prep_script,
         Duration::from_secs(60),
+        Some(serial),
     )?;
 
     println!("copying guest harness payload to {GUEST_PAYLOAD_DIR}");
@@ -571,6 +756,7 @@ fn run_guest_harness(
     run_dir: &Path,
     tests: &[String],
     timeout: Duration,
+    serial: &SerialWatcher,
 ) -> Result<()> {
     let script = guest_harness_script(tests);
     run_guest_script(
@@ -583,6 +769,7 @@ fn run_guest_harness(
         run_dir,
         &script,
         timeout,
+        Some(serial),
     )
 }
 
@@ -1175,8 +1362,21 @@ fn allocate_local_port() -> Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
+/// QMP listens on a UNIX socket, and `sun_path` is capped at 108 bytes; a run
+/// dir under a deep checkout (git worktrees, for instance) blows past that and
+/// QEMU refuses to start. The socket is not an artifact, so keep it in the
+/// system temp dir keyed by the unique run dir name.
+fn qmp_socket_path(run_dir: &Path) -> PathBuf {
+    let run_name = run_dir
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| format!("smoo-vm-{}", std::process::id()));
+    env::temp_dir().join(format!("{run_name}.qmp"))
+}
+
 fn spawn_qemu(
     run_dir: &Path,
+    qmp: &Path,
     overlay: &Path,
     seed: &Path,
     ssh_port: u16,
@@ -1184,7 +1384,7 @@ fn spawn_qemu(
 ) -> Result<Child> {
     let stdout = File::create(run_dir.join("qemu.stdout.log")).context("create qemu stdout log")?;
     let stderr = File::create(run_dir.join("qemu.stderr.log")).context("create qemu stderr log")?;
-    let qmp = run_dir.join("qmp.sock");
+    let _ = fs::remove_file(qmp);
     let serial = run_dir.join("serial.log");
 
     let child = Command::new("qemu-system-x86_64")
@@ -1229,12 +1429,16 @@ fn wait_for_ssh(
     ssh_user: &str,
     timeout: Duration,
     qemu: &mut Child,
+    serial: &SerialWatcher,
 ) -> Result<()> {
     println!("waiting for guest SSH on localhost:{port} as {ssh_user}");
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(status) = qemu.try_wait().context("poll qemu status")? {
             bail!("qemu exited before SSH became ready: {status:?}");
+        }
+        if let Some(crash) = serial.crash() {
+            bail!("{}", crash.describe("guest boot"));
         }
         if ssh_status(port, key, ssh_user, "true")?.success() {
             println!("guest SSH ready on localhost:{port}");
@@ -1247,7 +1451,13 @@ fn wait_for_ssh(
     }
 }
 
-fn run_guest_probe(port: u16, key: &Path, run_dir: &Path, timeout: Duration) -> Result<()> {
+fn run_guest_probe(
+    port: u16,
+    key: &Path,
+    run_dir: &Path,
+    timeout: Duration,
+    serial: &SerialWatcher,
+) -> Result<()> {
     let script = guest_probe_script();
     run_guest_script(
         "guest probe",
@@ -1259,6 +1469,7 @@ fn run_guest_probe(port: u16, key: &Path, run_dir: &Path, timeout: Duration) -> 
         run_dir,
         &script,
         timeout,
+        Some(serial),
     )
 }
 
@@ -1273,6 +1484,7 @@ fn run_guest_script(
     run_dir: &Path,
     script: &str,
     timeout: Duration,
+    serial: Option<&SerialWatcher>,
 ) -> Result<()> {
     let stdout_path = run_dir.join(stdout_name);
     let stderr_path = run_dir.join(stderr_name);
@@ -1304,7 +1516,7 @@ fn run_guest_script(
         .write_all(script.as_bytes())
         .with_context(|| format!("write {label} script to SSH stdin"))?;
 
-    let status = wait_child(&mut child, timeout).with_context(|| label.to_string());
+    let status = wait_child(&mut child, timeout, serial, label).with_context(|| label.to_string());
     join_output_tee(stdout_tee, &format!("{label} stdout"))?;
     join_output_tee(stderr_tee, &format!("{label} stderr"))?;
     let status = status?;
@@ -1422,10 +1634,14 @@ fn collect_guest_logs(port: u16, key: &Path, ssh_user: &str, run_dir: &Path) {
     }
 }
 
+/// Power the guest down and reap QEMU. `guest_dead` skips the ACPI powerdown
+/// request (and its 30s grace period) when the guest kernel is known to have
+/// crashed and cannot act on it.
 fn shutdown_qemu(
     mut qmp: Option<&mut QmpClient>,
     qemu: Option<&mut Child>,
     run_dir: &Path,
+    guest_dead: bool,
 ) -> Result<()> {
     let Some(qemu) = qemu else {
         return Ok(());
@@ -1437,25 +1653,32 @@ fn shutdown_qemu(
         bail!("qemu exited unsuccessfully: {status:?}");
     }
 
-    if let Some(qmp) = qmp.as_mut() {
-        let _ = qmp.execute("system_powerdown");
-    }
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Some(status) = qemu.try_wait().context("poll qemu shutdown")? {
-            if status.success() {
-                return Ok(());
+    if !guest_dead {
+        if let Some(qmp) = qmp.as_mut() {
+            let _ = qmp.execute("system_powerdown");
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(status) = qemu.try_wait().context("poll qemu shutdown")? {
+                if status.success() {
+                    return Ok(());
+                }
+                bail!("qemu exited unsuccessfully during shutdown: {status:?}");
             }
-            bail!("qemu exited unsuccessfully during shutdown: {status:?}");
+            if Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(250));
         }
-        if Instant::now() >= deadline {
-            break;
-        }
-        thread::sleep(Duration::from_millis(250));
     }
 
     eprintln!(
-        "vm-integration: guest did not power down, asking QEMU to quit (artifacts: {})",
+        "vm-integration: {}, asking QEMU to quit (artifacts: {})",
+        if guest_dead {
+            "guest kernel crashed"
+        } else {
+            "guest did not power down"
+        },
         run_dir.display()
     );
     if let Some(qmp) = qmp.as_mut() {
@@ -1645,11 +1868,27 @@ fn scp_command(port: u16, key: &Path) -> Command {
     cmd
 }
 
-fn wait_child(child: &mut Child, timeout: Duration) -> Result<ExitStatus> {
+fn wait_child(
+    child: &mut Child,
+    timeout: Duration,
+    serial: Option<&SerialWatcher>,
+    activity: &str,
+) -> Result<ExitStatus> {
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(status) = child.try_wait().context("poll child")? {
             return Ok(status);
+        }
+        if let Some(watcher) = serial
+            && watcher.crash().is_some()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            thread::sleep(GUEST_KERNEL_CRASH_SETTLE);
+            let crash = watcher
+                .crash()
+                .expect("crash marker cannot disappear once recorded");
+            bail!("{}", crash.describe(activity));
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
@@ -1797,21 +2036,35 @@ fn unix_time_secs() -> u64 {
         .unwrap_or(0)
 }
 
-fn write_run_metadata(
-    run_dir: &Path,
-    image: &str,
-    accel: &str,
+struct RunMetadata<'a> {
+    image: &'a str,
+    accel: &'a str,
     ssh_port: Option<u16>,
     started: u64,
     finished: u64,
-    failure: Option<&str>,
-) -> Result<()> {
+    failure: Option<&'a str>,
+    guest_kernel_crash: Option<&'a str>,
+}
+
+fn write_run_metadata(run_dir: &Path, meta: &RunMetadata<'_>) -> Result<()> {
+    let RunMetadata {
+        image,
+        accel,
+        ssh_port,
+        started,
+        finished,
+        failure,
+        guest_kernel_crash,
+    } = *meta;
     let status = if failure.is_some() {
         "failed"
     } else {
         "passed"
     };
     let failure_json = failure
+        .map(|s| format!("\"{}\"", json_escape(s)))
+        .unwrap_or_else(|| "null".to_string());
+    let guest_kernel_crash_json = guest_kernel_crash
         .map(|s| format!("\"{}\"", json_escape(s)))
         .unwrap_or_else(|| "null".to_string());
     let ssh_port_json = ssh_port
@@ -1826,7 +2079,8 @@ fn write_run_metadata(
             "  \"ssh_port\": {},\n",
             "  \"started_at_unix\": {},\n",
             "  \"finished_at_unix\": {},\n",
-            "  \"failure\": {}\n",
+            "  \"failure\": {},\n",
+            "  \"guest_kernel_crash\": {}\n",
             "}}\n"
         ),
         status,
@@ -1836,6 +2090,7 @@ fn write_run_metadata(
         started,
         finished,
         failure_json,
+        guest_kernel_crash_json,
     );
     fs::write(run_dir.join("vm-run.json"), json).context("write vm-run.json")
 }
@@ -1851,4 +2106,59 @@ fn json_escape(s: &str) -> String {
             _ => vec![ch],
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crash_scanner_ignores_ordinary_console_output() {
+        let mut scanner = CrashScanner::default();
+        assert!(!scanner.feed("[    1.234567] usb 1-1: new high-speed USB device number 2"));
+        assert!(!scanner.feed("smoo-vm login: "));
+        assert!(scanner.crash().is_none());
+    }
+
+    #[test]
+    fn crash_scanner_latches_on_marker_and_bounds_excerpt() {
+        let mut scanner = CrashScanner::default();
+        let first = "[   33.340281] BUG: unable to handle page fault for address: ffff8d5f70747000";
+        assert!(scanner.feed(first));
+        for i in 0..(GUEST_KERNEL_CRASH_EXCERPT_LINES * 2) {
+            scanner.feed(&format!("[   33.4] trace line {i}"));
+        }
+        let crash = scanner.crash().expect("crash recorded");
+        assert_eq!(crash.first_line, first);
+        assert_eq!(
+            crash.excerpt.lines().count(),
+            GUEST_KERNEL_CRASH_EXCERPT_LINES
+        );
+        assert!(crash.excerpt.starts_with(first));
+        // A later marker does not restart the excerpt.
+        assert!(
+            !scanner.feed("[   33.5] Kernel panic - not syncing: Fatal exception in interrupt")
+        );
+        assert_eq!(scanner.crash().unwrap().first_line, first);
+    }
+
+    #[test]
+    fn crash_scanner_skips_userspace_protection_faults() {
+        let mut scanner = CrashScanner::default();
+        assert!(!scanner.feed(
+            "[   12.0] traps: smoo-host[1234] general protection fault ip:7f00 sp:7ffd error:0 in libc.so.6"
+        ));
+        assert!(scanner.crash().is_none());
+        assert!(scanner.feed(
+            "[   12.1] Oops: general protection fault, probably for non-canonical address 0xdead: 0000 [#1] SMP"
+        ));
+    }
+
+    #[test]
+    fn qmp_socket_path_is_short_and_run_specific() {
+        let run_dir = Path::new("/very/deep/checkout/target/vm-runs/vm-integration-1-2");
+        let path = qmp_socket_path(run_dir);
+        assert!(path.starts_with(env::temp_dir()));
+        assert!(path.ends_with("vm-integration-1-2.qmp"));
+    }
 }
