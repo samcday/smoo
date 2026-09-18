@@ -45,6 +45,22 @@ install() {
     inst_simple "$moddir/smoo-root-setup.service" \
         "$systemdsystemunitdir/smoo-root-setup.service"
 
+    # inst_script/inst_hook copy the source mode verbatim. The scripts are
+    # executable in git, but a checkout or packaging step that drops the mode
+    # would make every smoo unit fail with status 203/EXEC ("Permission
+    # denied") in the initrd, as the DB410c lane-42 trial did
+    # (43-liveboot-v2-db410c-trial/evidence/20-uart-liveboot.log). Make the
+    # installed copies executable defensively.
+    for _script in \
+        "$initdir/usr/libexec/smoo/smoo-lib" \
+        "$initdir/usr/libexec/smoo/smoo-gadget-initrd-start" \
+        "$initdir/usr/libexec/smoo/smoo-root-setup" \
+        "$initdir/usr/lib/dracut/hooks/cmdline/parse-smoo.sh" \
+        "$initdir/usr/lib/dracut/hooks/pre-pivot/smoo-pre-pivot.sh" \
+        "$initdir/usr/lib/dracut/hooks/shutdown/smoo-gadget-initrd-stop.sh"; do
+        [ -e "$_script" ] && chmod 0755 "$_script"
+    done
+
     $SYSTEMCTL -q --root "$initdir" add-wants \
         initrd-root-device.target smoo-root-storage.service
     $SYSTEMCTL -q --root "$initdir" add-wants \
