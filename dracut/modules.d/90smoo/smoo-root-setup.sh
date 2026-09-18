@@ -57,10 +57,19 @@ ln -sf "$devnode" /dev/smoo-export
 
 # Expose $1 (a kernel block device name) as /dev/smoo-root through udev, which
 # is the only way systemd learns the root device has arrived.
+#
+# The rule is installed into the initrd by module-setup.sh, so it is already
+# active even if `udevadm control --reload` cannot load the copy written here.
+# That matters after a device timeout: dracut closes the udev control socket on
+# the way into emergency mode, so a late run's reload fails with "Failed to
+# connect to udev via varlink" and the change event would otherwise match no
+# rule at all (43-liveboot-v2-db410c-trial/evidence/42-enter.log).
 publish_root() {
     mkdir -p "${SMOO_UDEV_RULE%/*}"
-    smoo_root_udev_rule "$1" > "$SMOO_UDEV_RULE"
-    udevadm control --reload
+    smoo_root_udev_rule > "$SMOO_UDEV_RULE" 2> /dev/null \
+        || warn "smoo: could not write $SMOO_UDEV_RULE"
+    udevadm control --reload 2> /dev/null \
+        || warn "smoo: could not reload udev rules; relying on the rule installed in the initrd"
     udevadm trigger --settle --action=change --sysname-match="$1"
     waited=0
     while [ ! -e /dev/smoo-root ]; do

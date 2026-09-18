@@ -243,8 +243,8 @@ printf 'smoo-root\n' > "$SMOO_SYS_BLOCK/dm-1/dm/name"
 assert_eq "16777216" "$(smoo_device_sectors /dev/ublkb0)" "device size comes from sysfs"
 smoo_device_sectors /dev/nope > /dev/null 2>&1
 assert_status 1 $? "a device without a sysfs entry has no size"
-assert_eq 'SUBSYSTEM=="block", KERNEL=="ublkb0", SYMLINK+="smoo-root"' \
-    "$(smoo_root_udev_rule /dev/ublkb0)" "udev rule names the kernel device"
+assert_eq 'SUBSYSTEM=="block", KERNEL=="dm-*", ATTR{dm/name}=="smoo-root", SYMLINK+="smoo-root"' \
+    "$(smoo_root_udev_rule)" "udev rule matches the served root by its sysfs dm name"
 assert_eq "dm-1" "$(smoo_dm_kname smoo-root)" "dm kernel name is found by dm name"
 smoo_dm_kname missing > /dev/null
 assert_status 1 $? "an absent dm device has no kernel name"

@@ -207,8 +207,14 @@ smoo_device_sectors() {
 # systemd only treats /dev/smoo-root as present once udev has reported a device
 # carrying that link, so a symlink made with ln would leave the root device job
 # waiting forever. The link has to come from a rule.
+#
+# The same rule is installed into the initrd by module-setup.sh
+# (60-smoo-root.rules) so it is loaded before the dm device is created. The
+# runtime copy here is a fallback for a script run outside the module; it
+# matches the dm device by its sysfs name, not by the dm-N kernel name, so it
+# is the same rule in both places and does not depend on when it is written.
 smoo_root_udev_rule() {
-    printf 'SUBSYSTEM=="block", KERNEL=="%s", SYMLINK+="smoo-root"\n' "${1##*/}"
+    printf 'SUBSYSTEM=="block", KERNEL=="dm-*", ATTR{dm/name}=="%s", SYMLINK+="smoo-root"\n' "$SMOO_DM_NAME"
 }
 
 # Kernel name (dm-N) of the device-mapper device called $1, if it exists.

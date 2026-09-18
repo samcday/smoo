@@ -40,6 +40,11 @@ install() {
     inst_script "$moddir/smoo-root-setup.sh" \
         "/usr/libexec/smoo/smoo-root-setup"
 
+    # Install the /dev/smoo-root naming rule up front so it is active before
+    # the dm device exists and does not depend on a runtime `udevadm control
+    # --reload` (which fails once dracut has closed the udev control socket).
+    inst_simple "$moddir/60-smoo-root.rules" "$udevdir/rules.d/60-smoo-root.rules"
+
     inst_simple "$moddir/smoo-root-storage.service" \
         "$systemdsystemunitdir/smoo-root-storage.service"
     inst_simple "$moddir/smoo-root-setup.service" \
