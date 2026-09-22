@@ -175,6 +175,44 @@ impl RusbTransport {
 }
 
 impl RusbTransport {
+    /// Claim a previously opened device without enumerating USB again.
+    ///
+    /// Callers can apply their own discovery and ambiguity policy, then pass
+    /// the inspected handle here. A disconnect fails on that handle; this
+    /// never substitutes another device with matching descriptors. The caller
+    /// remains responsible for selecting the intended device.
+    ///
+    /// Endpoint discovery and interface claiming use blocking libusb calls,
+    /// which run off the async executor along with worker startup.
+    pub async fn open_handle(
+        handle: DeviceHandle<Context>,
+        class: u8,
+        subclass: u8,
+        protocol: u8,
+        transfer_timeout: Duration,
+    ) -> TransportResult<(Self, RusbControl)> {
+        task::spawn_blocking(move || {
+            let endpoints = select_endpoints(&handle.device(), class, subclass, protocol)?
+                .ok_or_else(|| TransportError::new(TransportErrorKind::NotReady))?;
+            let transport = Self::new(
+                handle,
+                RusbTransportConfig {
+                    interface: endpoints.interface,
+                    interrupt_in: endpoints.interrupt_in,
+                    interrupt_out: endpoints.interrupt_out,
+                    bulk_in: endpoints.bulk_in,
+                    bulk_out: endpoints.bulk_out,
+                    transfer_timeout,
+                    queue_depth: DEFAULT_QUEUE_DEPTH,
+                },
+            )?;
+            let control = transport.control_handle();
+            Ok((transport, control))
+        })
+        .await
+        .map_err(|err| join_error("open device handle", err))?
+    }
+
     /// Discover and open the first device matching filters and the desired interface class tuple.
     pub async fn open_matching(
         vendor_id: Option<u16>,
