@@ -295,7 +295,9 @@ Failure to service ep0 promptly leads to EP0 STALL + possible gadget reset.
 
   Each scenario is a `#[tokio::test]` in `crates/smoo-test-harness/tests/`.
   Stable scenarios include `smoke`, `rw_modest`, `pipelined_io`,
-  `max_io_read`, and `link_replay`. On failure the artifact
+  `max_io_read`, `link_replay`, `user_recovery_handover`, and `udc_rebind`
+  (in-process UDC unbind/rebind with a read in flight, as USB mode managers
+  such as usb-signaller do). On failure the artifact
   bundle is the source of truth — open `capture.pcapng` with the
   dissector at `tools/wireshark/smoo.lua` to triage wire-level issues.
 

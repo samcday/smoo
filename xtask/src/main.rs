@@ -19,6 +19,7 @@ const STABLE_HARNESS_TESTS: &[&str] = &[
     "max_io_read",
     "link_replay",
     "user_recovery_handover",
+    "udc_rebind",
 ];
 
 fn main() -> ExitCode {
