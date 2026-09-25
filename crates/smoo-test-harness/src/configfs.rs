@@ -137,9 +137,17 @@ impl GadgetConfigFs {
 
     pub fn unbind_udc(&self) {
         if self.udc_bound.swap(false, Ordering::AcqRel) {
-            // empty string clears UDC binding
-            if let Err(err) = write_sys(&self.gadget_dir.join("UDC"), "") {
-                tracing::warn!(error = ?err, gadget = %self.gadget_dir.display(), "UDC unbind failed");
+            // A lone newline clears the UDC binding. An empty string does not: a zero-length
+            // write never reaches the configfs store, so the gadget would stay bound.
+            match fs::write(self.gadget_dir.join("UDC"), "\n") {
+                Ok(()) => {}
+                // FunctionFS unbinds the gadget itself once its daemon closes ep0.
+                Err(err) if err.raw_os_error() == Some(libc::ENODEV) => {
+                    tracing::debug!(gadget = %self.gadget_dir.display(), "UDC already unbound");
+                }
+                Err(err) => {
+                    tracing::warn!(error = ?err, gadget = %self.gadget_dir.display(), "UDC unbind failed");
+                }
             }
         }
     }
@@ -230,8 +238,8 @@ fn try_remove_existing(gadget_dir: &Path, ffs_mount: &Path) {
         ffs = %ffs_mount.display(),
         "leaked configfs/ffs state from prior run; cleaning"
     );
-    // Unbind UDC if bound
-    let _ = fs::write(gadget_dir.join("UDC"), "");
+    // Unbind UDC if bound (see GadgetConfigFs::unbind_udc for why "\n")
+    let _ = fs::write(gadget_dir.join("UDC"), "\n");
     // Try to remove all symlinks under configs/c.1/
     if let Ok(rd) = fs::read_dir(gadget_dir.join("configs/c.1")) {
         for entry in rd.flatten() {
