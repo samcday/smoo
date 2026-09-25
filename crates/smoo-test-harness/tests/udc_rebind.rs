@@ -47,9 +47,7 @@ async fn udc_rebind() -> Result<()> {
         Duration::from_secs(2),
         Duration::from_secs(10),
     ];
-    run_rebind_cycles("udc_rebind", &gaps)
-        .await
-        .inspect_err(log_failure)
+    run_rebind_cycles("udc_rebind", &gaps).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -57,15 +55,7 @@ async fn udc_rebind() -> Result<()> {
 async fn udc_rebind_loop() -> Result<()> {
     common::init_tracing();
     let gaps = [Duration::from_millis(100); 20];
-    run_rebind_cycles("udc_rebind_loop", &gaps)
-        .await
-        .inspect_err(log_failure)
-}
-
-/// Log the failure as soon as it happens, before scenario teardown, so it is
-/// visible even if teardown gets stuck.
-fn log_failure(err: &anyhow::Error) {
-    tracing::error!(error = ?err, "UDC rebind scenario failed");
+    run_rebind_cycles("udc_rebind_loop", &gaps).await
 }
 
 async fn run_rebind_cycles(name: &str, gaps: &[Duration]) -> Result<()> {
@@ -89,6 +79,29 @@ async fn run_rebind_cycles(name: &str, gaps: &[Duration]) -> Result<()> {
         .start()
         .await?;
 
+    // Log a failure while `sc` is still alive: dropping it tears down the
+    // gadget's configfs state synchronously, and a teardown that blocks must
+    // not hide the error that caused it.
+    if let Err(err) = drive_cycles(&sc, &server, gaps).await {
+        tracing::error!(error = ?err, "UDC rebind scenario failed");
+        return Err(err);
+    }
+
+    server.disarm();
+    let result = sc.stop().await?;
+    // Replayed requests are visible twice on the wire with one final response,
+    // so strict request/response balance is not meaningful here.
+    result.assert(true, false).await?;
+    Ok(())
+}
+
+/// Wait for the host to attach the device, then run one unbind/rebind cycle
+/// per gap.
+async fn drive_cycles(
+    sc: &RunningScenario,
+    server: &StallingHttpSource,
+    gaps: &[Duration],
+) -> Result<()> {
     let connected_re = Regex::new("connected to smoo gadget")?;
     sc.host()
         .wait_for_log(&connected_re, Duration::from_secs(15))
@@ -99,7 +112,7 @@ async fn run_rebind_cycles(name: &str, gaps: &[Duration]) -> Result<()> {
         .await?;
     let dev_path = PathBuf::from(format!("/dev/ublkb{dev_id}"));
     common::wait_for_block_device(&dev_path, Duration::from_secs(5)).await?;
-    assert_gadget_serving(&sc, "before the first unbind").await?;
+    assert_gadget_serving(sc, "before the first unbind").await?;
 
     for (cycle, gap) in gaps.iter().copied().enumerate() {
         let lba = FIRST_LBA + LBA_STRIDE * cycle as u64;
@@ -141,15 +154,9 @@ async fn run_rebind_cycles(name: &str, gaps: &[Duration]) -> Result<()> {
             .context("device read thread exited without a result")??;
         ensure_read_matches(&actual, &expected)
             .with_context(|| format!("cycle {cycle}: replayed read"))?;
-        assert_gadget_serving(&sc, &format!("after cycle {cycle}")).await?;
+        assert_gadget_serving(sc, &format!("after cycle {cycle}")).await?;
         tracing::info!(cycle, ?gap, "read completed after UDC rebind");
     }
-
-    server.disarm();
-    let result = sc.stop().await?;
-    // Replayed requests are visible twice on the wire with one final response,
-    // so strict request/response balance is not meaningful here.
-    result.assert(true, false).await?;
     Ok(())
 }
 
