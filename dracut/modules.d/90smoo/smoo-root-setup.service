@@ -1,0 +1,18 @@
+[Unit]
+Description=smoo initrd root device setup
+Documentation=https://github.com/samcday/smoo
+DefaultDependencies=no
+ConditionPathExists=/etc/initrd-release
+ConditionKernelCommandLine=rd.smoo
+Requires=smoo-root-storage.service
+After=smoo-root-storage.service
+Before=initrd-root-device.target
+IgnoreOnIsolate=yes
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/smoo/smoo-root-setup
+StandardInput=null
+StandardOutput=journal+console
+StandardError=journal+console

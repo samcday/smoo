@@ -321,3 +321,18 @@ Failure to service ep0 promptly leads to EP0 STALL + possible gadget reset.
   * cancellation safety
   * `(export_id, request_id)` matching guarantees
   * all invariants in this document
+
+## Dracut module tests
+
+The `90smoo` dracut module ships pure helpers in
+`dracut/modules.d/90smoo/smoo-lib.sh` so they can be tested without a device.
+Run them with:
+
+```sh
+sh tests/dracut/run.sh
+```
+
+It stubs the dracut library, asserts on gadget argument building, export-map
+parsing and selection, copy-on-write size parsing and the dm-snapshot table, and
+syntax-checks every script in the module. Keep new module logic in `smoo-lib.sh`
+so it stays testable.
