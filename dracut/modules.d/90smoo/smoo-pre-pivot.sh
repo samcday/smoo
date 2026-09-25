@@ -7,6 +7,11 @@
 # and stopping the gadget tears down the very device the root is on. Give the
 # new root the unit file, in /etc so it works on an image-based root too. The
 # write lands in the copy-on-write layer and is gone on reboot.
+#
+# Nothing else needs carrying over. The FunctionFS mount at /run/smoo/ffs and
+# the usb-signaller drop-in in /run/usb-signaller live under /run, which
+# systemd moves to the new root together with every mount below it; the
+# configfs gadget is kernel state and does not depend on either root.
 
 command -v getarg > /dev/null || . /lib/dracut-lib.sh
 

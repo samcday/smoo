@@ -34,11 +34,11 @@ smoo_gadget_args() {
     printf '%s\n' --state-file "$(getarg rd.smoo.state_file= || printf '%s' "$SMOO_STATE_FILE")"
     printf '%s\n' --export-map-file "$SMOO_EXPORT_MAP"
 
-    _value=$(getarg rd.smoo.vendor=) || _value=$(getarg rd.smoo.vendor_id=) || _value=
-    [ -n "$_value" ] && printf '%s\n' --vendor-id "$_value"
-
-    _value=$(getarg rd.smoo.product=) || _value=$(getarg rd.smoo.product_id=) || _value=
-    [ -n "$_value" ] && printf '%s\n' --product-id "$_value"
+    # The initrd builds the gadget itself (smoo-gadget-initrd-start), so the
+    # daemon only serves the FunctionFS instance mounted here. On this path
+    # smoo-gadget never touches configfs and ignores --vendor-id/--product-id,
+    # so the start script applies rd.smoo.vendor/product instead.
+    printf '%s\n' --ffs-dir "$SMOO_FFS_DIR"
 
     _value=$(getarg rd.smoo.queue_count=) || _value=
     [ -n "$_value" ] && printf '%s\n' --queue-count "$_value"

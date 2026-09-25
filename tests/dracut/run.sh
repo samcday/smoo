@@ -93,18 +93,20 @@ die() {
 
 CMDLINE="rd.smoo=1"
 args=$(smoo_gadget_args | tr '\n' ' ')
-assert_eq "--state-file /run/smoo/state.json --export-map-file /run/smoo/export-map.json " \
+assert_eq "--state-file /run/smoo/state.json --export-map-file /run/smoo/export-map.json --ffs-dir /run/smoo/ffs " \
     "$args" "default gadget arguments"
 
 CMDLINE="rd.smoo=1 rd.smoo.vendor=0x18d1 rd.smoo.product=0x4ee0 rd.smoo.queue_count=2 rd.smoo.queue_depth=32 rd.smoo.max_io=1048576 rd.smoo.mimic_fastboot=1"
 args=$(smoo_gadget_args | tr '\n' ' ')
+# The initrd owns the gadget: smoo-gadget only serves the FunctionFS instance,
+# and the USB ids go into configfs from the start script instead.
 case "$args" in
-    *"--vendor-id 0x18d1"*) ok ;;
-    *) fail "vendor id missing from: $args" ;;
+    *"--ffs-dir /run/smoo/ffs "*) ok ;;
+    *) fail "--ffs-dir missing from: $args" ;;
 esac
 case "$args" in
-    *"--product-id 0x4ee0"*) ok ;;
-    *) fail "product id missing from: $args" ;;
+    *--vendor-id* | *--product-id*) fail "USB ids must not reach smoo-gadget: $args" ;;
+    *) ok ;;
 esac
 case "$args" in
     *"--queue-count 2"*) ok ;;
@@ -286,9 +288,12 @@ case "$out" in
     "error: rd.smoo.product=0x1ffff is not a 16-bit USB id") ok ;;
     *) fail "oversized product id did not explain itself: $out" ;;
 esac
-smoo_usb_id_ok 0 && ok || fail "0 is a valid USB id"
-smoo_usb_id_ok 65535 && ok || fail "65535 is a valid USB id"
-smoo_usb_id_ok 0XFFFF && ok || fail "0XFFFF is a valid USB id"
+smoo_usb_id_ok 0
+assert_status 0 $? "0 is a valid USB id"
+smoo_usb_id_ok 65535
+assert_status 0 $? "65535 is a valid USB id"
+smoo_usb_id_ok 0XFFFF
+assert_status 0 $? "0XFFFF is a valid USB id"
 
 long_serial=$(printf '%0127d' 0)
 CMDLINE="rd.smoo=1 rd.smoo.serial=$long_serial"

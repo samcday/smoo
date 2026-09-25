@@ -12,6 +12,16 @@ SurviveFinalKillSignal=yes
 [Service]
 Type=simple
 ExecStart=/usr/libexec/smoo/smoo-gadget-initrd-start
+# The initrd builds the gadget and smoo-gadget only serves ffs.smoo, so binding
+# the UDC is a separate step that waits for the descriptors. For Type=simple,
+# systemd runs this as soon as the daemon is forked and keeps the unit
+# activating until it returns, so smoo-root-setup.service (After=) starts only
+# once the gadget is bound. A failure here counts as a failed start and goes
+# through Restart= like a failure of the daemon itself.
+ExecStartPost=/usr/libexec/smoo/smoo-gadget-bind
+# The bind helper bounds its own waits by rd.smoo.udc_timeout; systemd's
+# default start timeout must not cut them short when that is raised.
+TimeoutStartSec=infinity
 Restart=on-failure
 RestartSec=1s
 StandardInput=null
