@@ -60,6 +60,10 @@ const LIVENESS_INTERVAL_MS: u64 = 500;
 const MAINTENANCE_SLICE_MS: u64 = 200;
 const GRACEFUL_SHUTDOWN_TIMEOUT_MS: u64 = 5_000;
 const DATA_PLANE_FAULT_TIMEOUT_MS: u64 = 1_000;
+/// Consecutive failed ep0 event reads the control loop rides out before it gives up.
+const CONTROL_ERROR_BUDGET: u32 = 20;
+const CONTROL_ERROR_BACKOFF_MIN_MS: u64 = 10;
+const CONTROL_ERROR_BACKOFF_MAX_MS: u64 = 1_000;
 
 #[derive(Debug, Parser)]
 #[command(name = "smoo-gadget", version)]
@@ -246,14 +250,14 @@ async fn run_impl(args: Args) -> Result<()> {
         initial_export_count,
     ));
     let ep0_signals = Ep0Signals::new();
-    let control_task = tokio::spawn(control_loop(
+    let mut control_task = Some(tokio::spawn(control_loop(
         custom,
         control_handler,
         status.clone(),
         ep0_signals.clone(),
         control_stop_rx,
         control_tx,
-    ));
+    )));
     let tunables = RuntimeTunables {
         queue_count: args.queue_count,
         queue_depth: args.queue_depth,
@@ -283,6 +287,7 @@ async fn run_impl(args: Args) -> Result<()> {
         link,
         ep0_signals,
         control_stop_tx.clone(),
+        &mut control_task,
     )
     .await;
     metrics_shutdown.cancel();
@@ -290,8 +295,10 @@ async fn run_impl(args: Args) -> Result<()> {
         let _ = task.await;
     }
     let _ = control_stop_tx.send(true);
-    control_task.abort();
-    let _ = control_task.await;
+    if let Some(task) = control_task.take() {
+        task.abort();
+        let _ = task.await;
+    }
     result
 }
 
@@ -1046,6 +1053,7 @@ async fn run_event_loop(
     mut link: LinkController,
     ep0_signals: Ep0Signals,
     control_stop: watch::Sender<bool>,
+    control_task: &mut Option<JoinHandle<Result<()>>>,
 ) -> Result<()> {
     let mut sigint = unix_signal(SignalKind::interrupt()).context("install SIGINT handler")?;
     let mut sigterm = unix_signal(SignalKind::terminate()).context("install SIGTERM handler")?;
@@ -1101,6 +1109,31 @@ async fn run_event_loop(
                 runtime.data_plane_epoch,
                 io::Error::other("io pump exited"),
             );
+        }
+
+        if control_task.as_ref().is_some_and(|task| task.is_finished()) {
+            let task = control_task.take().expect("control task checked above");
+            let joined = task.await;
+            if *control_stop.borrow() {
+                debug!("control loop exited after stop request");
+            } else {
+                // Without the control loop nobody holds ep0: every FunctionFS file is closed,
+                // the host can never reconnect and parked I/O would wait forever. Exit loudly
+                // instead, so a supervisor (systemd Restart=) sees the failure.
+                let err = match joined {
+                    Ok(Ok(())) => anyhow!("control loop exited unexpectedly"),
+                    Ok(Err(err)) => err.context("control loop failed"),
+                    Err(err) => anyhow!("control loop panicked: {err}"),
+                };
+                error!(
+                    error = ?err,
+                    "FunctionFS control plane lost; the host can no longer reach this gadget, exiting"
+                );
+                note_exit_reason(&mut exit_reason, format!("control plane lost: {err:#}"));
+                fail_pending_io_for_shutdown(&mut queue_rx, &mut outstanding);
+                io_error = Some(err);
+                break;
+            }
         }
 
         if let Some(handover_state) = handover.as_mut() {
@@ -1508,15 +1541,39 @@ async fn handle_request(
 async fn wait_custom_event<'a>(
     custom: &'a mut Custom,
     async_fd: &tokio::io::unix::AsyncFd<RawFd>,
-) -> Result<Option<Event<'a>>> {
+) -> io::Result<Option<Event<'a>>> {
     let mut guard = async_fd.readable().await?;
     match guard.try_io(|_| match custom.try_event()? {
         Some(event) => Ok(event),
         None => Err(io::Error::from(io::ErrorKind::WouldBlock)),
     }) {
-        Ok(result) => result.map(Some).context("read FunctionFS event"),
+        Ok(result) => result.map(Some),
         Err(_would_block) => Ok(None),
     }
+}
+
+/// Whether a failed ep0 event read means the FunctionFS instance itself is gone.
+///
+/// Anything else (a SETUP the kernel cancelled on a disconnect or UDC unbind, an interrupted
+/// read) leaves ep0 usable, and the control loop retries. Giving up closes every FunctionFS
+/// file, after which the gadget can never talk to a host again.
+fn ep0_error_is_fatal(err: &io::Error) -> bool {
+    // gadgetry-most-foul reports a closed ep0 as BrokenPipe; EBADFD means FunctionFS is no
+    // longer active.
+    err.kind() == io::ErrorKind::BrokenPipe
+        || matches!(
+            err.raw_os_error(),
+            Some(libc::EBADFD) | Some(libc::EBADF) | Some(libc::ENODEV)
+        )
+}
+
+fn control_error_backoff(consecutive_errors: u32) -> Duration {
+    let shift = consecutive_errors.saturating_sub(1).min(16);
+    Duration::from_millis(
+        CONTROL_ERROR_BACKOFF_MIN_MS
+            .saturating_mul(1 << shift)
+            .min(CONTROL_ERROR_BACKOFF_MAX_MS),
+    )
 }
 
 async fn control_loop(
@@ -1528,20 +1585,48 @@ async fn control_loop(
     tx: mpsc::Sender<ConfigExportsV0>,
 ) -> Result<()> {
     let async_fd = tokio::io::unix::AsyncFd::with_interest(custom.fd()?, Interest::READABLE)?;
+    let mut consecutive_errors: u32 = 0;
     loop {
         let event = loop {
+            if consecutive_errors > 0 {
+                tokio::select! {
+                    _ = stop.changed() => {
+                        debug!("control loop stopping on shutdown signal");
+                        return Ok(());
+                    }
+                    _ = tokio::time::sleep(control_error_backoff(consecutive_errors)) => {}
+                }
+            }
             tokio::select! {
                 _ = stop.changed() => {
                     debug!("control loop stopping on shutdown signal");
                     return Ok(());
                 }
-                result = wait_custom_event(&mut custom, &async_fd) => {
-                    if let Some(event) = result.context("wait for FunctionFS event")? {
-                        break event;
+                result = wait_custom_event(&mut custom, &async_fd) => match result {
+                    Ok(Some(event)) => break event,
+                    Ok(None) => {}
+                    Err(err) if ep0_error_is_fatal(&err) => {
+                        return Err(err).context("wait for FunctionFS event");
+                    }
+                    Err(err) => {
+                        consecutive_errors += 1;
+                        if consecutive_errors >= CONTROL_ERROR_BUDGET {
+                            return Err(err).with_context(|| {
+                                format!(
+                                    "wait for FunctionFS event ({consecutive_errors} consecutive failures)"
+                                )
+                            });
+                        }
+                        warn!(
+                            error = %err,
+                            consecutive_errors,
+                            "FunctionFS event read failed; retrying"
+                        );
                     }
                 }
             }
         };
+        consecutive_errors = 0;
         match event {
             Event::Bind => {
                 debug!("FunctionFS bind event (control loop)");
@@ -2654,8 +2739,50 @@ fn build_spec_from_export(export: ConfigExport) -> Result<ExportSpec> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_byte_size, parse_duration};
+    use super::{
+        control_error_backoff, ep0_error_is_fatal, parse_byte_size, parse_duration,
+        CONTROL_ERROR_BACKOFF_MAX_MS,
+    };
+    use std::io;
     use std::time::Duration;
+
+    #[test]
+    fn ep0_errors_from_a_cancelled_or_interrupted_request_are_retried() {
+        for errno in [
+            libc::EIDRM,
+            libc::EINVAL,
+            libc::ESRCH,
+            libc::EINTR,
+            libc::ESHUTDOWN,
+        ] {
+            assert!(
+                !ep0_error_is_fatal(&io::Error::from_raw_os_error(errno)),
+                "errno {errno} should be retried"
+            );
+        }
+    }
+
+    #[test]
+    fn ep0_errors_from_a_closed_functionfs_are_fatal() {
+        assert!(ep0_error_is_fatal(&io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "USB gadget was removed"
+        )));
+        assert!(ep0_error_is_fatal(&io::Error::from_raw_os_error(
+            libc::EBADFD
+        )));
+    }
+
+    #[test]
+    fn control_error_backoff_doubles_up_to_the_cap() {
+        assert_eq!(control_error_backoff(1), Duration::from_millis(10));
+        assert_eq!(control_error_backoff(2), Duration::from_millis(20));
+        assert_eq!(control_error_backoff(5), Duration::from_millis(160));
+        assert_eq!(
+            control_error_backoff(u32::MAX),
+            Duration::from_millis(CONTROL_ERROR_BACKOFF_MAX_MS)
+        );
+    }
 
     #[test]
     fn parse_byte_size_accepts_raw_bytes() {
