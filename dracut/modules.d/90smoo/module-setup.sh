@@ -29,7 +29,7 @@ installkernel() {
 }
 
 install() {
-    inst_multiple modprobe mount grep mkdir ln rm rmdir mv cat tail dmesg \
+    inst_multiple modprobe mount umount grep mkdir ln rm rmdir mv cat tail dmesg \
         sleep sed tr udevadm dmsetup
     inst /usr/bin/smoo-gadget /usr/bin/smoo-gadget
 

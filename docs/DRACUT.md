@@ -67,7 +67,11 @@ are in the initrd work: the module ships `usb_f_ncm` and `u_ether`.
 
 When the unit restarts inside the initrd, it finds the gadget and the FunctionFS
 mount still in place and reuses them; `smoo-gadget --ffs-dir` never deletes
-either.
+either. Only a complete gadget is reused: `functions/ffs.smoo` linked into
+`c.1`, the last step of the build. A gadget an earlier start left half-built is
+removed (a stale FunctionFS mount, links, then `c.1` and its strings, the
+functions, the strings, the gadget) and built again, unless something has bound
+it to a UDC, in which case the start fails rather than touch it.
 
 ## Handing the gadget over
 
@@ -159,8 +163,9 @@ the consuming image's job, so nothing here runs `semodule`.
 
 ## Tests
 
-`sh tests/dracut/run.sh` exercises the module's pure helpers — gadget argument
+`sh tests/dracut/run.sh` exercises the module's helpers — gadget argument
 building, USB identity and `rd.smoo.functions` validation, the usb-signaller
-drop-in, readiness and UDC selection, export-map parsing and selection,
+drop-in, readiness and UDC selection, building, reusing and rebuilding the
+gadget against a stand-in for configfs, export-map parsing and selection,
 copy-on-write size parsing and the dm-snapshot table — against a stubbed dracut
 library, and syntax-checks every script. It needs no device and no root.

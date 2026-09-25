@@ -397,6 +397,113 @@ assert_status 1 $? "a requested UDC that is absent is not replaced by another"
 SMOO_UDC_CLASS=/sys/class/udc
 rm -rf "$fake"
 
+# --- smoo_ensure_gadget -----------------------------------------------------
+# A temporary directory stands in for configfs. mkdir and rmdir are replaced
+# with just enough of its behaviour: making a gadget or a config also makes
+# its default groups (marked .default), and rmdir takes attributes and default
+# groups with a group but, like configfs, refuses while it still holds a
+# symlink or a group somebody made. Anything left in the wrong order fails.
+
+fake=$(mktemp -d)
+mkdir -p "$fake/usb_gadget"
+SMOO_GADGET_DIR=$fake/usb_gadget/smoo
+# Read by smoo_teardown_gadget, which must not find a real FunctionFS mount.
+# shellcheck disable=SC2034
+SMOO_FFS_DIR=$fake/ffs
+gadget=$SMOO_GADGET_DIR
+
+mkdir() {
+    for _d in "$@"; do
+        command mkdir "$_d" || return 1
+        case "${_d#"$fake/usb_gadget/"}" in
+            */*/*/*) _defaults= ;;
+            */configs/*) _defaults="strings" ;;
+            */*) _defaults= ;;
+            *)
+                _defaults="functions configs strings os_desc"
+                : > "$_d/UDC"
+                ;;
+        esac
+        for _g in $_defaults; do
+            command mkdir "$_d/$_g" && : > "$_d/$_g/.default"
+        done
+    done
+}
+
+fake_group_busy() {
+    find "$1" -mindepth 1 \( -type l -o -type d \
+        ! -exec sh -c '[ -e "$1/.default" ]' sh '{}' ';' \) -print | grep -q .
+}
+
+rmdir() {
+    for _d in "$@"; do
+        if [ ! -d "$_d" ] || [ -L "$_d" ] || fake_group_busy "$_d"; then
+            printf 'fake rmdir: cannot remove %s\n' "$_d" >&2
+            return 1
+        fi
+        command rm -rf "$_d"
+    done
+}
+
+modprobe() { :; }
+
+# Failing the ffs.smoo link, the last required step, leaves the same
+# half-built gadget a failed start leaves on a device.
+ln() { return 1; }
+smoo_ensure_gadget 0xdead 0xbeef 0001 "ncm.usb0" 2> /dev/null
+assert_status 1 $? "a gadget whose ffs.smoo link fails is not built"
+unset -f ln
+if [ -d "$gadget/functions/ffs.smoo" ] && [ ! -e "$gadget/configs/c.1/ffs.smoo" ]; then
+    ok
+else
+    fail "the failed build did not leave an incomplete gadget behind"
+fi
+smoo_gadget_complete
+assert_status 1 $? "a gadget without the ffs.smoo link is not complete"
+
+# The restart: the incomplete gadget goes and a complete one takes its place.
+# The stale idVendor shows whether the gadget was really built again.
+echo 0x1234 > "$gadget/idVendor"
+smoo_ensure_gadget 0xdead 0xbeef 0001 "ncm.usb0"
+assert_status 0 $? "an incomplete gadget is rebuilt"
+smoo_gadget_complete
+assert_status 0 $? "the rebuilt gadget is complete"
+assert_eq "0xdead" "$(cat "$gadget/idVendor")" "the rebuilt gadget has fresh attributes"
+assert_eq "$gadget/functions/ffs.smoo" "$(readlink "$gadget/configs/c.1/ffs.smoo")" \
+    "the rebuilt gadget links ffs.smoo into c.1"
+assert_eq "$gadget/functions/ncm.usb0" "$(readlink "$gadget/configs/c.1/ncm.usb0")" \
+    "the rebuilt gadget pre-composes the extra functions"
+
+# A complete gadget is reused as it is; a rebuild would have lost the marker.
+: > "$gadget/functions/ffs.smoo/marker"
+smoo_ensure_gadget 0x18d1 0x4ee0 0002 ""
+assert_status 0 $? "a complete gadget is accepted"
+if [ -e "$gadget/functions/ffs.smoo/marker" ]; then
+    ok
+else
+    fail "a complete gadget was rebuilt instead of reused"
+fi
+assert_eq "0xdead" "$(cat "$gadget/idVendor")" "a reused gadget keeps its identity"
+
+# Teardown copes with everything the build makes, extra functions included.
+smoo_teardown_gadget
+assert_status 0 $? "a complete, unbound gadget can be torn down"
+if [ -e "$gadget" ]; then
+    fail "teardown left the gadget directory behind"
+else
+    ok
+fi
+
+# A bound gadget belongs to whoever bound it, complete or not.
+mkdir "$gadget" "$gadget/functions/ffs.smoo"
+echo a600000.usb > "$gadget/UDC"
+smoo_ensure_gadget 0xdead 0xbeef 0001 ""
+assert_status 1 $? "an incomplete but bound gadget is not rebuilt"
+assert_eq "a600000.usb" "$(cat "$gadget/UDC")" "an incomplete but bound gadget is left alone"
+
+unset -f mkdir rmdir modprobe fake_group_busy
+rm -rf "$fake"
+
 # --- shell syntax -----------------------------------------------------------
 
 for script in "$moddir"/*.sh; do

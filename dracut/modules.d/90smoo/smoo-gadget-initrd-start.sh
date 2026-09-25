@@ -47,10 +47,6 @@ done
 # next to ffs.smoo. The UDC is bound by smoo-gadget-bind (ExecStartPost) once
 # smoo-gadget has written its descriptors; never here, where binding would fail
 # with ENODEV.
-gadget=$SMOO_GADGET_DIR
-config=$gadget/configs/c.1
-ffs_function=$gadget/functions/ffs.$SMOO_FFS_INSTANCE
-
 vendor=$(smoo_vendor) || die "smoo: ${vendor#error: }"
 product=$(smoo_product) || die "smoo: ${product#error: }"
 serial=$(smoo_gadget_serial) || die "smoo: ${serial#error: }"
@@ -59,50 +55,12 @@ extra_functions=$(smoo_extra_functions) || {
     extra_functions=
 }
 
-build_gadget() {
-    mkdir "$gadget" "$gadget/strings/0x409" "$config" "$config/strings/0x409" \
-        "$ffs_function" || return 1
-    echo "$vendor" > "$gadget/idVendor" || return 1
-    echo "$product" > "$gadget/idProduct" || return 1
-    echo 0x0200 > "$gadget/bcdUSB" || return 1
-    # Composite (IAD) device class: correct for ffs.smoo alone and for the NCM
-    # or ACM functions that may join it. smoo hosts match on the interface
-    # class, never on the device class, ids or strings.
-    echo 0xEF > "$gadget/bDeviceClass" || return 1
-    echo 0x02 > "$gadget/bDeviceSubClass" || return 1
-    echo 0x01 > "$gadget/bDeviceProtocol" || return 1
-    echo smoo > "$gadget/strings/0x409/manufacturer" || return 1
-    echo "smoo gadget" > "$gadget/strings/0x409/product" || return 1
-    printf '%s\n' "$serial" > "$gadget/strings/0x409/serialnumber" || return 1
-    echo smoo > "$config/strings/0x409/configuration" || return 1
-    echo 500 > "$config/MaxPower" || return 1
-    # Linked first, so ffs.smoo is interface 0 whatever joins later: configfs
-    # binds functions in link order.
-    ln -s "$ffs_function" "$config/ffs.$SMOO_FFS_INSTANCE" || return 1
-
-    for fn in $extra_functions; do
-        # mkdir would request usbfunc:<driver> by itself; loading the usual
-        # module name first just avoids depending on that alias.
-        modprobe -q "usb_f_${fn%%.*}" 2> /dev/null || :
-        if mkdir "$gadget/functions/$fn" 2> /dev/null; then
-            if ln -s "$gadget/functions/$fn" "$config/$fn"; then
-                info "smoo: pre-composed $fn next to ffs.$SMOO_FFS_INSTANCE"
-                continue
-            fi
-            rmdir "$gadget/functions/$fn" 2> /dev/null || :
-        fi
-        warn "smoo: could not pre-compose $fn; its manager will add it after switch-root at the cost of one more re-enumeration"
-    done
-    return 0
-}
-
 # A restart of this unit in the initrd finds the gadget, and the FunctionFS
-# mount below, still in place: smoo-gadget no longer removes them on exit.
-if [ -d "$gadget" ]; then
-    info "smoo: reusing the gadget at $gadget"
-else
-    build_gadget || die "smoo: could not build the USB gadget at $gadget"
-fi
+# mount below, still in place: smoo-gadget no longer removes them on exit. A
+# gadget an earlier start finished is reused; one whose build failed part way
+# is removed and built again (smoo_ensure_gadget).
+smoo_ensure_gadget "$vendor" "$product" "$serial" "$extra_functions" \
+    || die "smoo: could not build the USB gadget at $SMOO_GADGET_DIR"
 
 mkdir -p "$SMOO_FFS_DIR"
 if ! grep -qs " $SMOO_FFS_DIR functionfs " /proc/mounts; then
