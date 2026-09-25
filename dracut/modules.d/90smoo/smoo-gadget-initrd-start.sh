@@ -30,17 +30,58 @@ rm -f "$state_file"
 udc_timeout=$(getarg rd.smoo.udc_timeout=) || udc_timeout=
 udc_timeout=$(smoo_parse_seconds "$udc_timeout" 15) \
     || die "smoo: rd.smoo.udc_timeout=$udc_timeout is not a number of seconds"
+requested_udc=$(getarg rd.smoo.udc=) || requested_udc=
 udc_waited=0
-while :; do
-    for udc in /sys/class/udc/*; do
-        [ -e "$udc" ] && break 2
-    done
+until smoo_pick_udc "$requested_udc" > /dev/null; do
     if [ "$udc_waited" -ge "$udc_timeout" ]; then
-        die "smoo: no USB device controller appeared after ${udc_timeout}s"
+        die "smoo: no USB device controller${requested_udc:+ named $requested_udc} appeared after ${udc_timeout}s"
     fi
     sleep 1
     udc_waited=$((udc_waited + 1))
 done
+
+# The initrd owns the gadget; smoo-gadget only serves its FunctionFS instance
+# (--ffs-dir) and so never creates, rebinds or deletes configfs state. That
+# keeps the gadget in place for as long as the root is served, and lets a USB
+# manager on the served root (usb-signaller) adopt it and add its own functions
+# next to ffs.smoo. The UDC is bound by smoo-gadget-bind (ExecStartPost) once
+# smoo-gadget has written its descriptors; never here, where binding would fail
+# with ENODEV.
+vendor=$(smoo_vendor) || die "smoo: ${vendor#error: }"
+product=$(smoo_product) || die "smoo: ${product#error: }"
+serial=$(smoo_gadget_serial) || die "smoo: ${serial#error: }"
+extra_functions=$(smoo_extra_functions) || {
+    warn "smoo: ${extra_functions#error: }; pre-composing no extra functions"
+    extra_functions=
+}
+
+# A restart of this unit in the initrd finds the gadget, and the FunctionFS
+# mount below, still in place: smoo-gadget no longer removes them on exit. A
+# gadget an earlier start finished is reused; one whose build failed part way
+# is removed and built again (smoo_ensure_gadget).
+smoo_ensure_gadget "$vendor" "$product" "$serial" "$extra_functions" \
+    || die "smoo: could not build the USB gadget at $SMOO_GADGET_DIR"
+
+mkdir -p "$SMOO_FFS_DIR"
+if ! grep -qs " $SMOO_FFS_DIR functionfs " /proc/mounts; then
+    # No options: the same mount smoo-gadget made for itself.
+    mount -t functionfs "$SMOO_FFS_INSTANCE" "$SMOO_FFS_DIR" \
+        || die "smoo: could not mount FunctionFS instance $SMOO_FFS_INSTANCE at $SMOO_FFS_DIR"
+fi
+
+# Tell usb-signaller, if the served root runs it, that this gadget carries the
+# root: adopt it in place and never unlink ffs.smoo. The temporary name does
+# not end in .toml, so a reader never parses a half-written file. Losing this
+# file costs the developer link, not the root, as long as usb-signaller is set
+# to preserve gadgets it was not told about.
+dropin_dir=$SMOO_USB_SIGNALLER_DROPIN_DIR
+if mkdir -p "$dropin_dir" \
+    && smoo_usb_signaller_dropin > "$dropin_dir/.50-smoo.toml.tmp" \
+    && mv -f "$dropin_dir/.50-smoo.toml.tmp" "$dropin_dir/50-smoo.toml"; then
+    :
+else
+    warn "smoo: could not write $dropin_dir/50-smoo.toml; usb-signaller will not adopt the gadget"
+fi
 
 log_level=$(getarg rd.smoo.log=)
 if [ -n "$log_level" ]; then

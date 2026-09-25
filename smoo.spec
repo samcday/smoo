@@ -74,6 +74,8 @@ install -Dpm0755 dracut/modules.d/90smoo/parse-smoo.sh \
     %{buildroot}%{_prefix}/lib/dracut/modules.d/90smoo/parse-smoo.sh
 install -Dpm0755 dracut/modules.d/90smoo/smoo-gadget-initrd-start.sh \
     %{buildroot}%{_prefix}/lib/dracut/modules.d/90smoo/smoo-gadget-initrd-start.sh
+install -Dpm0755 dracut/modules.d/90smoo/smoo-gadget-bind.sh \
+    %{buildroot}%{_prefix}/lib/dracut/modules.d/90smoo/smoo-gadget-bind.sh
 install -Dpm0755 dracut/modules.d/90smoo/smoo-gadget-initrd-stop.sh \
     %{buildroot}%{_prefix}/lib/dracut/modules.d/90smoo/smoo-gadget-initrd-stop.sh
 install -Dpm0755 dracut/modules.d/90smoo/smoo-lib.sh \

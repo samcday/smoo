@@ -50,7 +50,11 @@ assert_status() {
 
 CMDLINE=""
 
-getarg() {
+# A test that needs a value the space-separated CMDLINE cannot carry redefines
+# getarg and puts this one back afterwards.
+getarg() { cmdline_getarg "$@"; }
+
+cmdline_getarg() {
     _want=$1
     for _arg in $CMDLINE; do
         case "$_arg" in
@@ -89,18 +93,20 @@ die() {
 
 CMDLINE="rd.smoo=1"
 args=$(smoo_gadget_args | tr '\n' ' ')
-assert_eq "--state-file /run/smoo/state.json --export-map-file /run/smoo/export-map.json " \
+assert_eq "--state-file /run/smoo/state.json --export-map-file /run/smoo/export-map.json --ffs-dir /run/smoo/ffs " \
     "$args" "default gadget arguments"
 
 CMDLINE="rd.smoo=1 rd.smoo.vendor=0x18d1 rd.smoo.product=0x4ee0 rd.smoo.queue_count=2 rd.smoo.queue_depth=32 rd.smoo.max_io=1048576 rd.smoo.mimic_fastboot=1"
 args=$(smoo_gadget_args | tr '\n' ' ')
+# The initrd owns the gadget: smoo-gadget only serves the FunctionFS instance,
+# and the USB ids go into configfs from the start script instead.
 case "$args" in
-    *"--vendor-id 0x18d1"*) ok ;;
-    *) fail "vendor id missing from: $args" ;;
+    *"--ffs-dir /run/smoo/ffs "*) ok ;;
+    *) fail "--ffs-dir missing from: $args" ;;
 esac
 case "$args" in
-    *"--product-id 0x4ee0"*) ok ;;
-    *) fail "product id missing from: $args" ;;
+    *--vendor-id* | *--product-id*) fail "USB ids must not reach smoo-gadget: $args" ;;
+    *) ok ;;
 esac
 case "$args" in
     *"--queue-count 2"*) ok ;;
@@ -251,6 +257,252 @@ assert_status 1 $? "an absent dm device has no kernel name"
 assert_eq "2097152" "$(smoo_cow_kib 2147483648)" "2G COW in KiB"
 assert_eq "1" "$(smoo_cow_kib 1)" "COW KiB rounds up"
 rm -rf "$SMOO_SYS_BLOCK"
+
+# --- gadget identity --------------------------------------------------------
+
+CMDLINE="rd.smoo=1"
+assert_eq "0xdead" "$(smoo_vendor)" "default vendor id"
+assert_eq "0xbeef" "$(smoo_product)" "default product id"
+assert_eq "0001" "$(smoo_gadget_serial)" "default serial matches what smoo-gadget hard-codes"
+
+CMDLINE="rd.smoo=1 rd.smoo.vendor=0x18d1 rd.smoo.product=20192 rd.smoo.serial=TESTSERIAL1"
+assert_eq "0x18d1" "$(smoo_vendor)" "vendor id from the command line"
+assert_eq "20192" "$(smoo_product)" "decimal product id from the command line"
+assert_eq "TESTSERIAL1" "$(smoo_gadget_serial)" "serial from the command line"
+
+CMDLINE="rd.smoo=1 rd.smoo.vendor_id=0x1209 rd.smoo.product_id=0x0001"
+assert_eq "0x1209" "$(smoo_vendor)" "rd.smoo.vendor_id is accepted too"
+assert_eq "0x0001" "$(smoo_product)" "rd.smoo.product_id is accepted too"
+
+CMDLINE="rd.smoo=1 rd.smoo.serial="
+assert_eq "0001" "$(smoo_gadget_serial)" "an empty serial falls back to the default"
+
+for bad in 0x 0x12345 0xgood 65536 banana 0123 -1; do
+    CMDLINE="rd.smoo=1 rd.smoo.vendor=$bad"
+    smoo_vendor > /dev/null
+    assert_status 1 $? "vendor id $bad is rejected"
+done
+CMDLINE="rd.smoo=1 rd.smoo.product=0x1ffff"
+out=$(smoo_product) && fail "an oversized product id was accepted"
+case "$out" in
+    "error: rd.smoo.product=0x1ffff is not a 16-bit USB id") ok ;;
+    *) fail "oversized product id did not explain itself: $out" ;;
+esac
+smoo_usb_id_ok 0
+assert_status 0 $? "0 is a valid USB id"
+smoo_usb_id_ok 65535
+assert_status 0 $? "65535 is a valid USB id"
+smoo_usb_id_ok 0XFFFF
+assert_status 0 $? "0XFFFF is a valid USB id"
+
+long_serial=$(printf '%0127d' 0)
+CMDLINE="rd.smoo=1 rd.smoo.serial=$long_serial"
+smoo_gadget_serial > /dev/null
+assert_status 1 $? "a serial longer than a USB string descriptor holds is rejected"
+
+# --- smoo_extra_functions ---------------------------------------------------
+
+CMDLINE="rd.smoo=1"
+assert_eq "" "$(smoo_extra_functions)" "no extra functions by default"
+smoo_extra_functions > /dev/null
+assert_status 0 $? "no rd.smoo.functions is not an error"
+
+CMDLINE="rd.smoo=1 rd.smoo.functions=ncm.usb0,acm.GS0"
+assert_eq "ncm.usb0
+acm.GS0" "$(smoo_extra_functions)" "a comma list becomes one function per line, in order"
+
+CMDLINE="rd.smoo=1 rd.smoo.functions=ncm.usb0,,ncm.usb0,mass_storage.0,"
+assert_eq "ncm.usb0
+mass_storage.0" "$(smoo_extra_functions)" "empty entries and duplicates are dropped"
+
+CMDLINE="rd.smoo=1 rd.smoo.functions=ncm.usb0,ffs.x"
+out=$(smoo_extra_functions)
+assert_status 1 $? "a FunctionFS function is rejected"
+case "$out" in
+    'error: rd.smoo.functions: "ffs.x" is a FunctionFS function'*) ok ;;
+    *) fail "ffs.x rejection did not explain itself: $out" ;;
+esac
+
+# Values with whitespace cannot come through the space-separated test command
+# line, so these go through a getarg that answers rd.smoo.functions= from
+# $bad_value, and the command-line stub is put back afterwards.
+getarg() {
+    [ "$1" = rd.smoo.functions= ] || return 1
+    printf '%s\n' "$bad_value"
+}
+for bad_value in a/b ncm/usb0 ../x ncm noinstance. .usb0 'ncm.usb 0' "ncm.usb0	" 'ncm.*' 'n-cm.usb0'; do
+    out=$(smoo_extra_functions)
+    assert_status 1 $? "rd.smoo.functions=\"$bad_value\" is rejected"
+    case "$out" in
+        error:*) ok ;;
+        *) fail "rd.smoo.functions=\"$bad_value\" printed no error: $out" ;;
+    esac
+done
+getarg() { cmdline_getarg "$@"; }
+unset bad_value
+
+CMDLINE="rd.smoo=1 rd.smoo.functions=ncm.usb0,a/b"
+assert_eq 'error: rd.smoo.functions: "a/b" may only use letters, digits and _.@:+- (no "/" or whitespace)' \
+    "$(smoo_extra_functions)" "a bad entry rejects the whole list, not just itself"
+
+# --- smoo_usb_signaller_dropin ----------------------------------------------
+
+expected_dropin='# Written by smoo'"'"'s dracut module: this boot'"'"'s root filesystem is served over
+# ffs.smoo. Masking or deleting this file makes usb-signaller leave the gadget
+# alone (no developer link), never delete it, provided foreign_gadgets =
+# "preserve" is set.
+[gadget.smoo]
+# Manage the gadget in place while it stays bound. Absent or false: the gadget
+# is declared, so protected, but left untouched.
+adopt = true
+# Never unlinked or removed, must be ready before any bind, vetoes host role.
+pinned_functions = ["ffs.smoo"]
+# config = "c.1"                 # only needed with more than one config
+# keep_identity = true           # the default when adopt = true
+# allowed_modes = ["charging_only", "developer_mode", "tethering_mode"]'
+assert_eq "$expected_dropin" "$(smoo_usb_signaller_dropin)" "usb-signaller drop-in content"
+
+# The only non-comment lines are the ones usb-signaller parses; anything else
+# under [gadget.*] would make its config Broken (deny_unknown_fields).
+assert_eq '[gadget.smoo]
+adopt = true
+pinned_functions = ["ffs.smoo"]' "$(smoo_usb_signaller_dropin | grep -v '^#')" \
+    "usb-signaller drop-in keys"
+
+# --- smoo_ffs_ready and smoo_pick_udc ---------------------------------------
+
+fake=$(mktemp -d)
+mkdir -p "$fake/fn" "$fake/ffs" "$fake/udc"
+
+smoo_ffs_ready "$fake/fn" "$fake/ffs"
+assert_status 1 $? "no ready attribute and no ep1 is not ready"
+: > "$fake/ffs/ep1"
+smoo_ffs_ready "$fake/fn" "$fake/ffs"
+assert_status 0 $? "without a ready attribute, ep1 existing means ready"
+printf '0\n' > "$fake/fn/ready"
+smoo_ffs_ready "$fake/fn" "$fake/ffs"
+assert_status 1 $? "a ready attribute reading 0 wins over ep1"
+printf '1\n' > "$fake/fn/ready"
+smoo_ffs_ready "$fake/fn" "$fake/ffs"
+assert_status 0 $? "a ready attribute reading 1 is ready"
+
+SMOO_UDC_CLASS=$fake/udc
+smoo_pick_udc "" > /dev/null
+assert_status 1 $? "no UDC to pick while none is present"
+mkdir "$fake/udc/b.usb" "$fake/udc/a600000.usb"
+assert_eq "a600000.usb" "$(smoo_pick_udc "")" "the first UDC in glob order is picked"
+assert_eq "b.usb" "$(smoo_pick_udc b.usb)" "rd.smoo.udc picks that UDC"
+smoo_pick_udc c.usb > /dev/null
+assert_status 1 $? "a requested UDC that is absent is not replaced by another"
+SMOO_UDC_CLASS=/sys/class/udc
+rm -rf "$fake"
+
+# --- smoo_ensure_gadget -----------------------------------------------------
+# A temporary directory stands in for configfs. mkdir and rmdir are replaced
+# with just enough of its behaviour: making a gadget or a config also makes
+# its default groups (marked .default), and rmdir takes attributes and default
+# groups with a group but, like configfs, refuses while it still holds a
+# symlink or a group somebody made. Anything left in the wrong order fails.
+
+fake=$(mktemp -d)
+mkdir -p "$fake/usb_gadget"
+SMOO_GADGET_DIR=$fake/usb_gadget/smoo
+# Read by smoo_teardown_gadget, which must not find a real FunctionFS mount.
+# shellcheck disable=SC2034
+SMOO_FFS_DIR=$fake/ffs
+gadget=$SMOO_GADGET_DIR
+
+mkdir() {
+    for _d in "$@"; do
+        command mkdir "$_d" || return 1
+        case "${_d#"$fake/usb_gadget/"}" in
+            */*/*/*) _defaults= ;;
+            */configs/*) _defaults="strings" ;;
+            */*) _defaults= ;;
+            *)
+                _defaults="functions configs strings os_desc"
+                : > "$_d/UDC"
+                ;;
+        esac
+        for _g in $_defaults; do
+            command mkdir "$_d/$_g" && : > "$_d/$_g/.default"
+        done
+    done
+}
+
+fake_group_busy() {
+    find "$1" -mindepth 1 \( -type l -o -type d \
+        ! -exec sh -c '[ -e "$1/.default" ]' sh '{}' ';' \) -print | grep -q .
+}
+
+rmdir() {
+    for _d in "$@"; do
+        if [ ! -d "$_d" ] || [ -L "$_d" ] || fake_group_busy "$_d"; then
+            printf 'fake rmdir: cannot remove %s\n' "$_d" >&2
+            return 1
+        fi
+        command rm -rf "$_d"
+    done
+}
+
+modprobe() { :; }
+
+# Failing the ffs.smoo link, the last required step, leaves the same
+# half-built gadget a failed start leaves on a device.
+ln() { return 1; }
+smoo_ensure_gadget 0xdead 0xbeef 0001 "ncm.usb0" 2> /dev/null
+assert_status 1 $? "a gadget whose ffs.smoo link fails is not built"
+unset -f ln
+if [ -d "$gadget/functions/ffs.smoo" ] && [ ! -e "$gadget/configs/c.1/ffs.smoo" ]; then
+    ok
+else
+    fail "the failed build did not leave an incomplete gadget behind"
+fi
+smoo_gadget_complete
+assert_status 1 $? "a gadget without the ffs.smoo link is not complete"
+
+# The restart: the incomplete gadget goes and a complete one takes its place.
+# The stale idVendor shows whether the gadget was really built again.
+echo 0x1234 > "$gadget/idVendor"
+smoo_ensure_gadget 0xdead 0xbeef 0001 "ncm.usb0"
+assert_status 0 $? "an incomplete gadget is rebuilt"
+smoo_gadget_complete
+assert_status 0 $? "the rebuilt gadget is complete"
+assert_eq "0xdead" "$(cat "$gadget/idVendor")" "the rebuilt gadget has fresh attributes"
+assert_eq "$gadget/functions/ffs.smoo" "$(readlink "$gadget/configs/c.1/ffs.smoo")" \
+    "the rebuilt gadget links ffs.smoo into c.1"
+assert_eq "$gadget/functions/ncm.usb0" "$(readlink "$gadget/configs/c.1/ncm.usb0")" \
+    "the rebuilt gadget pre-composes the extra functions"
+
+# A complete gadget is reused as it is; a rebuild would have lost the marker.
+: > "$gadget/functions/ffs.smoo/marker"
+smoo_ensure_gadget 0x18d1 0x4ee0 0002 ""
+assert_status 0 $? "a complete gadget is accepted"
+if [ -e "$gadget/functions/ffs.smoo/marker" ]; then
+    ok
+else
+    fail "a complete gadget was rebuilt instead of reused"
+fi
+assert_eq "0xdead" "$(cat "$gadget/idVendor")" "a reused gadget keeps its identity"
+
+# Teardown copes with everything the build makes, extra functions included.
+smoo_teardown_gadget
+assert_status 0 $? "a complete, unbound gadget can be torn down"
+if [ -e "$gadget" ]; then
+    fail "teardown left the gadget directory behind"
+else
+    ok
+fi
+
+# A bound gadget belongs to whoever bound it, complete or not.
+mkdir "$gadget" "$gadget/functions/ffs.smoo"
+echo a600000.usb > "$gadget/UDC"
+smoo_ensure_gadget 0xdead 0xbeef 0001 ""
+assert_status 1 $? "an incomplete but bound gadget is not rebuilt"
+assert_eq "a600000.usb" "$(cat "$gadget/UDC")" "an incomplete but bound gadget is left alone"
+
+unset -f mkdir rmdir modprobe fake_group_busy
+rm -rf "$fake"
 
 # --- shell syntax -----------------------------------------------------------
 

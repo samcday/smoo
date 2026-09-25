@@ -1,10 +1,12 @@
 #!/bin/sh
-# Pure helpers for the smoo dracut module.
+# Helpers for the smoo dracut module.
 #
-# Everything here is free of side effects so tests/dracut/run.sh can source this
-# file with a stubbed dracut library and assert on the results. The scripts that
-# touch the system (smoo-gadget-initrd-start.sh, smoo-root-setup.sh) keep only
-# the parts that cannot be tested without a device.
+# Everything here is either free of side effects or, for the gadget helpers,
+# confined to $SMOO_GADGET_DIR, so tests/dracut/run.sh can source this file with
+# a stubbed dracut library and a temporary directory standing in for configfs,
+# and assert on the results. The scripts that touch the system
+# (smoo-gadget-initrd-start.sh, smoo-root-setup.sh) keep only the parts that
+# cannot be tested without a device.
 
 SMOO_EXPORT_MAP=${SMOO_EXPORT_MAP:-/run/smoo/export-map.json}
 SMOO_STATE_FILE=${SMOO_STATE_FILE:-/run/smoo/state.json}
@@ -12,6 +14,18 @@ SMOO_COW_IMAGE=${SMOO_COW_IMAGE:-/run/smoo/cow.img}
 SMOO_DM_NAME=${SMOO_DM_NAME:-smoo-root}
 SMOO_SYS_BLOCK=${SMOO_SYS_BLOCK:-/sys/class/block}
 SMOO_UDEV_RULE=${SMOO_UDEV_RULE:-/run/udev/rules.d/60-smoo-root.rules}
+
+# The USB gadget the initrd builds and smoo-gadget serves through. The names are
+# a contract with whoever manages the gadget after switch-root (usb-signaller
+# pins ffs.smoo by these names), so they are fixed rather than derived.
+SMOO_GADGET_NAME=${SMOO_GADGET_NAME:-smoo}
+SMOO_GADGET_DIR=${SMOO_GADGET_DIR:-/sys/kernel/config/usb_gadget/$SMOO_GADGET_NAME}
+# FunctionFS instance names are global across all gadgets, so this one is too.
+SMOO_FFS_INSTANCE=${SMOO_FFS_INSTANCE:-smoo}
+# Under /run so the mount is carried across switch-root with the rest of /run.
+SMOO_FFS_DIR=${SMOO_FFS_DIR:-/run/smoo/ffs}
+SMOO_UDC_CLASS=${SMOO_UDC_CLASS:-/sys/class/udc}
+SMOO_USB_SIGNALLER_DROPIN_DIR=${SMOO_USB_SIGNALLER_DROPIN_DIR:-/run/usb-signaller/usb-signaller.toml.d}
 
 # Build the smoo-gadget argument list from the kernel command line.
 #
@@ -22,11 +36,11 @@ smoo_gadget_args() {
     printf '%s\n' --state-file "$(getarg rd.smoo.state_file= || printf '%s' "$SMOO_STATE_FILE")"
     printf '%s\n' --export-map-file "$SMOO_EXPORT_MAP"
 
-    _value=$(getarg rd.smoo.vendor=) || _value=$(getarg rd.smoo.vendor_id=) || _value=
-    [ -n "$_value" ] && printf '%s\n' --vendor-id "$_value"
-
-    _value=$(getarg rd.smoo.product=) || _value=$(getarg rd.smoo.product_id=) || _value=
-    [ -n "$_value" ] && printf '%s\n' --product-id "$_value"
+    # The initrd builds the gadget itself (smoo-gadget-initrd-start), so the
+    # daemon only serves the FunctionFS instance mounted here. On this path
+    # smoo-gadget never touches configfs and ignores --vendor-id/--product-id,
+    # so the start script applies rd.smoo.vendor/product instead.
+    printf '%s\n' --ffs-dir "$SMOO_FFS_DIR"
 
     _value=$(getarg rd.smoo.queue_count=) || _value=
     [ -n "$_value" ] && printf '%s\n' --queue-count "$_value"
@@ -48,6 +62,280 @@ smoo_gadget_args() {
     getargbool 0 rd.smoo.mimic_fastboot && printf '%s\n' --mimic-fastboot
 
     return 0
+}
+
+# A USB vendor or product id as configfs takes it: 0x plus one to four hex
+# digits, or a decimal number up to 65535. Anything else would make the
+# idVendor/idProduct write fail after the gadget directory already exists.
+smoo_usb_id_ok() {
+    case "$1" in
+        0x* | 0X*)
+            _hex=${1#0[xX]}
+            case "$_hex" in
+                '' | *[!0-9a-fA-F]*) return 1 ;;
+            esac
+            [ "${#_hex}" -le 4 ]
+            ;;
+        # A leading zero would be read as octal by the kernel.
+        '' | 0?* | *[!0-9]*) return 1 ;;
+        *) [ "${#1}" -le 5 ] && [ "$1" -le 65535 ] ;;
+    esac
+}
+
+# The USB ids of the initrd gadget: rd.smoo.vendor= / rd.smoo.product= (the
+# _id spellings are accepted too), 0xdead:0xbeef by default. No smoo host
+# looks at them; discovery goes by interface class.
+#
+# Prints the id, or "error: <reason>" and returns 1 for a malformed value: an
+# explicit request must not silently fall back to the default.
+smoo_vendor() {
+    _value=$(getarg rd.smoo.vendor=) || _value=$(getarg rd.smoo.vendor_id=) || _value=
+    _value=${_value:-0xdead}
+    if ! smoo_usb_id_ok "$_value"; then
+        printf 'error: rd.smoo.vendor=%s is not a 16-bit USB id\n' "$_value"
+        return 1
+    fi
+    printf '%s\n' "$_value"
+}
+
+smoo_product() {
+    _value=$(getarg rd.smoo.product=) || _value=$(getarg rd.smoo.product_id=) || _value=
+    _value=${_value:-0xbeef}
+    if ! smoo_usb_id_ok "$_value"; then
+        printf 'error: rd.smoo.product=%s is not a 16-bit USB id\n' "$_value"
+        return 1
+    fi
+    printf '%s\n' "$_value"
+}
+
+# The gadget's iSerialNumber: rd.smoo.serial=, "0001" by default, which is what
+# smoo-gadget hard-codes when it builds the gadget itself. A host that filters
+# by serial (fastboop's --smoo-serial) must be given the same value.
+#
+# USB string descriptors hold at most 126 characters; configfs refuses longer.
+smoo_gadget_serial() {
+    _value=$(getarg rd.smoo.serial=) || _value=
+    _value=${_value:-0001}
+    if [ "${#_value}" -gt 126 ]; then
+        printf 'error: rd.smoo.serial= is longer than the 126 characters USB allows\n'
+        return 1
+    fi
+    printf '%s\n' "$_value"
+}
+
+# Extra functions to link into the gadget next to ffs.smoo before it is first
+# bound, from rd.smoo.functions=<drv>.<inst>[,<drv>.<inst>...], for example
+# rd.smoo.functions=ncm.usb0. Pre-composing what the served root's USB manager
+# will want anyway saves one re-enumeration after switch-root.
+#
+# Prints one function per line, duplicates dropped. A malformed list is
+# rejected as a whole: it prints "error: <reason>" and returns 1, and the
+# caller pre-composes nothing rather than part of what was asked for.
+# FunctionFS functions are refused: nothing in the initrd would serve them, and
+# an FFS function without descriptors in the config makes every bind fail.
+smoo_extra_functions() {
+    _list=$(getarg rd.smoo.functions=) || return 0
+    _out=
+    _rest=$_list,
+    while [ -n "$_rest" ]; do
+        _fn=${_rest%%,*}
+        _rest=${_rest#*,}
+        [ -n "$_fn" ] || continue
+        case "$_fn" in
+            *[!A-Za-z0-9_.@:+-]*)
+                printf 'error: rd.smoo.functions: "%s" may only use letters, digits and _.@:+- (no "/" or whitespace)\n' "$_fn"
+                return 1
+                ;;
+            *.*) ;;
+            *)
+                printf 'error: rd.smoo.functions: "%s" is not <driver>.<instance>\n' "$_fn"
+                return 1
+                ;;
+        esac
+        _drv=${_fn%%.*}
+        _inst=${_fn#*.}
+        case "$_drv" in
+            '' | *[!A-Za-z0-9_]*)
+                printf 'error: rd.smoo.functions: "%s" does not start with a driver name\n' "$_fn"
+                return 1
+                ;;
+            ffs)
+                printf 'error: rd.smoo.functions: "%s" is a FunctionFS function, which needs a daemon the initrd does not run\n' "$_fn"
+                return 1
+                ;;
+        esac
+        if [ -z "$_inst" ]; then
+            printf 'error: rd.smoo.functions: "%s" has no instance name\n' "$_fn"
+            return 1
+        fi
+        case " $_out " in
+            *" $_fn "*) continue ;;
+        esac
+        _out="${_out:+$_out }$_fn"
+    done
+    # Entries are validated above: no whitespace or glob characters, so plain
+    # word splitting is safe here.
+    for _fn in $_out; do
+        printf '%s\n' "$_fn"
+    done
+}
+
+# The usb-signaller drop-in describing the gadget, written to
+# $SMOO_USB_SIGNALLER_DROPIN_DIR/50-smoo.toml on every rd.smoo boot.
+#
+# It lives in /run because the pin is a fact about this boot, not about the
+# image: only a boot whose root is served over ffs.smoo needs the gadget kept.
+smoo_usb_signaller_dropin() {
+    cat << EOF
+# Written by smoo's dracut module: this boot's root filesystem is served over
+# ffs.$SMOO_FFS_INSTANCE. Masking or deleting this file makes usb-signaller leave the gadget
+# alone (no developer link), never delete it, provided foreign_gadgets =
+# "preserve" is set.
+[gadget.$SMOO_GADGET_NAME]
+# Manage the gadget in place while it stays bound. Absent or false: the gadget
+# is declared, so protected, but left untouched.
+adopt = true
+# Never unlinked or removed, must be ready before any bind, vetoes host role.
+pinned_functions = ["ffs.$SMOO_FFS_INSTANCE"]
+# config = "c.1"                 # only needed with more than one config
+# keep_identity = true           # the default when adopt = true
+# allowed_modes = ["charging_only", "developer_mode", "tethering_mode"]
+EOF
+}
+
+# Whether the FunctionFS function directory $1 (mounted at $2) can be bound:
+# smoo-gadget has written its descriptors. The ready attribute arrived in Linux
+# 6.9; on older kernels the endpoint files appearing is the same signal.
+#
+# Every call opens the attribute afresh: configfs caches what an open file
+# read the first time.
+smoo_ffs_ready() {
+    if [ -e "$1/ready" ]; then
+        read -r _ready < "$1/ready" 2> /dev/null || return 1
+        [ "$_ready" = 1 ]
+    else
+        [ -e "$2/ep1" ]
+    fi
+}
+
+# The UDC to bind: $1 if it is set (rd.smoo.udc=) and present, else the first
+# controller under $SMOO_UDC_CLASS in glob order, the same one smoo-gadget
+# picks when it binds by itself. Fails while there is none.
+smoo_pick_udc() {
+    if [ -n "$1" ]; then
+        [ -e "$SMOO_UDC_CLASS/$1" ] || return 1
+        printf '%s\n' "$1"
+        return 0
+    fi
+    for _udc in "$SMOO_UDC_CLASS"/*; do
+        [ -e "$_udc" ] || continue
+        printf '%s\n' "${_udc##*/}"
+        return 0
+    done
+    return 1
+}
+
+# Build the gadget at $SMOO_GADGET_DIR: $1 idVendor, $2 idProduct, $3 serial,
+# $4 extra functions as smoo_extra_functions prints them. Returns 1 as soon as a
+# required step fails, leaving what it made so far for smoo_ensure_gadget to
+# clear away when the unit starts again. Extra functions are best effort.
+smoo_build_gadget() {
+    _gadget=$SMOO_GADGET_DIR
+    _config=$_gadget/configs/c.1
+    _ffs_function=$_gadget/functions/ffs.$SMOO_FFS_INSTANCE
+    mkdir "$_gadget" "$_gadget/strings/0x409" "$_config" "$_config/strings/0x409" \
+        "$_ffs_function" || return 1
+    echo "$1" > "$_gadget/idVendor" || return 1
+    echo "$2" > "$_gadget/idProduct" || return 1
+    echo 0x0200 > "$_gadget/bcdUSB" || return 1
+    # Composite (IAD) device class: correct for ffs.smoo alone and for the NCM
+    # or ACM functions that may join it. smoo hosts match on the interface
+    # class, never on the device class, ids or strings.
+    echo 0xEF > "$_gadget/bDeviceClass" || return 1
+    echo 0x02 > "$_gadget/bDeviceSubClass" || return 1
+    echo 0x01 > "$_gadget/bDeviceProtocol" || return 1
+    echo smoo > "$_gadget/strings/0x409/manufacturer" || return 1
+    echo "smoo gadget" > "$_gadget/strings/0x409/product" || return 1
+    printf '%s\n' "$3" > "$_gadget/strings/0x409/serialnumber" || return 1
+    echo smoo > "$_config/strings/0x409/configuration" || return 1
+    echo 500 > "$_config/MaxPower" || return 1
+    # Linked first, so ffs.smoo is interface 0 whatever joins later: configfs
+    # binds functions in link order. This is the last required step, which is
+    # what smoo_gadget_complete relies on.
+    ln -s "$_ffs_function" "$_config/ffs.$SMOO_FFS_INSTANCE" || return 1
+
+    # Validated by smoo_extra_functions: no whitespace or glob characters.
+    for _fn in $4; do
+        # mkdir would request usbfunc:<driver> by itself; loading the usual
+        # module name first just avoids depending on that alias.
+        modprobe -q "usb_f_${_fn%%.*}" 2> /dev/null || :
+        if mkdir "$_gadget/functions/$_fn" 2> /dev/null; then
+            if ln -s "$_gadget/functions/$_fn" "$_config/$_fn"; then
+                info "smoo: pre-composed $_fn next to ffs.$SMOO_FFS_INSTANCE"
+                continue
+            fi
+            rmdir "$_gadget/functions/$_fn" 2> /dev/null || :
+        fi
+        warn "smoo: could not pre-compose $_fn; its manager will add it after switch-root at the cost of one more re-enumeration"
+    done
+    return 0
+}
+
+# Whether the gadget at $SMOO_GADGET_DIR was built to the end. Linking ffs.smoo
+# into c.1 is the last step smoo_build_gadget requires, so the link being there
+# means every step before it succeeded too.
+smoo_gadget_complete() {
+    [ -d "$SMOO_GADGET_DIR/functions/ffs.$SMOO_FFS_INSTANCE" ] \
+        && [ -L "$SMOO_GADGET_DIR/configs/c.1/ffs.$SMOO_FFS_INSTANCE" ]
+}
+
+# Remove the gadget at $SMOO_GADGET_DIR and everything in it, in the order
+# configfs insists on: links first, then the groups made inside the configs,
+# the configs, the functions and the strings, and the gadget itself last.
+# Attributes and default groups (functions/, configs/, strings/...) go with
+# their parent. Refuses while the gadget is bound: whoever bound it is using it.
+smoo_teardown_gadget() {
+    _gadget=$SMOO_GADGET_DIR
+    _udc=
+    read -r _udc < "$_gadget/UDC" 2> /dev/null || :
+    if [ -n "$_udc" ]; then
+        warn "smoo: $_gadget is bound to $_udc; leaving it alone"
+        return 1
+    fi
+    # Removing ffs.smoo does not unmount its FunctionFS instance, and a
+    # rebuilt ffs.smoo would never become ready behind the stale mount.
+    if grep -qs " $SMOO_FFS_DIR functionfs " /proc/mounts; then
+        umount "$SMOO_FFS_DIR" || return 1
+    fi
+    for _entry in "$_gadget"/os_desc/* "$_gadget"/configs/*/*; do
+        if [ -L "$_entry" ]; then
+            rm -f "$_entry" || return 1
+        fi
+    done
+    for _entry in "$_gadget"/configs/*/strings/* "$_gadget"/configs/* \
+        "$_gadget"/functions/* "$_gadget"/strings/*; do
+        if [ -d "$_entry" ]; then
+            rmdir "$_entry" || return 1
+        fi
+    done
+    rmdir "$_gadget"
+}
+
+# Make sure $SMOO_GADGET_DIR holds a complete gadget; arguments as for
+# smoo_build_gadget. A restart of the unit reuses the gadget an earlier start
+# finished (smoo-gadget --ffs-dir never removes it), but clears away one whose
+# build failed part way and builds it again: reused as it was, it could lack
+# ffs.smoo or its link, and the host would never see the smoo interface.
+smoo_ensure_gadget() {
+    if smoo_gadget_complete; then
+        info "smoo: reusing the gadget at $SMOO_GADGET_DIR"
+        return 0
+    fi
+    if [ -d "$SMOO_GADGET_DIR" ]; then
+        warn "smoo: the gadget at $SMOO_GADGET_DIR was left incomplete by an earlier start; rebuilding it"
+        smoo_teardown_gadget || return 1
+    fi
+    smoo_build_gadget "$@"
 }
 
 # Reduce an export map JSON document to "<export_id> <devnode>" lines.

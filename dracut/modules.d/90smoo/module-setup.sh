@@ -19,6 +19,8 @@ installkernel() {
         configfs \
         libcomposite \
         usb_f_fs \
+        usb_f_ncm \
+        u_ether \
         ublk_drv \
         dm_mod \
         dm_snapshot \
@@ -27,7 +29,8 @@ installkernel() {
 }
 
 install() {
-    inst_multiple modprobe mount grep mkdir ln rm sleep sed tr udevadm dmsetup
+    inst_multiple modprobe mount umount grep mkdir ln rm rmdir mv cat tail dmesg \
+        sleep sed tr udevadm dmsetup
     inst /usr/bin/smoo-gadget /usr/bin/smoo-gadget
 
     inst_hook cmdline 20 "$moddir/parse-smoo.sh"
@@ -37,6 +40,8 @@ install() {
     inst_script "$moddir/smoo-lib.sh" "/usr/libexec/smoo/smoo-lib"
     inst_script "$moddir/smoo-gadget-initrd-start.sh" \
         "/usr/libexec/smoo/smoo-gadget-initrd-start"
+    inst_script "$moddir/smoo-gadget-bind.sh" \
+        "/usr/libexec/smoo/smoo-gadget-bind"
     inst_script "$moddir/smoo-root-setup.sh" \
         "/usr/libexec/smoo/smoo-root-setup"
 

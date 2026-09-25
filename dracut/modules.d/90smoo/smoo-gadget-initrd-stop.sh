@@ -1,4 +1,9 @@
 #!/bin/sh
+# Stop the gadget daemon after the real root has gone away.
+#
+# Only the daemon: smoo-gadget runs with --ffs-dir, so it neither built the
+# configfs gadget nor removes it on exit. Its FunctionFS files closing is
+# enough for the kernel to unbind the gadget, and the host sees it go.
 
 smoo_gadget_initrd_stop() {
     command -v getarg > /dev/null || . /lib/dracut-lib.sh
