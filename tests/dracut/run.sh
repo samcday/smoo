@@ -50,7 +50,11 @@ assert_status() {
 
 CMDLINE=""
 
-getarg() {
+# A test that needs a value the space-separated CMDLINE cannot carry redefines
+# getarg and puts this one back afterwards.
+getarg() { cmdline_getarg "$@"; }
+
+cmdline_getarg() {
     _want=$1
     for _arg in $CMDLINE; do
         case "$_arg" in
@@ -251,6 +255,142 @@ assert_status 1 $? "an absent dm device has no kernel name"
 assert_eq "2097152" "$(smoo_cow_kib 2147483648)" "2G COW in KiB"
 assert_eq "1" "$(smoo_cow_kib 1)" "COW KiB rounds up"
 rm -rf "$SMOO_SYS_BLOCK"
+
+# --- gadget identity --------------------------------------------------------
+
+CMDLINE="rd.smoo=1"
+assert_eq "0xdead" "$(smoo_vendor)" "default vendor id"
+assert_eq "0xbeef" "$(smoo_product)" "default product id"
+assert_eq "0001" "$(smoo_gadget_serial)" "default serial matches what smoo-gadget hard-codes"
+
+CMDLINE="rd.smoo=1 rd.smoo.vendor=0x18d1 rd.smoo.product=20192 rd.smoo.serial=94BX0A1B2"
+assert_eq "0x18d1" "$(smoo_vendor)" "vendor id from the command line"
+assert_eq "20192" "$(smoo_product)" "decimal product id from the command line"
+assert_eq "94BX0A1B2" "$(smoo_gadget_serial)" "serial from the command line"
+
+CMDLINE="rd.smoo=1 rd.smoo.vendor_id=0x1209 rd.smoo.product_id=0x0001"
+assert_eq "0x1209" "$(smoo_vendor)" "rd.smoo.vendor_id is accepted too"
+assert_eq "0x0001" "$(smoo_product)" "rd.smoo.product_id is accepted too"
+
+CMDLINE="rd.smoo=1 rd.smoo.serial="
+assert_eq "0001" "$(smoo_gadget_serial)" "an empty serial falls back to the default"
+
+for bad in 0x 0x12345 0xgood 65536 banana 0123 -1; do
+    CMDLINE="rd.smoo=1 rd.smoo.vendor=$bad"
+    smoo_vendor > /dev/null
+    assert_status 1 $? "vendor id $bad is rejected"
+done
+CMDLINE="rd.smoo=1 rd.smoo.product=0x1ffff"
+out=$(smoo_product) && fail "an oversized product id was accepted"
+case "$out" in
+    "error: rd.smoo.product=0x1ffff is not a 16-bit USB id") ok ;;
+    *) fail "oversized product id did not explain itself: $out" ;;
+esac
+smoo_usb_id_ok 0 && ok || fail "0 is a valid USB id"
+smoo_usb_id_ok 65535 && ok || fail "65535 is a valid USB id"
+smoo_usb_id_ok 0XFFFF && ok || fail "0XFFFF is a valid USB id"
+
+long_serial=$(printf '%0127d' 0)
+CMDLINE="rd.smoo=1 rd.smoo.serial=$long_serial"
+smoo_gadget_serial > /dev/null
+assert_status 1 $? "a serial longer than a USB string descriptor holds is rejected"
+
+# --- smoo_extra_functions ---------------------------------------------------
+
+CMDLINE="rd.smoo=1"
+assert_eq "" "$(smoo_extra_functions)" "no extra functions by default"
+smoo_extra_functions > /dev/null
+assert_status 0 $? "no rd.smoo.functions is not an error"
+
+CMDLINE="rd.smoo=1 rd.smoo.functions=ncm.usb0,acm.GS0"
+assert_eq "ncm.usb0
+acm.GS0" "$(smoo_extra_functions)" "a comma list becomes one function per line, in order"
+
+CMDLINE="rd.smoo=1 rd.smoo.functions=ncm.usb0,,ncm.usb0,mass_storage.0,"
+assert_eq "ncm.usb0
+mass_storage.0" "$(smoo_extra_functions)" "empty entries and duplicates are dropped"
+
+CMDLINE="rd.smoo=1 rd.smoo.functions=ncm.usb0,ffs.x"
+out=$(smoo_extra_functions)
+assert_status 1 $? "a FunctionFS function is rejected"
+case "$out" in
+    'error: rd.smoo.functions: "ffs.x" is a FunctionFS function'*) ok ;;
+    *) fail "ffs.x rejection did not explain itself: $out" ;;
+esac
+
+# Values with whitespace cannot come through the space-separated test command
+# line, so these go through a getarg that answers rd.smoo.functions= from
+# $bad_value, and the command-line stub is put back afterwards.
+getarg() {
+    [ "$1" = rd.smoo.functions= ] || return 1
+    printf '%s\n' "$bad_value"
+}
+for bad_value in a/b ncm/usb0 ../x ncm noinstance. .usb0 'ncm.usb 0' "ncm.usb0	" 'ncm.*' 'n-cm.usb0'; do
+    out=$(smoo_extra_functions)
+    assert_status 1 $? "rd.smoo.functions=\"$bad_value\" is rejected"
+    case "$out" in
+        error:*) ok ;;
+        *) fail "rd.smoo.functions=\"$bad_value\" printed no error: $out" ;;
+    esac
+done
+getarg() { cmdline_getarg "$@"; }
+unset bad_value
+
+CMDLINE="rd.smoo=1 rd.smoo.functions=ncm.usb0,a/b"
+assert_eq 'error: rd.smoo.functions: "a/b" may only use letters, digits and _.@:+- (no "/" or whitespace)' \
+    "$(smoo_extra_functions)" "a bad entry rejects the whole list, not just itself"
+
+# --- smoo_usb_signaller_dropin ----------------------------------------------
+
+expected_dropin='# Written by smoo'"'"'s dracut module: this boot'"'"'s root filesystem is served over
+# ffs.smoo. Masking or deleting this file makes usb-signaller leave the gadget
+# alone (no developer link), never delete it, provided foreign_gadgets =
+# "preserve" is set.
+[gadget.smoo]
+# Manage the gadget in place while it stays bound. Absent or false: the gadget
+# is declared, so protected, but left untouched.
+adopt = true
+# Never unlinked or removed, must be ready before any bind, vetoes host role.
+pinned_functions = ["ffs.smoo"]
+# config = "c.1"                 # only needed with more than one config
+# keep_identity = true           # the default when adopt = true
+# allowed_modes = ["charging_only", "developer_mode", "tethering_mode"]'
+assert_eq "$expected_dropin" "$(smoo_usb_signaller_dropin)" "usb-signaller drop-in content"
+
+# The only non-comment lines are the ones usb-signaller parses; anything else
+# under [gadget.*] would make its config Broken (deny_unknown_fields).
+assert_eq '[gadget.smoo]
+adopt = true
+pinned_functions = ["ffs.smoo"]' "$(smoo_usb_signaller_dropin | grep -v '^#')" \
+    "usb-signaller drop-in keys"
+
+# --- smoo_ffs_ready and smoo_pick_udc ---------------------------------------
+
+fake=$(mktemp -d)
+mkdir -p "$fake/fn" "$fake/ffs" "$fake/udc"
+
+smoo_ffs_ready "$fake/fn" "$fake/ffs"
+assert_status 1 $? "no ready attribute and no ep1 is not ready"
+: > "$fake/ffs/ep1"
+smoo_ffs_ready "$fake/fn" "$fake/ffs"
+assert_status 0 $? "without a ready attribute, ep1 existing means ready"
+printf '0\n' > "$fake/fn/ready"
+smoo_ffs_ready "$fake/fn" "$fake/ffs"
+assert_status 1 $? "a ready attribute reading 0 wins over ep1"
+printf '1\n' > "$fake/fn/ready"
+smoo_ffs_ready "$fake/fn" "$fake/ffs"
+assert_status 0 $? "a ready attribute reading 1 is ready"
+
+SMOO_UDC_CLASS=$fake/udc
+smoo_pick_udc "" > /dev/null
+assert_status 1 $? "no UDC to pick while none is present"
+mkdir "$fake/udc/b.usb" "$fake/udc/a600000.usb"
+assert_eq "a600000.usb" "$(smoo_pick_udc "")" "the first UDC in glob order is picked"
+assert_eq "b.usb" "$(smoo_pick_udc b.usb)" "rd.smoo.udc picks that UDC"
+smoo_pick_udc c.usb > /dev/null
+assert_status 1 $? "a requested UDC that is absent is not replaced by another"
+SMOO_UDC_CLASS=/sys/class/udc
+rm -rf "$fake"
 
 # --- shell syntax -----------------------------------------------------------
 
