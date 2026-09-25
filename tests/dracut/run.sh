@@ -265,10 +265,10 @@ assert_eq "0xdead" "$(smoo_vendor)" "default vendor id"
 assert_eq "0xbeef" "$(smoo_product)" "default product id"
 assert_eq "0001" "$(smoo_gadget_serial)" "default serial matches what smoo-gadget hard-codes"
 
-CMDLINE="rd.smoo=1 rd.smoo.vendor=0x18d1 rd.smoo.product=20192 rd.smoo.serial=94BX0A1B2"
+CMDLINE="rd.smoo=1 rd.smoo.vendor=0x18d1 rd.smoo.product=20192 rd.smoo.serial=TESTSERIAL1"
 assert_eq "0x18d1" "$(smoo_vendor)" "vendor id from the command line"
 assert_eq "20192" "$(smoo_product)" "decimal product id from the command line"
-assert_eq "94BX0A1B2" "$(smoo_gadget_serial)" "serial from the command line"
+assert_eq "TESTSERIAL1" "$(smoo_gadget_serial)" "serial from the command line"
 
 CMDLINE="rd.smoo=1 rd.smoo.vendor_id=0x1209 rd.smoo.product_id=0x0001"
 assert_eq "0x1209" "$(smoo_vendor)" "rd.smoo.vendor_id is accepted too"
