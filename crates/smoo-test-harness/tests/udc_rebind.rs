@@ -17,6 +17,7 @@ mod common;
 #[path = "common/stalling_http.rs"]
 mod stalling_http;
 
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -24,9 +25,8 @@ use anyhow::{Context, Result, bail, ensure};
 use regex::Regex;
 use smoo_test_harness::fixture::{GadgetOpts, HostSourceSpec};
 use smoo_test_harness::{RunningScenario, ScenarioBuilder};
-use stalling_http::{
-    StallingHttpSource, assert_device_read_pending, ensure_read_matches, read_device_bytes,
-};
+use stalling_http::{StallingHttpSource, ensure_read_matches};
+use tokio::sync::oneshot;
 
 const SEED: u64 = 0x0DC_2EB1;
 const BLOCK_SIZE: u32 = 4096;
@@ -47,7 +47,9 @@ async fn udc_rebind() -> Result<()> {
         Duration::from_secs(2),
         Duration::from_secs(10),
     ];
-    run_rebind_cycles("udc_rebind", &gaps).await
+    run_rebind_cycles("udc_rebind", &gaps)
+        .await
+        .inspect_err(log_failure)
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -55,7 +57,15 @@ async fn udc_rebind() -> Result<()> {
 async fn udc_rebind_loop() -> Result<()> {
     common::init_tracing();
     let gaps = [Duration::from_millis(100); 20];
-    run_rebind_cycles("udc_rebind_loop", &gaps).await
+    run_rebind_cycles("udc_rebind_loop", &gaps)
+        .await
+        .inspect_err(log_failure)
+}
+
+/// Log the failure as soon as it happens, before scenario teardown, so it is
+/// visible even if teardown gets stuck.
+fn log_failure(err: &anyhow::Error) {
+    tracing::error!(error = ?err, "UDC rebind scenario failed");
 }
 
 async fn run_rebind_cycles(name: &str, gaps: &[Duration]) -> Result<()> {
@@ -96,12 +106,7 @@ async fn run_rebind_cycles(name: &str, gaps: &[Duration]) -> Result<()> {
         let expected = server.expected_bytes(lba, 1).await?;
         let requests_before = server.target_request_count();
         server.rearm(lba)?;
-        let mut read_task = tokio::spawn(read_device_bytes(
-            dev_path.clone(),
-            BLOCK_SIZE,
-            lba,
-            BLOCK_SIZE as usize,
-        ));
+        let mut read = spawn_device_read(dev_path.clone(), lba);
         server
             .wait_for_data_requests(requests_before + 1, Duration::from_secs(15))
             .await
@@ -111,9 +116,12 @@ async fn run_rebind_cycles(name: &str, gaps: &[Duration]) -> Result<()> {
         sc.gadget().configfs.unbind_udc();
         // The unbind gap doubles as the parked-read check: the read must
         // neither complete nor fail while the gadget has no UDC.
-        assert_device_read_pending(&mut read_task, gap)
-            .await
-            .with_context(|| format!("cycle {cycle}: read while unbound for {gap:?}"))?;
+        if let Ok(outcome) = tokio::time::timeout(gap, &mut read).await {
+            bail!(
+                "cycle {cycle}: read finished while the UDC was unbound for {gap:?}, expected it to stay parked: {:?}",
+                outcome.map(|r| r.map(|bytes| bytes.len()))
+            );
+        }
         sc.gadget()
             .configfs
             .bind_udc()
@@ -127,10 +135,10 @@ async fn run_rebind_cycles(name: &str, gaps: &[Duration]) -> Result<()> {
             .with_context(|| format!("cycle {cycle}: parked read was not replayed after rebind"))?;
         server.release();
 
-        let actual = tokio::time::timeout(Duration::from_secs(15), &mut read_task)
+        let actual = tokio::time::timeout(Duration::from_secs(15), &mut read)
             .await
             .with_context(|| format!("cycle {cycle}: read did not complete after rebind"))?
-            .context("device read task panicked")??;
+            .context("device read thread exited without a result")??;
         ensure_read_matches(&actual, &expected)
             .with_context(|| format!("cycle {cycle}: replayed read"))?;
         assert_gadget_serving(&sc, &format!("after cycle {cycle}")).await?;
@@ -143,6 +151,27 @@ async fn run_rebind_cycles(name: &str, gaps: &[Duration]) -> Result<()> {
     // so strict request/response balance is not meaningful here.
     result.assert(true, false).await?;
     Ok(())
+}
+
+/// Read block `lba` of `path` on a plain OS thread.
+///
+/// A parked read sleeps in the kernel until the gadget answers it. On a
+/// dedicated thread it cannot hold up the tokio runtime's shutdown when the
+/// test fails with the read still parked; process exit kills the thread.
+fn spawn_device_read(path: PathBuf, lba: u64) -> oneshot::Receiver<Result<Vec<u8>>> {
+    let (tx, rx) = oneshot::channel();
+    std::thread::spawn(move || {
+        let result = (|| {
+            let file =
+                std::fs::File::open(&path).with_context(|| format!("open {}", path.display()))?;
+            let mut buf = vec![0u8; BLOCK_SIZE as usize];
+            file.read_exact_at(&mut buf, lba * BLOCK_SIZE as u64)
+                .with_context(|| format!("read block {lba} of {}", path.display()))?;
+            Ok(buf)
+        })();
+        let _ = tx.send(result);
+    });
+    rx
 }
 
 /// The same smoo-gadget process still owns a ready FunctionFS instance on a
